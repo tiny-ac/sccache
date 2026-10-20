@@ -14,10 +14,13 @@
 
 use crate::cache::readonly::ReadOnlyStorage;
 use crate::cache::{CacheMode, Storage, storage_from_config};
+#[cfg(feature = "dist-client")]
+use crate::compiler::DistExecutor;
 use crate::compiler::PreprocessorCacheEntry;
 use crate::compiler::{
     CacheControl, CompileResult, Compiler, CompilerArguments, CompilerHasher, CompilerKind,
-    CompilerProxy, DistType, Language, MissType, NO_CRATE_TYPE_PASSED, get_compiler_info,
+    CompilerProxy, DistType, Language, MissType, NO_CRATE_TYPE_PASSED, RemoteExecutor,
+    get_compiler_info,
 };
 #[cfg(feature = "dist-client")]
 use crate::config;
@@ -203,6 +206,12 @@ impl DistClientContainer {
     async fn get_client(&self) -> Result<Option<Arc<dyn dist::Client>>> {
         Ok(None)
     }
+
+    async fn get_executor<C: CommandCreatorSync>(
+        &self,
+    ) -> Result<Option<Arc<dyn RemoteExecutor<C>>>> {
+        Ok(None)
+    }
 }
 
 #[cfg(feature = "dist-client")]
@@ -309,6 +318,13 @@ impl DistClientContainer {
             );
         }
         res
+    }
+
+    async fn get_executor<C: CommandCreatorSync>(
+        &self,
+    ) -> Result<Option<Arc<dyn RemoteExecutor<C>>>> {
+        let client = self.get_client().await?;
+        Ok(client.map(|client| Arc::new(DistExecutor::new(client)) as Arc<dyn RemoteExecutor<C>>))
     }
 
     async fn maybe_recreate_state(state: &mut DistClientState) {
@@ -1546,10 +1562,10 @@ where
         let me = self.clone();
 
         util::spawn_on(&self.rt, async move {
-            let result = match me.dist_client.get_client().await {
-                Ok(client) => std::panic::AssertUnwindSafe(hasher.get_cached_or_compile(
+            let result = match me.dist_client.get_executor().await {
+                Ok(executor) => std::panic::AssertUnwindSafe(hasher.get_cached_or_compile(
                     &me,
-                    client,
+                    executor,
                     me.creator.clone(),
                     me.storage.clone(),
                     arguments,
