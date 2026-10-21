@@ -16,4 +16,5 @@
 //! and execution.
 
 mod client;
+mod digest;
 pub(crate) mod proto;

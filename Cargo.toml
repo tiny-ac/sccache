@@ -276,6 +276,7 @@ dist-tests = ["dist-client", "dist-server"]
 reapi = [
   "prost",
   "prost-types",
+  "sha2",
   "tonic",
   # For the tests' fake REAPI servers; a dev-dependency can't be optional.
   "tonic/server",
