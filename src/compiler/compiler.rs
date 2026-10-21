@@ -27,7 +27,7 @@ use crate::compiler::nvcc::Nvcc;
 use crate::compiler::nvcc::NvccHostCompiler;
 use crate::compiler::nvhpc::Nvhpc;
 use crate::compiler::ptxas::Ptxas;
-use crate::compiler::remote::{DistJob, LocalCompile, RemoteExecutor, RemoteJob};
+use crate::compiler::remote::{DistInputOptions, DistJob, LocalCompile, RemoteExecutor, RemoteJob};
 use crate::compiler::rust::{Rust, RustupProxy};
 use crate::compiler::tasking_vx::TaskingVX;
 #[cfg(feature = "dist-client")]
@@ -754,6 +754,7 @@ where
                 let (cacheable, dist_type, compiler_result) = remote_or_local_compile(
                     service,
                     executor,
+                    dist_input_options,
                     creator,
                     cwd,
                     compilation,
@@ -852,9 +853,11 @@ where
     fn language(&self) -> Language;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn remote_or_local_compile<T>(
     service: &server::SccacheService<T>,
     executor: Option<Arc<dyn RemoteExecutor<T>>>,
+    dist_input_options: Option<DistInputOptions>,
     creator: T,
     cwd: PathBuf,
     compilation: Box<dyn Compilation<T>>,
@@ -864,9 +867,6 @@ async fn remote_or_local_compile<T>(
 where
     T: CommandCreatorSync,
 {
-    let dist_input_options = executor
-        .as_ref()
-        .and_then(|executor| executor.dist_input_options());
     let rewrite_includes_only =
         dist_input_options.is_some_and(|options| options.rewrite_includes_only);
     let mut path_transformer = dist::PathTransformer::new();
@@ -892,7 +892,6 @@ where
             path_transformer,
             command,
             weak_toolchain_key,
-            local_compiler: local_compile.command.get_executable(),
             cwd,
         });
     let job = RemoteJob {
