@@ -52,6 +52,19 @@ jobs:
       - name: Clippy with reapi
         run: cargo clippy --locked --all-targets --features reapi -- -D warnings -A unknown-lints -A clippy::type_complexity -A clippy::new-without-default
 
+  check_reapi_windows:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v5
+
+      - name: Install rust
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Check with reapi
+        run: cargo check --locked --all-targets --features reapi
+
   check_features:
     runs-on: ubuntu-latest
     strategy:
@@ -95,6 +108,10 @@ jobs:
             extra_args: --features=dist-server
           - os: ubuntu-22.04
             rustc: stable
+            extra_desc: reapi
+            extra_args: --features=reapi
+          - os: ubuntu-22.04
+            rustc: stable
           - os: ubuntu-22.04
             rustc: beta
           - os: ubuntu-22.04
@@ -115,6 +132,9 @@ jobs:
             extra_desc: cuda12.8
           # # M1 CPU
           - os: macos-14
+          - os: macos-14
+            extra_desc: reapi
+            extra_args: "--features=reapi reapi"
           - os: macos-15-intel
           - os: windows-2022
             cuda: "12.8"

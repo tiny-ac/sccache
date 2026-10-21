@@ -117,7 +117,10 @@ toml = "0.9"
 # src/reapi/proto is generated for these tonic and prost versions: bump the generator's in
 # scripts/reapi-protogen along with them, and run its generate.sh.
 tonic = { version = "0.14.6", optional = true, default-features = false, features = [
+  "channel",
   "codegen",
+  "tls-aws-lc",
+  "tls-native-roots",
 ] }
 tonic-prost = { version = "0.14.6", optional = true }
 tower-service = "0.3"
@@ -269,11 +272,13 @@ dist-server = [
 ]
 # Enables dist tests with external requirements
 dist-tests = ["dist-client", "dist-server"]
-# Enables the Remote Execution API (REAPI) protocol code. Experimental.
+# Enables a Remote Execution API (REAPI) client. Experimental.
 reapi = [
   "prost",
   "prost-types",
   "tonic",
+  # For the tests' fake REAPI servers; a dev-dependency can't be optional.
+  "tonic/server",
   "tonic-prost",
 ]
 
