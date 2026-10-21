@@ -38,12 +38,11 @@ pub struct RemoteJob<T: CommandCreatorSync> {
     pub dist_job: Option<DistJob>,
 }
 
-/// What sccache-dist needs to run a job.
+/// A compile to run on an sccache-dist cluster.
 pub struct DistJob {
     pub path_transformer: crate::dist::PathTransformer,
     pub command: crate::dist::CompileCommand,
     pub weak_toolchain_key: String,
-    pub local_compiler: PathBuf,
     pub cwd: PathBuf,
 }
 
@@ -71,9 +70,7 @@ impl<T: CommandCreatorSync> LocalCompile<'_, T> {
 /// Compiles cache misses remotely.
 #[async_trait]
 pub trait RemoteExecutor<T: CommandCreatorSync>: Send + Sync {
-    /// Options for preprocessing sources that sccache-dist compiles, or `None` when no
-    /// compile is distributed. Called before hashing and again before compiling: both
-    /// calls must agree.
+    /// `None` when no compile is distributed.
     fn dist_input_options(&self) -> Option<DistInputOptions>;
 
     /// Compiles `job`, remotely or with `local_compile`, and writes its outputs where a

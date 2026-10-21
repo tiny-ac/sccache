@@ -43,7 +43,7 @@ pub struct DistExecutor {
 struct DistRequest {
     command: dist::CompileCommand,
     dist_output_paths: Vec<String>,
-    local_compiler: PathBuf,
+    compiler_path: PathBuf,
     weak_toolchain_key: String,
     out_pretty: String,
 }
@@ -80,13 +80,13 @@ impl<T: CommandCreatorSync> RemoteExecutor<T> for DistExecutor {
             return Ok((DistType::NoDist, local_compile.run().await?));
         };
         debug!("[{}]: Attempting distributed compilation", out_pretty);
-        let local_compiler = dist_job.local_compiler.clone();
+        let compiler_path = local_compile.command.get_executable();
         let result = self
-            .run_on_cluster(compilation, dist_job, &out_pretty)
+            .run_on_cluster(compilation, dist_job, compiler_path.clone(), &out_pretty)
             .await
-            .map_err(|e| classify_error(e, &local_compiler));
+            .map_err(|error| classify_error(error, &compiler_path));
         match result {
-            Ok(done) => Ok(done),
+            Ok(compiled) => Ok(compiled),
             Err(DistError::FailCompile(e)) => Err(e),
             Err(DistError::CompileLocally(e)) => {
                 // `{:#}` prints the error and the causes in a single line.
@@ -112,10 +112,11 @@ impl DistExecutor {
         &self,
         compilation: Box<dyn Compilation<T>>,
         dist_job: DistJob,
+        compiler_path: PathBuf,
         out_pretty: &str,
     ) -> Result<(DistType, process::Output)> {
         let (request, (inputs_packager, toolchain_packager, outputs_rewriter)) =
-            Self::prepare(compilation, dist_job, out_pretty)?;
+            Self::prepare(compilation, dist_job, compiler_path, out_pretty)?;
         let response = self
             .dispatch(request, inputs_packager, toolchain_packager)
             .await?;
@@ -126,13 +127,13 @@ impl DistExecutor {
     fn prepare<T: CommandCreatorSync>(
         compilation: Box<dyn Compilation<T>>,
         dist_job: DistJob,
+        compiler_path: PathBuf,
         out_pretty: &str,
     ) -> Result<(DistRequest, DistPackagers)> {
         let DistJob {
             mut path_transformer,
             command,
             weak_toolchain_key,
-            local_compiler,
             cwd,
         } = dist_job;
         debug!("[{}]: Creating distributed compile request", out_pretty);
@@ -145,7 +146,7 @@ impl DistExecutor {
         let request = DistRequest {
             command,
             dist_output_paths,
-            local_compiler,
+            compiler_path,
             weak_toolchain_key,
             out_pretty: out_pretty.to_owned(),
         };
@@ -163,7 +164,7 @@ impl DistExecutor {
         let DistRequest {
             command: mut dist_compile_cmd,
             dist_output_paths,
-            local_compiler,
+            compiler_path,
             weak_toolchain_key,
             out_pretty,
         } = request;
@@ -171,10 +172,10 @@ impl DistExecutor {
 
         debug!(
             "[{}]: Identifying dist toolchain for {:?}",
-            out_pretty, local_compiler
+            out_pretty, compiler_path
         );
         let (dist_toolchain, maybe_dist_compile_executable) = dist_client
-            .put_toolchain(local_compiler, weak_toolchain_key, toolchain_packager)
+            .put_toolchain(compiler_path, weak_toolchain_key, toolchain_packager)
             .await?;
         let mut custom_toolchain_archive = None;
         if let Some((dist_compile_executable, archive_path)) = maybe_dist_compile_executable {
@@ -340,19 +341,19 @@ fn remove_outputs_on_error<V>(outputs: &[PathBuf], result: Result<V>) -> Result<
 }
 
 /// Decides whether to fail the compile or compile locally after an sccache-dist error.
-fn classify_error(e: Error, local_compiler: &Path) -> DistError {
-    if let Some(HttpClientError(_)) = e.downcast_ref::<HttpClientError>() {
-        DistError::FailCompile(e)
+fn classify_error(error: Error, compiler_path: &Path) -> DistError {
+    if let Some(HttpClientError(_)) = error.downcast_ref::<HttpClientError>() {
+        DistError::FailCompile(error)
     } else if let Some(lru_disk_cache::Error::FileTooLarge) =
-        e.downcast_ref::<lru_disk_cache::Error>()
+        error.downcast_ref::<lru_disk_cache::Error>()
     {
         DistError::FailCompile(anyhow!(
             "Could not cache dist toolchain for {:?} locally.
                  Increase `toolchain_cache_size` or decrease the toolchain archive size.",
-            local_compiler
+            compiler_path
         ))
     } else {
-        DistError::CompileLocally(e)
+        DistError::CompileLocally(error)
     }
 }
 
