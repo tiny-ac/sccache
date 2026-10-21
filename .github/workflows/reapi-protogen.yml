@@ -1,0 +1,31 @@
+name: REAPI protogen
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/reapi-protogen/**'
+      - 'src/reapi/proto/**'
+  push:
+    paths:
+      - 'scripts/reapi-protogen/**'
+      - 'src/reapi/proto/**'
+
+permissions:
+  contents: read # to fetch code (actions/checkout)
+
+jobs:
+  reapi_protogen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v5
+
+      - name: Install rust
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Check the generated REAPI code is up to date
+        run: |
+          scripts/reapi-protogen/generate.sh
+          git add --intent-to-add src/reapi/proto
+          git diff --exit-code src/reapi/proto

@@ -84,6 +84,8 @@ opendal = { version = "0.58.1", optional = true, default-features = false }
 opendal-http-transport-reqwest = { version = "0.58.1", optional = true }
 opendal-layer-logging = { version = "0.58.1", optional = true }
 openssl = { version = "0.10.75", optional = true }
+prost = { version = "0.14.4", optional = true }
+prost-types = { version = "0.14.4", optional = true }
 rand = "0.8.4"
 regex = "1.10.3"
 reqwest = { version = "0.13", features = [
@@ -113,6 +115,13 @@ tokio = { version = "1", features = [
 tokio-serde = "0.9"
 tokio-util = { version = "0.7.18", features = ["codec", "io", "rt"] }
 toml = "0.9"
+tonic = { version = "0.14.6", optional = true, default-features = false, features = [
+  "channel",
+  "codegen",
+  "tls-aws-lc",
+  "tls-native-roots",
+] }
+tonic-prost = { version = "0.14.6", optional = true }
 tower-service = "0.3"
 typed-path = "0.12.0"
 url = { version = "2", optional = true }
@@ -262,9 +271,18 @@ dist-server = [
 ]
 # Enables dist tests with external requirements
 dist-tests = ["dist-client", "dist-server"]
+# Enables a Remote Execution API (REAPI) client. Experimental.
+reapi = [
+  "prost",
+  "prost-types",
+  "tonic",
+  # For the tests' fake REAPI servers; a dev-dependency can't be optional.
+  "tonic/server",
+  "tonic-prost",
+]
 
 [workspace]
-exclude = ["tests/test-crate"]
+exclude = ["scripts/reapi-protogen", "tests/test-crate"]
 members = ["tests/integration/randomize_readdir"]
 
 [[bench]]

@@ -1,0 +1,10 @@
+[package]
+description = "Generates src/reapi/proto from the Remote Execution API's protobuf files"
+edition = "2024"
+name = "reapi-protogen"
+publish = false
+version = "0.0.0"
+
+[dependencies]
+protox = "=0.10.0"
+tonic-prost-build = "=0.14.6"
