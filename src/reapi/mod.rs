@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The Remote Execution API (REAPI), Bazel's protocol for remote caching and execution.
+//! A client for the Remote Execution API (REAPI), Bazel's protocol for remote caching
+//! and execution.
 
+mod client;
 pub(crate) mod proto;
