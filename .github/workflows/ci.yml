@@ -95,6 +95,10 @@ jobs:
             extra_args: --features=dist-server
           - os: ubuntu-22.04
             rustc: stable
+            extra_desc: reapi
+            extra_args: "--features=reapi reapi::"
+          - os: ubuntu-22.04
+            rustc: stable
           - os: ubuntu-22.04
             rustc: beta
           - os: ubuntu-22.04

@@ -271,11 +271,13 @@ dist-server = [
 ]
 # Enables dist tests with external requirements
 dist-tests = ["dist-client", "dist-server"]
-# Enables the Remote Execution API (REAPI) protocol code. Experimental.
+# Enables a Remote Execution API (REAPI) client. Experimental.
 reapi = [
   "prost",
   "prost-types",
   "tonic",
+  # For the tests' fake REAPI servers; a dev-dependency can't be optional.
+  "tonic/server",
   "tonic-prost",
 ]
 
