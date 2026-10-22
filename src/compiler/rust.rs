@@ -3148,7 +3148,8 @@ impl pkg::ToolchainPackager for RustToolchainPackager {
 #[cfg(feature = "dist-client")]
 #[derive(Debug)]
 struct RlibDepsDetail {
-    deps: Vec<String>,
+    /// The dependencies' `name-hash` stems from `rustc -Z ls`, or `name` when it prints no hash.
+    stems: Vec<String>,
     mtime: time::SystemTime,
 }
 
@@ -3168,10 +3169,10 @@ impl Meter<PathBuf, RlibDepsDetail> for DepsSize {
         //let k_size = mem::size_of::<PathBuf>() + k.capacity();
         let k_size = 3 * 8 + 100;
 
-        let crate_names_size: usize = v.deps.iter().map(|s| s.capacity()).sum();
+        let stems_size: usize = v.stems.iter().map(|s| s.capacity()).sum();
         let v_size: usize = mem::size_of::<RlibDepsDetail>() + // Systemtime and vec itself
-            v.deps.capacity() * mem::size_of::<String>() + // Each string in the vec
-            crate_names_size; // Contents of all strings
+            v.stems.capacity() * mem::size_of::<String>() + // Each string in the vec
+            stems_size; // Contents of all strings
 
         k_size + v_size
     }
@@ -3228,12 +3229,12 @@ impl RlibDepReader {
         }
 
         // The goal of this cache is to avoid repeated lookups when building a single project. Let's budget 3MB.
-        // Allowing for a 100 byte path, 50 dependencies per rlib and 20 characters per crate name, this roughly
-        // approximates to `path_size + path + vec_size + num_deps * (systemtime_size + string_size + crate_name_len)`
-        //                 `   3*8    +  100 +   3*8    +    50    * (      8         +     3*8     +       20      )`
-        //                 `2748` bytes per crate
+        // Allowing for a 100 byte path, 50 dependencies per rlib and 37 characters per `name-hash` stem, this roughly
+        // approximates to `path_size + path + vec_size + num_deps * (systemtime_size + string_size + stem_len)`
+        //                 `   3*8    +  100 +   3*8    +    50    * (      8         +     3*8     +    37   )`
+        //                 `3598` bytes per crate
         // Allowing for possible overhead of up to double (for unused space in allocated memory), this means we
-        // can cache information from about 570 rlibs - easily enough for a single project.
+        // can cache information from about 440 rlibs - easily enough for a single project.
         const CACHE_SIZE: u64 = 3 * 1024 * 1024;
         let cache = LruCache::with_meter(CACHE_SIZE, DepsSize);
         let rustc_version = Self::get_rustc_version(&executable, env_vars)?;
@@ -3305,6 +3306,23 @@ impl RlibDepReader {
         env_vars: &[(OsString, OsString)],
         rlib: &Path,
     ) -> Result<Vec<String>> {
+        Ok(self
+            .discover_rlib_dep_stems(env_vars, rlib)?
+            .into_iter()
+            .map(|mut stem| {
+                stem.truncate(crate_name(&stem).len());
+                stem
+            })
+            .collect())
+    }
+
+    /// `rlib`'s dependencies as `name-hash` stems, which tell apart same-named crates such
+    /// as std's `libc` and a user's.
+    fn discover_rlib_dep_stems(
+        &self,
+        env_vars: &[(OsString, OsString)],
+        rlib: &Path,
+    ) -> Result<Vec<String>> {
         let rlib_mtime = fs::metadata(rlib)
             .and_then(|m| m.modified())
             .context("Unable to get rlib modified time")?;
@@ -3314,7 +3332,7 @@ impl RlibDepReader {
             if let Some(deps_detail) = cache.get(rlib)
                 && rlib_mtime == deps_detail.mtime
             {
-                return Ok(deps_detail.deps.clone());
+                return Ok(deps_detail.stems.clone());
             }
         }
 
@@ -3344,8 +3362,10 @@ impl RlibDepReader {
         }
 
         let stdout = String::from_utf8(stdout).context("Error parsing rustc -Z ls output")?;
-        let deps: Vec<_> = parse_rustc_z_ls(&stdout)
-            .map(|deps| deps.into_iter().map(|dep| dep.to_owned()).collect())?;
+        let stems: Vec<_> = parse_rustc_z_ls(&stdout)?
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
 
         {
             // This will behave poorly if the rlib is changing under our feet, but in that case rustc
@@ -3354,16 +3374,22 @@ impl RlibDepReader {
             cache.insert(
                 rlib.to_owned(),
                 RlibDepsDetail {
-                    deps: deps.clone(),
+                    stems: stems.clone(),
                     mtime: rlib_mtime,
                 },
             );
         }
-        Ok(deps)
+        Ok(stems)
     }
 }
 
-// Parse output like the following:
+/// The crate name in a `rustc -Z ls` stem, `name-hash` or `name`.
+#[cfg(feature = "dist-client")]
+fn crate_name(stem: &str) -> &str {
+    stem.rsplit_once('-').map_or(stem, |(name, _)| name)
+}
+
+// Parse the dependencies' stems out of output like the following:
 //
 // ```
 // =External Dependencies=
@@ -3390,7 +3416,7 @@ fn parse_rustc_z_ls(stdout: &str) -> Result<Vec<&str>> {
         }
     }
 
-    let mut dep_names = vec![];
+    let mut dep_stems = vec![];
 
     for line in &mut lines {
         if line.is_empty() {
@@ -3411,7 +3437,7 @@ fn parse_rustc_z_ls(stdout: &str) -> Result<Vec<&str>> {
             .split_whitespace()
             .next()
             .context("No lib string on line from rustc -Z ls")?;
-        if num != dep_names.len() + 1 {
+        if num != dep_stems.len() + 1 {
             bail!(
                 "Unexpected numbering of {} in rustc -Z ls output",
                 libstring
@@ -3419,22 +3445,7 @@ fn parse_rustc_z_ls(stdout: &str) -> Result<Vec<&str>> {
         }
         assert!(line_splits.next().is_none());
 
-        let mut libstring_splits = libstring.rsplitn(2, '-');
-        // Most things get printed as ${LIBNAME}-${HASH} but for some things
-        // (native code-only libraries?), ${LIBNAME} is all you get.
-        let libname = {
-            let maybe_hash = libstring_splits
-                .next()
-                .context("Nothing in lib string from `rustc -Z ls`")?;
-            if let Some(name) = libstring_splits.next() {
-                name
-            } else {
-                maybe_hash
-            }
-        };
-        assert!(libstring_splits.next().is_none());
-
-        dep_names.push(libname);
+        dep_stems.push(libstring);
     }
 
     for line in lines {
@@ -3443,7 +3454,7 @@ fn parse_rustc_z_ls(stdout: &str) -> Result<Vec<&str>> {
         }
     }
 
-    Ok(dep_names)
+    Ok(dep_stems)
 }
 
 /// Whether `line` is rustc's `--json=artifacts` notification for a `.rmeta`.
@@ -4215,9 +4226,9 @@ c:/foo/bar.rs:
         assert!(res.is_ok());
         let res = res.unwrap();
         assert_eq!(res.len(), 3);
-        assert_eq!(res[0], "lucet_runtime");
-        assert_eq!(res[1], "lucet_runtime_internals");
-        assert_eq!(res[2], "lucet_runtime_macros");
+        assert_eq!(crate_name(res[0]), "lucet_runtime");
+        assert_eq!(crate_name(res[1]), "lucet_runtime_internals");
+        assert_eq!(crate_name(res[2]), "lucet_runtime_macros");
     }
 
     #[cfg(feature = "dist-client")]
@@ -4240,9 +4251,40 @@ proc_macro false
         assert!(res.is_ok());
         let res = res.unwrap();
         assert_eq!(res.len(), 3);
-        assert_eq!(res[0], "lucet_runtime");
-        assert_eq!(res[1], "lucet_runtime_internals");
-        assert_eq!(res[2], "lucet_runtime_macros");
+        assert_eq!(crate_name(res[0]), "lucet_runtime");
+        assert_eq!(crate_name(res[1]), "lucet_runtime_internals");
+        assert_eq!(crate_name(res[2]), "lucet_runtime_macros");
+    }
+
+    #[cfg(feature = "dist-client")]
+    #[test]
+    fn test_parse_rustc_z_ls_stems() {
+        // rustc 1.98 output, trimmed, plus a stem without a hash.
+        let output = "Crate info:
+name memchr-913b64bde2108e6c
+=External Dependencies=
+1 core-a4b78f7f6a62a375 hash 155b1ea52cb2bf59a8f8108322e96d81 host_hash None kind Unconditional public
+2 libc-e47c8f2666a97726 hash d8e90f2326193dce8d5b44879732dc3d host_hash None kind Unconditional public
+3 lucet_runtime
+
+";
+        let stems = parse_rustc_z_ls(output).unwrap();
+        assert_eq!(
+            [
+                "core-a4b78f7f6a62a375",
+                "libc-e47c8f2666a97726",
+                "lucet_runtime"
+            ],
+            stems.as_slice()
+        );
+        assert_eq!(
+            ["core", "libc", "lucet_runtime"],
+            stems
+                .iter()
+                .map(|s| crate_name(s))
+                .collect::<Vec<_>>()
+                .as_slice()
+        );
     }
 
     #[cfg(feature = "dist-client")]
@@ -4268,11 +4310,11 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
 ";
         let res = parse_rustc_z_ls(output).expect("modern rustc -Z ls output should parse");
         assert_eq!(res.len(), 5);
-        assert_eq!(res[0], "std");
-        assert_eq!(res[1], "core");
-        assert_eq!(res[2], "crc_fast");
-        assert_eq!(res[3], "crc");
-        assert_eq!(res[4], "aws_sdk_s3");
+        assert_eq!(crate_name(res[0]), "std");
+        assert_eq!(crate_name(res[1]), "core");
+        assert_eq!(crate_name(res[2]), "crc_fast");
+        assert_eq!(crate_name(res[3]), "crc");
+        assert_eq!(crate_name(res[4]), "aws_sdk_s3");
     }
 
     #[cfg(feature = "dist-client")]
