@@ -15,7 +15,11 @@
 //! A client for the Remote Execution API (REAPI), Bazel's protocol for remote caching
 //! and execution.
 
+mod action_cache;
+mod cas;
 mod client;
 mod digest;
+#[cfg(test)]
+mod fake;
 mod input_root;
 pub(crate) mod proto;
