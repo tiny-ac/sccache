@@ -27,7 +27,7 @@ use remexec::action_cache_server::{ActionCache, ActionCacheServer};
 use remexec::capabilities_server::{Capabilities, CapabilitiesServer};
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use tokio::net::TcpListener;
@@ -48,6 +48,11 @@ pub(crate) struct FakeServer {
     pub(crate) oversize_reads: AtomicBool,
     /// Answers GetActionResult with INTERNAL.
     pub(crate) fail_lookups: AtomicBool,
+    /// Leaves `cache_capabilities` out of its capabilities.
+    pub(crate) without_caching: bool,
+    /// Answers GetCapabilities with this code.
+    pub(crate) capabilities_error: Mutex<Option<tonic::Code>>,
+    pub(crate) capabilities_calls: AtomicUsize,
     pub(crate) blobs: Mutex<HashMap<(String, i64), Vec<u8>>>,
     pub(crate) action_results: Mutex<HashMap<(String, i64), remexec::ActionResult>>,
 }
@@ -81,6 +86,17 @@ impl FakeServer {
 
     /// Serves on a new local port and returns a [`Client`] connected with `instance_name`.
     pub(crate) async fn serve_and_connect(self: &Arc<Self>) -> Client {
+        Client::connect(&ConnectOptions {
+            endpoint: self.serve().await,
+            instance_name: self.instance_name.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Serves on a new local port and returns its `grpc://` endpoint.
+    pub(crate) async fn serve(self: &Arc<Self>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let routes = Routes {
@@ -92,13 +108,7 @@ impl FakeServer {
             tonic::transport::Server::builder()
                 .serve_with_incoming(routes, TcpIncoming::from(listener)),
         );
-        Client::connect(&ConnectOptions {
-            endpoint: format!("grpc://{addr}"),
-            instance_name: self.instance_name.clone(),
-            ..Default::default()
-        })
-        .await
-        .unwrap()
+        format!("grpc://{addr}")
     }
 
     fn parse_resource_name(
@@ -172,13 +182,17 @@ impl Capabilities for FakeServer {
         &self,
         _: Request<remexec::GetCapabilitiesRequest>,
     ) -> RpcResult<remexec::ServerCapabilities> {
+        self.capabilities_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(code) = *self.capabilities_error.lock().unwrap() {
+            return Err(Status::new(code, "capabilities_error"));
+        }
         let supported_compressors = if self.supports_zstd_bytestream {
             vec![remexec::compressor::Value::Zstd as i32]
         } else {
             vec![]
         };
         Ok(Response::new(remexec::ServerCapabilities {
-            cache_capabilities: Some(remexec::CacheCapabilities {
+            cache_capabilities: (!self.without_caching).then(|| remexec::CacheCapabilities {
                 supported_compressors,
                 ..Default::default()
             }),
