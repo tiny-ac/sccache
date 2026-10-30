@@ -77,6 +77,8 @@ pub(crate) struct FakeServer {
     pub(crate) delete_at_find_missing: Mutex<Option<PathBuf>>,
     /// Answers BatchUpdateBlobs with this code.
     pub(crate) upload_error: Mutex<Option<tonic::Code>>,
+    /// Answers each blob of a BatchUpdateBlobs with this code.
+    pub(crate) blob_upload_error: Option<tonic::Code>,
     pub(crate) batch_update_blobs_calls: AtomicUsize,
     pub(crate) batched_blob_count: AtomicUsize,
     pub(crate) bytestream_write_resource_names: Mutex<Vec<String>>,
@@ -365,7 +367,13 @@ impl ContentAddressableStorage for FakeServer {
             .into_iter()
             .map(|request| {
                 let digest = request.digest.unwrap_or_default();
-                let status = if digest::of_bytes(&request.data) == digest {
+                let status = if let Some(code) = self.blob_upload_error {
+                    Some(rpc::Status {
+                        code: code as i32,
+                        message: "blob_upload_error".to_owned(),
+                        details: vec![],
+                    })
+                } else if digest::of_bytes(&request.data) == digest {
                     self.blobs
                         .lock()
                         .unwrap()
