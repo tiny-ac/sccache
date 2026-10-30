@@ -18,6 +18,7 @@
 mod action_cache;
 mod cas;
 mod client;
+mod connection;
 mod digest;
 mod executor;
 #[cfg(test)]

@@ -90,6 +90,16 @@ impl std::fmt::Display for IncompatibleServer {
 
 impl std::error::Error for IncompatibleServer {}
 
+/// Error for a REAPI server that refuses the auth token, or a request without one.
+#[derive(Debug)]
+pub(crate) struct CredentialsRefused;
+
+impl std::fmt::Display for CredentialsRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the REAPI server refused the credentials")
+    }
+}
+
 /// A connection to a REAPI server.
 pub(crate) struct Client {
     instance_name: String,
@@ -152,7 +162,18 @@ impl Client {
                 Ok(CapabilitiesClient::new(channel.clone())
                     .get_capabilities(request)
                     .await
-                    .map_err(status_error)?
+                    .map_err(|status| {
+                        let refused = matches!(
+                            status.code(),
+                            tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
+                        );
+                        let e = status_error(status);
+                        if refused {
+                            e.context(CredentialsRefused)
+                        } else {
+                            e
+                        }
+                    })?
                     .into_inner())
             },
         )

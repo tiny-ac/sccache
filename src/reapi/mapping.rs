@@ -106,6 +106,10 @@ pub(crate) enum CompileLocallyReason {
     UnsupportedEnvVarName,
     SecretLikeEnvVar,
     UnreadableDependencies,
+    Connecting,
+    ConnectFailed,
+    IncompatibleServer,
+    CredentialsRefused,
 }
 
 impl std::fmt::Display for CompileLocallyReason {
@@ -127,6 +131,10 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::UnsupportedEnvVarName => "env var the REAPI command can't pass to rustc",
             Self::SecretLikeEnvVar => "secret-like env var",
             Self::UnreadableDependencies => "unreadable dependencies",
+            Self::Connecting => "connecting to the REAPI server",
+            Self::ConnectFailed => "failed to connect to the REAPI server",
+            Self::IncompatibleServer => "incompatible REAPI server",
+            Self::CredentialsRefused => "REAPI server refused the credentials",
         })
     }
 }
