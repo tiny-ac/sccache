@@ -18,10 +18,89 @@
 //! Paths under a compile's cwd keep their relative path in the input root, and paths
 //! under its build root (cargo's target dir) go under [`BUILD_ROOT_DIR`].
 
+use crate::errors::*;
 use std::path::{Component, Path, PathBuf};
 
 /// The input root's directory for files under the local build root.
 const BUILD_ROOT_DIR: &str = ".sccache-build";
+
+/// A compile that can run through REAPI, with its paths mapped into the input root.
+#[derive(Debug)]
+pub struct ReapiCompile {
+    pub(crate) path_mapper: PathMapper,
+    pub(crate) arguments: Vec<String>,
+    /// The crate root when cargo passes it as an absolute path, which `arguments` leave out.
+    /// A worker passes it as an absolute path too, since rustc writes the crate root into its
+    /// output as it was given.
+    pub(crate) mapped_crate_root: Option<String>,
+    pub(crate) target_triple: String,
+    /// Local paths of the files that go into the input root.
+    pub(crate) input_root_files: Vec<PathBuf>,
+    /// Local paths the compile writes.
+    pub(crate) outputs: Vec<PathBuf>,
+}
+
+/// Error for a compile that can't run through REAPI.
+#[derive(Debug)]
+pub struct NotEligible {
+    pub(crate) reason: CompileLocallyReason,
+    /// The error behind `reason`, if any.
+    pub(crate) detail: Option<Error>,
+}
+
+impl NotEligible {
+    pub(crate) fn new(reason: CompileLocallyReason, detail: Error) -> Self {
+        NotEligible {
+            reason,
+            detail: Some(detail),
+        }
+    }
+}
+
+impl From<CompileLocallyReason> for NotEligible {
+    fn from(reason: CompileLocallyReason) -> Self {
+        NotEligible {
+            reason,
+            detail: None,
+        }
+    }
+}
+
+/// Why a compile runs locally instead of through REAPI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompileLocallyReason {
+    NotRust,
+    RustcDriver,
+    WindowsPaths,
+    Staticlib,
+    UnexpectedCargoLayout,
+    PathOutsideInputRoot,
+    SourceOutsideInputRoot,
+    AbsolutePathInOption,
+    CustomTargetSpec,
+    NativeCpu,
+    ProfileUse,
+    RemapPathPrefix,
+}
+
+impl std::fmt::Display for CompileLocallyReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotRust => "not a Rust compile",
+            Self::RustcDriver => "not rustc",
+            Self::WindowsPaths => "Windows paths",
+            Self::Staticlib => "staticlib crate type",
+            Self::UnexpectedCargoLayout => "unexpected cargo dir layout",
+            Self::PathOutsideInputRoot => "path outside the cwd and build root",
+            Self::SourceOutsideInputRoot => "source file outside the cwd and build root",
+            Self::AbsolutePathInOption => "absolute path in a -C or -Z option",
+            Self::CustomTargetSpec => "custom target spec",
+            Self::NativeCpu => "-C target-cpu=native or -Z tune-cpu=native",
+            Self::ProfileUse => "-C profile-use or -C profile-sample-use",
+            Self::RemapPathPrefix => "--remap-path-prefix",
+        })
+    }
+}
 
 /// Maps local paths under the cwd and build root to input-root-relative paths.
 #[derive(Debug)]
@@ -63,7 +142,7 @@ impl PathMapper {
 }
 
 /// Resolves `.` and `..` in `path` without touching the filesystem.
-fn lexically_normalize(path: &Path) -> PathBuf {
+pub(crate) fn lexically_normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in path.components() {
         match c {
