@@ -17,6 +17,7 @@
 //! arguments a REAPI worker would use. The stats count the hits, the executions, and the
 //! local compiles by reason.
 
+use super::auth_token::{self, AuthToken};
 use super::cas::UnreadableBlob;
 use super::client::{
     ConnectOptions, RPC_TIMEOUT, RUSTC_MNEMONIC, RUSTC_VERSION_MNEMONIC, check_connect_options,
@@ -105,7 +106,7 @@ struct Lookup {
 }
 
 impl ReapiExecutor {
-    /// Reads the auth token once, so a changed token takes a restart.
+    /// Reads the TLS files once, so a changed one takes a restart.
     pub fn new(config: &ReapiConfig, dist_cache_dir: &Path) -> Self {
         let connection = match read_connect_options(config) {
             Ok(options) => Some(Connection::new(options)),
@@ -639,16 +640,10 @@ fn compile_locally<T>(
 fn read_connect_options(config: &ReapiConfig) -> Result<ConnectOptions> {
     let auth_token = config
         .auth_token_file
-        .as_ref()
-        .map(|file| {
-            std::fs::read_to_string(file).with_context(|| {
-                format!(
-                    "failed to read the REAPI auth token from {}",
-                    file.display()
-                )
-            })
-        })
-        .transpose()?;
+        .clone()
+        .map(|file| AuthToken::from_file(file, auth_token::CHECK_INTERVAL))
+        .transpose()?
+        .map(Arc::new);
     let tls_ca_certificates = config
         .tls_ca_file
         .as_deref()

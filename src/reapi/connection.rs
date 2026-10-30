@@ -22,7 +22,7 @@ use super::client::{Client, ConnectOptions, CredentialsRefused, IncompatibleServ
 use super::execution::Execution;
 use super::mapping::CompileLocallyReason;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
@@ -34,6 +34,8 @@ pub(super) struct ServerApis {
     pub(super) action_cache: ActionCache,
     /// `None` for a server that doesn't execute actions.
     pub(super) execution: Option<Execution>,
+    /// The version of the auth token when sccache connected.
+    token_version: u64,
 }
 
 enum State {
@@ -43,8 +45,9 @@ enum State {
     ConnectFailed {
         retry_at: Instant,
     },
-    /// Compiles run locally until the sccache server restarts, since retrying with the same
-    /// server and the same token can't succeed.
+    /// Compiles run locally until the sccache server restarts, or, for refused credentials,
+    /// until the auth token changes, since retrying with the same server and the same token
+    /// can't succeed.
     Refused(CompileLocallyReason),
 }
 
@@ -53,9 +56,8 @@ pub(super) struct Connection {
     state: tokio::sync::Mutex<State>,
     failures_in_a_row: AtomicU32,
     attempts_ended: watch::Sender<u64>,
-    /// Set once the server refused the credentials after connecting, and sccache connected
-    /// again to check them.
-    rechecked_credentials: AtomicBool,
+    /// The version of the auth token the server last refused, on a call or when connecting.
+    refused_token_version: std::sync::Mutex<Option<u64>>,
 }
 
 impl Connection {
@@ -65,7 +67,7 @@ impl Connection {
             state: tokio::sync::Mutex::new(State::NotConnected),
             failures_in_a_row: AtomicU32::new(0),
             attempts_ended: watch::Sender::new(0),
-            rechecked_credentials: AtomicBool::new(false),
+            refused_token_version: Default::default(),
         })
     }
 
@@ -76,11 +78,23 @@ impl Connection {
         deadline: Instant,
     ) -> Result<Arc<ServerApis>, CompileLocallyReason> {
         let mut attempts_ended = self.attempts_ended.subscribe();
+        if let Some(auth_token) = &self.options.auth_token {
+            // Read in the background; calls send the new token once the read ends.
+            drop(auth_token.read_again());
+        }
         loop {
             {
+                let token_version = self.token_version();
                 let mut state = self.state.lock().await;
                 match &*state {
                     State::Connected(apis) => return Ok(apis.clone()),
+                    State::Refused(CompileLocallyReason::CredentialsRefused)
+                        if *self.refused_token_version.lock().unwrap() != Some(token_version) =>
+                    {
+                        info!("REAPI: the auth token changed; connecting again");
+                        *state = State::Connecting;
+                        self.spawn_connect();
+                    }
                     State::Refused(reason) => return Err(*reason),
                     State::ConnectFailed { retry_at } if Instant::now() < *retry_at => {
                         return Err(CompileLocallyReason::ConnectFailed);
@@ -103,24 +117,33 @@ impl Connection {
         }
     }
 
-    /// For a server that refused the credentials on a call through `apis`. The first time,
-    /// the next compile connects again, and GetCapabilities decides, as at the first connect,
-    /// since a proxy may refuse a call once. The second time, every compile runs locally until
-    /// the sccache server restarts.
+    /// For a server that refused the credentials on a call through `apis`. The first time for
+    /// a token, the next compile connects again, and GetCapabilities decides, as at the first
+    /// connect, since a proxy may refuse a call once. The second time, every compile runs
+    /// locally until the sccache server restarts or the token changes.
     pub(super) async fn credentials_refused(&self, apis: &Arc<ServerApis>) {
         let mut state = self.state.lock().await;
         // A call through an earlier connection says nothing about the current one.
         if !matches!(&*state, State::Connected(current) if Arc::ptr_eq(current, apis)) {
             return;
         }
-        if self.rechecked_credentials.swap(true, Ordering::Relaxed) {
+        let token_version = self.token_version();
+        if apis.token_version != token_version {
+            // The call may have carried the earlier token; the new one gets its own check.
+            info!("REAPI: the server refused the credentials; connecting again with the new token");
+            *state = State::NotConnected;
+            return;
+        }
+        let mut refused_token_version = self.refused_token_version.lock().unwrap();
+        if *refused_token_version == Some(token_version) {
             warn!(
                 "REAPI: the server refused the credentials again; compiling locally until the \
-                 sccache server restarts"
+                 sccache server restarts or the auth token changes"
             );
             *state = State::Refused(CompileLocallyReason::CredentialsRefused);
         } else {
             warn!("REAPI: the server refused the credentials; connecting again to check them");
+            *refused_token_version = Some(token_version);
             *state = State::NotConnected;
         }
     }
@@ -141,7 +164,16 @@ impl Connection {
         });
     }
 
+    /// How many times the auth token changed; 0 without one.
+    fn token_version(&self) -> u64 {
+        self.options
+            .auth_token
+            .as_ref()
+            .map_or(0, |auth_token| auth_token.version())
+    }
+
     async fn connect(self: Arc<Self>) -> State {
+        let token_version = self.token_version();
         match Client::connect(&self.options).await {
             Ok(client) => {
                 self.failures_in_a_row.store(0, Ordering::Relaxed);
@@ -149,15 +181,20 @@ impl Connection {
                     cas: Cas::new(&client),
                     action_cache: ActionCache::new(&client),
                     execution: client.executes_actions().then(|| Execution::new(&client)),
+                    token_version,
                 }))
             }
-            Err(e) if e.is::<IncompatibleServer>() || e.is::<CredentialsRefused>() => {
+            Err(e) if e.is::<IncompatibleServer>() => {
                 warn!("REAPI: {e:#}; compiling locally until the sccache server restarts");
-                State::Refused(if e.is::<IncompatibleServer>() {
-                    CompileLocallyReason::IncompatibleServer
-                } else {
-                    CompileLocallyReason::CredentialsRefused
-                })
+                State::Refused(CompileLocallyReason::IncompatibleServer)
+            }
+            Err(e) if e.is::<CredentialsRefused>() => {
+                warn!(
+                    "REAPI: {e:#}; compiling locally until the sccache server restarts or the \
+                     auth token changes"
+                );
+                *self.refused_token_version.lock().unwrap() = Some(token_version);
+                State::Refused(CompileLocallyReason::CredentialsRefused)
             }
             Err(e) => {
                 let state = self.connect_failed();
@@ -186,12 +223,27 @@ impl Connection {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::reapi::auth_token::AuthToken;
+    use crate::reapi::auth_token::test::{read_again_now, token_file};
     use crate::reapi::fake::FakeServer;
 
     async fn serve(server: FakeServer) -> (Arc<FakeServer>, Arc<Connection>) {
         let server = Arc::new(server);
         let connection = Connection::new(ConnectOptions {
             endpoint: server.serve().await,
+            ..Default::default()
+        });
+        (server, connection)
+    }
+
+    async fn serve_with_token(
+        server: FakeServer,
+        auth_token: &Arc<AuthToken>,
+    ) -> (Arc<FakeServer>, Arc<Connection>) {
+        let server = Arc::new(server);
+        let connection = Connection::new(ConnectOptions {
+            endpoint: server.serve().await,
+            auth_token: Some(auth_token.clone()),
             ..Default::default()
         });
         (server, connection)
@@ -298,6 +350,83 @@ mod test {
             connection.server_apis(in_secs(10)).await.err()
         );
         assert_eq!(2, capabilities_calls(&server));
+    }
+
+    #[tokio::test]
+    async fn test_a_server_that_refused_a_token_at_connect_is_tried_with_the_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let (auth_token, write_token) = token_file(dir.path(), Duration::ZERO);
+        let (server, connection) =
+            serve_with_token(failing_with(tonic::Code::Unauthenticated), &auth_token).await;
+        for _ in 0..2 {
+            assert_eq!(
+                Some(CompileLocallyReason::CredentialsRefused),
+                connection.server_apis(in_secs(10)).await.err()
+            );
+        }
+        assert_eq!(1, capabilities_calls(&server));
+        write_token("second");
+        read_again_now(&auth_token).await;
+        *server.capabilities_error.lock().unwrap() = None;
+        assert!(connection.server_apis(in_secs(10)).await.is_ok());
+        assert_eq!(2, capabilities_calls(&server));
+    }
+
+    #[tokio::test]
+    async fn test_credentials_refused_twice_are_checked_again_with_the_next_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let (auth_token, write_token) = token_file(dir.path(), Duration::ZERO);
+        let (server, connection) = serve_with_token(FakeServer::default(), &auth_token).await;
+        let apis = connection.server_apis(in_secs(10)).await.unwrap();
+        connection.credentials_refused(&apis).await;
+        let apis = connection.server_apis(in_secs(10)).await.unwrap();
+        connection.credentials_refused(&apis).await;
+        assert!(connection.server_apis(in_secs(10)).await.is_err());
+        write_token("second");
+        read_again_now(&auth_token).await;
+        let apis = connection.server_apis(in_secs(10)).await.unwrap();
+        assert_eq!(3, capabilities_calls(&server));
+        // The new token gets its own check.
+        connection.credentials_refused(&apis).await;
+        assert!(connection.server_apis(in_secs(10)).await.is_ok());
+        assert_eq!(4, capabilities_calls(&server));
+    }
+
+    #[tokio::test]
+    async fn test_a_refusal_through_a_connection_with_an_earlier_token_doesnt_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let (auth_token, write_token) = token_file(dir.path(), Duration::ZERO);
+        let (server, connection) = serve_with_token(FakeServer::default(), &auth_token).await;
+        let apis = connection.server_apis(in_secs(10)).await.unwrap();
+        write_token("second");
+        read_again_now(&auth_token).await;
+        connection.credentials_refused(&apis).await;
+        let apis = connection.server_apis(in_secs(10)).await.unwrap();
+        // The first refusal of the new token.
+        connection.credentials_refused(&apis).await;
+        let apis = connection.server_apis(in_secs(10)).await.unwrap();
+        assert_eq!(3, capabilities_calls(&server));
+        connection.credentials_refused(&apis).await;
+        assert_eq!(
+            Some(CompileLocallyReason::CredentialsRefused),
+            connection.server_apis(in_secs(10)).await.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_compile_reads_a_changed_token_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (auth_token, write_token) = token_file(dir.path(), Duration::ZERO);
+        let (_, connection) = serve_with_token(FakeServer::default(), &auth_token).await;
+        write_token("second");
+        connection.server_apis(in_secs(10)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while auth_token.version() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the token file wasn't read again");
     }
 
     #[tokio::test]
