@@ -27,8 +27,7 @@ use crate::compiler::nvcc::Nvcc;
 use crate::compiler::nvcc::NvccHostCompiler;
 use crate::compiler::nvhpc::Nvhpc;
 use crate::compiler::ptxas::Ptxas;
-#[cfg(feature = "dist-client")]
-use crate::compiler::remote::dist_or_local_compile;
+use crate::compiler::remote::{DistInputOptions, DistJob, LocalCompile, RemoteExecutor, RemoteJob};
 use crate::compiler::rust::{Rust, RustupProxy};
 use crate::compiler::tasking_vx::TaskingVX;
 #[cfg(feature = "dist-client")]
@@ -576,7 +575,7 @@ where
     async fn get_cached_or_compile(
         &mut self,
         service: &server::SccacheService<T>,
-        dist_client: Option<Arc<dyn dist::Client>>,
+        executor: Option<Arc<dyn RemoteExecutor<T>>>,
         creator: T,
         storage: Arc<dyn Storage>,
         arguments: Vec<OsString>,
@@ -588,11 +587,12 @@ where
         let out_pretty = self.output_pretty().into_owned();
         debug!("[{}]: get_cached_or_compile: {:?}", out_pretty, arguments);
         let start = Instant::now();
-        let may_dist = dist_client.is_some();
-        let rewrite_includes_only = match dist_client {
-            Some(ref client) => client.rewrite_includes_only(),
-            _ => false,
-        };
+        let dist_input_options = executor
+            .as_ref()
+            .and_then(|executor| executor.dist_input_options());
+        let may_dist = dist_input_options.is_some();
+        let rewrite_includes_only =
+            dist_input_options.is_some_and(|options| options.rewrite_includes_only);
         let result = self
             .generate_hash_key(
                 &creator,
@@ -766,7 +766,7 @@ where
                     return self
                         .get_cached_or_compile(
                             service,
-                            dist_client,
+                            executor,
                             creator,
                             storage,
                             arguments,
@@ -778,9 +778,10 @@ where
                         .await;
                 }
 
-                let (cacheable, dist_type, compiler_result) = dist_or_local_compile(
+                let (cacheable, dist_type, compiler_result) = remote_or_local_compile(
                     service,
-                    dist_client,
+                    executor,
+                    dist_input_options,
                     creator,
                     cwd,
                     compilation,
@@ -879,29 +880,54 @@ where
     fn language(&self) -> Language;
 }
 
-#[cfg(not(feature = "dist-client"))]
-async fn dist_or_local_compile<T>(
+#[allow(clippy::too_many_arguments)]
+async fn remote_or_local_compile<T>(
     service: &server::SccacheService<T>,
-    _dist_client: Option<Arc<dyn dist::Client>>,
+    executor: Option<Arc<dyn RemoteExecutor<T>>>,
+    dist_input_options: Option<DistInputOptions>,
     creator: T,
-    _cwd: PathBuf,
+    cwd: PathBuf,
     compilation: Box<dyn Compilation<T>>,
-    _weak_toolchain_key: String,
+    weak_toolchain_key: String,
     out_pretty: String,
 ) -> Result<(Cacheable, DistType, process::Output)>
 where
     T: CommandCreatorSync,
 {
+    let rewrite_includes_only =
+        dist_input_options.is_some_and(|options| options.rewrite_includes_only);
     let mut path_transformer = dist::PathTransformer::new();
-    let (compile_cmd, _dist_compile_cmd, cacheable) = compilation
-        .generate_compile_commands(&mut path_transformer, true)
+    let (compile_cmd, dist_compile_cmd, cacheable) = compilation
+        .generate_compile_commands(&mut path_transformer, rewrite_includes_only)
         .context("Failed to generate compile commands")?;
+    let local_compile = LocalCompile {
+        service,
+        creator: &creator,
+        command: compile_cmd,
+    };
 
-    debug!("[{}]: Compiling locally", out_pretty);
-    compile_cmd
-        .execute(&service, &creator)
-        .await
-        .map(move |o| (cacheable, DistType::NoDist, o))
+    let Some(executor) = executor else {
+        debug!("[{}]: Compiling locally", out_pretty);
+        return local_compile
+            .run()
+            .await
+            .map(move |o| (cacheable, DistType::NoDist, o));
+    };
+    let dist_job = dist_input_options
+        .and(dist_compile_cmd)
+        .map(|command| DistJob {
+            path_transformer,
+            command,
+            weak_toolchain_key,
+            cwd,
+        });
+    let job = RemoteJob {
+        compilation,
+        out_pretty,
+        dist_job,
+    };
+    let (dist_type, output) = executor.compile(job, local_compile).await?;
+    Ok((cacheable, dist_type, output))
 }
 
 impl<T: CommandCreatorSync> Clone for Box<dyn CompilerHasher<T>> {
@@ -1870,6 +1896,8 @@ mod test {
     use super::*;
     use crate::cache::disk::DiskCache;
     use crate::cache::{CacheMode, CacheRead};
+    #[cfg(feature = "dist-client")]
+    use crate::compiler::DistExecutor;
     use crate::config::PreprocessorCacheModeConfig;
     use crate::mock_command::*;
     use crate::test::mock_storage::MockStorage;
@@ -2965,7 +2993,7 @@ LLVM version: 6.0",
                 hasher
                     .get_cached_or_compile(
                         &service,
-                        Some(dist_client.clone()),
+                        Some(Arc::new(DistExecutor::new(dist_client.clone()))),
                         creator.clone(),
                         storage.clone(),
                         arguments.clone(),
@@ -3002,7 +3030,7 @@ LLVM version: 6.0",
                 hasher
                     .get_cached_or_compile(
                         &service,
-                        Some(dist_client.clone()),
+                        Some(Arc::new(DistExecutor::new(dist_client.clone()))),
                         creator,
                         storage,
                         arguments,
@@ -3479,7 +3507,7 @@ LLVM version: 6.0",
                 hasher
                     .get_cached_or_compile(
                         &service,
-                        Some(dist_client.clone()),
+                        Some(Arc::new(DistExecutor::new(dist_client.clone()))),
                         creator.clone(),
                         storage.clone(),
                         arguments.clone(),
@@ -3597,7 +3625,7 @@ LLVM version: 6.0",
             let (cached, res) = hasher
                 .get_cached_or_compile(
                     &service,
-                    Some(dist_client.clone()),
+                    Some(Arc::new(DistExecutor::new(dist_client.clone()))),
                     creator.clone(),
                     storage.clone(),
                     arguments.clone(),
@@ -3621,6 +3649,79 @@ LLVM version: 6.0",
             assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
             assert_eq!(COMPILER_STDERR, res.stderr.as_slice());
         }
+    }
+
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_compiler_get_cached_or_compile_dist_http_client_error_fails_the_compile() {
+        drop(env_logger::try_init());
+        let creator = new_creator();
+        let f = TestFixture::new();
+        let gcc = f.mk_bin("gcc").unwrap();
+        let runtime = Runtime::new().unwrap();
+        let pool = runtime.handle().clone();
+        let dist_client = test_dist::ErrorAllocJobClient::with_error(|| {
+            HttpClientError("MOCK: unauthorized".to_owned()).into()
+        });
+        let storage = Arc::new(DiskCache::new(
+            f.tempdir.path().join("cache"),
+            u64::MAX,
+            &pool,
+            PreprocessorCacheModeConfig::default(),
+            CacheMode::ReadWrite,
+            vec![],
+        ));
+        let service = server::SccacheService::mock_with_dist_client(
+            dist_client.clone(),
+            storage.clone(),
+            pool.clone(),
+        );
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
+        );
+        next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
+        let c = get_compiler_info(
+            creator.clone(),
+            &gcc,
+            f.tempdir.path(),
+            &[],
+            &[],
+            &pool,
+            None,
+        )
+        .wait()
+        .unwrap()
+        .0;
+        // Only the preprocessor runs: the compile fails before any local compile.
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+        );
+        let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
+        let mut hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
+            CompilerArguments::Ok(h) => h,
+            o => panic!("Bad result from parse_arguments: {:?}", o),
+        };
+        let error = hasher
+            .get_cached_or_compile(
+                &service,
+                Some(Arc::new(DistExecutor::new(dist_client))),
+                creator.clone(),
+                storage,
+                arguments,
+                f.tempdir.path().to_path_buf(),
+                vec![],
+                CacheControl::ForceRecache,
+                pool,
+            )
+            .wait()
+            .expect_err("an HttpClientError fails the compile");
+        // `SccacheService` resets the dist client when it finds an `HttpClientError`.
+        assert!(
+            error.downcast_ref::<HttpClientError>().is_some(),
+            "expected an HttpClientError, got {error:#}"
+        );
     }
 }
 
@@ -3688,14 +3789,20 @@ mod test_dist {
 
     pub struct ErrorAllocJobClient {
         tc: Toolchain,
+        error: fn() -> Error,
     }
     impl ErrorAllocJobClient {
         #[allow(clippy::new_ret_no_self)]
         pub fn new() -> Arc<dyn dist::Client> {
+            Self::with_error(|| anyhow!("MOCK: alloc job failure"))
+        }
+
+        pub fn with_error(error: fn() -> Error) -> Arc<dyn dist::Client> {
             Arc::new(Self {
                 tc: Toolchain {
                     archive_id: "somearchiveid".to_owned(),
                 },
+                error,
             })
         }
     }
@@ -3703,7 +3810,7 @@ mod test_dist {
     impl dist::Client for ErrorAllocJobClient {
         async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
             assert_eq!(self.tc, tc);
-            Err(anyhow!("MOCK: alloc job failure"))
+            Err((self.error)())
         }
         async fn do_get_status(&self) -> Result<SchedulerStatusResult> {
             unreachable!()
