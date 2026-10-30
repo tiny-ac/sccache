@@ -18,15 +18,17 @@
 use super::client::{AuthChannel, Client, RPC_TIMEOUT, status_error, with_timeout};
 use super::digest;
 use super::proto::build::bazel::remote::execution::v2 as remexec;
-use super::proto::google::bytestream::ReadRequest;
 use super::proto::google::bytestream::byte_stream_client::ByteStreamClient;
+use super::proto::google::bytestream::{ReadRequest, WriteRequest};
 use crate::errors::*;
+use futures::StreamExt;
 use remexec::content_addressable_storage_client::ContentAddressableStorageClient;
 use sha2::{Digest as _, Sha256};
 use std::collections::HashSet;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -42,6 +44,11 @@ const DIGESTS_PER_FIND_MISSING_REQUEST: usize = 10_000;
 const UPLOAD_CONCURRENCY: usize = 4;
 /// Bounds `present_blobs`; clearing it costs only a FindMissingBlobs call.
 const MAX_PRESENT_BLOBS: usize = 100_000;
+#[cfg_attr(not(test), expect(dead_code, reason = "Execute uploads through it"))]
+const BYTESTREAM_WRITE_CHUNK_BYTES: usize = 1024 * 1024;
+/// rlib and rmeta files compress well at low levels.
+#[cfg_attr(not(test), expect(dead_code, reason = "Execute uploads through it"))]
+const ZSTD_LEVEL: i32 = 1;
 
 /// Allows for links as slow as 1 MiB/s.
 fn download_timeout(bytes: u64) -> Duration {
@@ -83,6 +90,63 @@ impl Blob {
             Blob::File(path) => std::fs::read(&path).with_context(|| UnreadableBlob(path)),
         }
     }
+
+    fn open(self) -> Result<Box<dyn Read + Send>> {
+        match self {
+            Blob::Bytes(bytes) => Ok(Box::new(io::Cursor::new(bytes))),
+            Blob::File(path) => {
+                let file = std::fs::File::open(&path).with_context(|| UnreadableBlob(path))?;
+                Ok(Box::new(file))
+            }
+        }
+    }
+}
+
+/// Reads a blob to upload, a chunk at a time.
+#[cfg_attr(not(test), expect(dead_code, reason = "Execute uploads through it"))]
+enum ChunkReader {
+    Unopened {
+        blob: Blob,
+        compress: bool,
+    },
+    Open {
+        reader: Box<dyn Read + Send>,
+        file: Option<PathBuf>,
+    },
+}
+
+#[cfg_attr(not(test), expect(dead_code, reason = "Execute uploads through it"))]
+impl ChunkReader {
+    /// The next chunk to send, and `self` to read the rest from. Blocks.
+    fn next_chunk(self) -> Result<(Self, Vec<u8>)> {
+        let (mut reader, file) = match self {
+            ChunkReader::Unopened { blob, compress } => {
+                let file = match &blob {
+                    Blob::File(path) => Some(path.clone()),
+                    Blob::Bytes(_) => None,
+                };
+                let reader = blob.open()?;
+                let reader: Box<dyn Read + Send> = if compress {
+                    Box::new(zstd::stream::read::Encoder::new(reader, ZSTD_LEVEL)?)
+                } else {
+                    reader
+                };
+                (reader, file)
+            }
+            ChunkReader::Open { reader, file } => (reader, file),
+        };
+        let mut data = Vec::with_capacity(BYTESTREAM_WRITE_CHUNK_BYTES);
+        if let Err(e) = (&mut reader)
+            .take(BYTESTREAM_WRITE_CHUNK_BYTES as u64)
+            .read_to_end(&mut data)
+        {
+            return Err(match file {
+                Some(path) => Error::from(e).context(UnreadableBlob(path)),
+                None => e.into(),
+            });
+        }
+        Ok((ChunkReader::Open { reader, file }, data))
+    }
 }
 
 /// The zstd window a download's decoder accepts. A server that compresses as it streams may
@@ -121,18 +185,26 @@ impl Cas {
         }
     }
 
-    fn download_resource_name(&self, digest: &remexec::Digest) -> String {
+    /// `{blobs,compressed-blobs/zstd}/<hash>/<size>`, in the encoding this CAS's transfers use.
+    fn blob_name(&self, digest: &remexec::Digest) -> String {
         let blobs = if self.supports_zstd_bytestream {
             "compressed-blobs/zstd"
         } else {
             "blobs"
         };
-        let blob_name = format!("{blobs}/{}/{}", digest.hash, digest.size_bytes);
+        format!("{blobs}/{}/{}", digest.hash, digest.size_bytes)
+    }
+
+    fn with_instance_name(&self, name: String) -> String {
         if self.instance_name.is_empty() {
-            blob_name
+            name
         } else {
-            format!("{}/{blob_name}", self.instance_name)
+            format!("{}/{name}", self.instance_name)
         }
+    }
+
+    fn download_resource_name(&self, digest: &remexec::Digest) -> String {
+        self.with_instance_name(self.blob_name(digest))
     }
 
     /// Fails without downloading if `digest` says the blob is larger than `max_bytes`.
@@ -232,9 +304,9 @@ impl Cas {
         digest.size_bytes == 0 || self.present_blobs.lock().unwrap().contains(digest)
     }
 
-    /// Uploads whichever of `blobs` the CAS doesn't have, in batches. A local file that can't
-    /// be read fails with [`UnreadableBlob`]. Concurrent calls with the same blob may both
-    /// upload it.
+    /// Uploads whichever of `blobs` the CAS doesn't have, in batches, or through ByteStream
+    /// if too large for one. A local file that can't be read fails with [`UnreadableBlob`].
+    /// Concurrent calls with the same blob may both upload it.
     pub(crate) async fn ensure_uploaded(&self, blobs: Vec<(remexec::Digest, Blob)>) -> Result<()> {
         let mut seen = HashSet::new();
         let candidates: Vec<(remexec::Digest, Blob)> = blobs
@@ -254,14 +326,12 @@ impl Cas {
         let mut batches = vec![];
         let mut batch = vec![];
         let mut batch_bytes = empty_batch_bytes;
+        let mut large_blobs = vec![];
         for (digest, blob) in candidates.into_iter().filter(|(d, _)| missing.contains(d)) {
             let size = digest.size_bytes as usize + BATCH_OVERHEAD_PER_BLOB;
             if empty_batch_bytes + size > self.max_batch_bytes {
-                bail!(
-                    "failed to upload blob {}/{}: too large for a REAPI batch",
-                    digest.hash,
-                    digest.size_bytes
-                );
+                large_blobs.push((digest, blob));
+                continue;
             }
             if batch_bytes + size > self.max_batch_bytes {
                 batches.push(std::mem::take(&mut batch));
@@ -273,12 +343,18 @@ impl Cas {
         if !batch.is_empty() {
             batches.push(batch);
         }
-        futures::future::try_join_all(
-            batches
-                .into_iter()
-                .map(|batch| self.with_upload_permit(self.batch_update_blobs(batch))),
-        )
-        .await?;
+        futures::try_join!(
+            futures::future::try_join_all(
+                batches
+                    .into_iter()
+                    .map(|batch| self.with_upload_permit(self.batch_update_blobs(batch)))
+            ),
+            futures::future::try_join_all(
+                large_blobs
+                    .into_iter()
+                    .map(|(digest, blob)| self.with_upload_permit(self.write_blob(digest, blob)))
+            ),
+        )?;
         let mut present_blobs = self.present_blobs.lock().unwrap();
         if present_blobs.len() + digests.len() > self.max_present_blobs {
             present_blobs.clear();
@@ -380,6 +456,104 @@ impl Cas {
         }
         Ok(())
     }
+
+    fn upload_resource_name(&self, digest: &remexec::Digest) -> String {
+        self.with_instance_name(format!(
+            "uploads/{}/{}",
+            uuid::Uuid::new_v4(),
+            self.blob_name(digest)
+        ))
+    }
+
+    /// Uploads `blob` through ByteStream, a chunk at a time, each read on a blocking thread
+    /// when the request stream asks for it.
+    async fn write_blob(&self, digest: remexec::Digest, blob: Blob) -> Result<()> {
+        let resource_name = self.upload_resource_name(&digest);
+        let read_error: Arc<Mutex<Option<Error>>> = Arc::default();
+        let sent_bytes = Arc::new(AtomicU64::new(0));
+        let chunk_reader = ChunkReader::Unopened {
+            blob,
+            compress: self.supports_zstd_bytestream,
+        };
+        let requests = futures::stream::unfold(Some(chunk_reader), {
+            let (read_error, sent_bytes) = (read_error.clone(), sent_bytes.clone());
+            move |chunk_reader| {
+                let (read_error, sent_bytes, resource_name) = (
+                    read_error.clone(),
+                    sent_bytes.clone(),
+                    resource_name.clone(),
+                );
+                async move {
+                    let chunk_reader = chunk_reader?;
+                    let next_chunk = tokio::task::spawn_blocking(move || chunk_reader.next_chunk())
+                        .await
+                        .map_err(Error::from)
+                        .flatten();
+                    let (chunk_reader, data) = match next_chunk {
+                        Ok(next_chunk) => next_chunk,
+                        Err(e) => {
+                            *read_error.lock().unwrap() = Some(e);
+                            return None;
+                        }
+                    };
+                    let offset = sent_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+                    let finish_write = data.len() < BYTESTREAM_WRITE_CHUNK_BYTES;
+                    let request = WriteRequest {
+                        // Only the first request names the resource.
+                        resource_name: if offset == 0 {
+                            resource_name
+                        } else {
+                            String::new()
+                        },
+                        write_offset: offset as i64,
+                        finish_write,
+                        data,
+                    };
+                    Some((request, (!finish_write).then_some(chunk_reader)))
+                }
+            }
+        });
+        // hyper sends the request stream from its own task, which keeps going after a
+        // timeout until this function returns and drops `_cancel`.
+        let (_cancel, cancelled) = futures::channel::oneshot::channel::<()>();
+        let requests = requests.take_until(cancelled);
+        let description = format!(
+            "failed to upload blob {}/{} to the REAPI CAS",
+            digest.hash, digest.size_bytes
+        );
+        let response = with_timeout(
+            &description,
+            upload_timeout(digest.size_bytes as u64),
+            async {
+                self.bytestream_client
+                    .clone()
+                    .write(requests)
+                    .await
+                    .map_err(status_error)
+            },
+        )
+        .await;
+        // A server that has the blob may end the write early, so a read error matters only
+        // when the write failed.
+        let committed_size = match response {
+            Ok(response) => response.into_inner().committed_size,
+            Err(e) => return Err(read_error.lock().unwrap().take().unwrap_or(e)),
+        };
+        let sent_bytes = sent_bytes.load(Ordering::Relaxed);
+        // Servers report the bytes received, or, when they end the write early because they
+        // already have the blob, its size (-1 for a compressed upload).
+        let early_committed_size = if self.supports_zstd_bytestream {
+            -1
+        } else {
+            digest.size_bytes
+        };
+        if committed_size != sent_bytes as i64 && committed_size != early_committed_size {
+            bail!(
+                "{description}: the REAPI server committed {committed_size} of {sent_bytes} bytes"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Hashes what passes through to `inner`, failing writes past `max_len` bytes.
@@ -443,9 +617,22 @@ mod test {
 
     /// More than one 1000-byte chunk, which zstd can't shrink.
     fn incompressible_bytes() -> Vec<u8> {
-        let mut data = vec![0; 64 * 1024];
+        incompressible_bytes_of_len(64 * 1024)
+    }
+
+    fn incompressible_bytes_of_len(len: usize) -> Vec<u8> {
+        let mut data = vec![0; len];
         rand::rngs::StdRng::seed_from_u64(0).fill_bytes(&mut data);
         data
+    }
+
+    /// A server whose batches take 64 KiB.
+    async fn cas_with_small_batches(server: FakeServer) -> (Cas, Arc<FakeServer>) {
+        cas_with(FakeServer {
+            max_batch_bytes: 64 * 1024,
+            ..server
+        })
+        .await
     }
 
     async fn cas_and_server(supports_zstd_bytestream: bool) -> (Cas, Arc<FakeServer>) {
@@ -554,11 +741,105 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_an_unreadable_file_fails_the_upload() {
-        let (cas, _) = cas_with(FakeServer::default()).await;
+    async fn test_a_blob_that_fits_only_without_its_overhead_goes_through_bytestream() {
+        let (cas, server) = cas_with(FakeServer {
+            max_batch_bytes: 3 * 1024,
+            ..Default::default()
+        })
+        .await;
+        let large = vec![9; 3 * 1024 - 10];
+        cas.ensure_uploaded(vec![blob(&large)]).await.unwrap();
+        assert!(server.has_blob(&large));
+        assert_eq!(0, server.batch_update_blobs_calls.load(Ordering::SeqCst));
+        assert_eq!(
+            1,
+            server.bytestream_write_resource_names.lock().unwrap().len()
+        );
+    }
+
+    #[test_case(false ; "uncompressed")]
+    #[test_case(true ; "zstd")]
+    #[tokio::test]
+    async fn test_large_blobs_go_through_bytestream(supports_zstd_bytestream: bool) {
+        let (cas, server) = cas_with_small_batches(FakeServer {
+            instance_name: "main".to_owned(),
+            supports_zstd_bytestream,
+            ..Default::default()
+        })
+        .await;
+        // Several chunks even compressed.
+        let large = incompressible_bytes_of_len(3 * BYTESTREAM_WRITE_CHUNK_BYTES + 10);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("large");
+        std::fs::write(&file, &large).unwrap();
+        cas.ensure_uploaded(vec![(digest::of_bytes(&large), Blob::File(file))])
+            .await
+            .unwrap();
+        assert!(server.has_blob(&large));
+        assert_eq!(0, server.batch_update_blobs_calls.load(Ordering::SeqCst));
+        let resource_names = server.bytestream_write_resource_names.lock().unwrap();
+        assert_eq!(1, resource_names.len());
+        assert_eq!(
+            supports_zstd_bytestream,
+            resource_names[0].contains("/compressed-blobs/zstd/"),
+            "{resource_names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_upload_of_whole_chunks_finishes() {
+        let (cas, server) = cas_with_small_batches(FakeServer::default()).await;
+        // The last request carries no data, only `finish_write`.
+        let data = incompressible_bytes_of_len(2 * BYTESTREAM_WRITE_CHUNK_BYTES);
+        cas.ensure_uploaded(vec![blob(&data)]).await.unwrap();
+        assert!(server.has_blob(&data));
+    }
+
+    const EARLY_FINISH_BYTES: usize = 3 * BYTESTREAM_WRITE_CHUNK_BYTES;
+
+    #[test_case(false, EARLY_FINISH_BYTES as i64 ; "uncompressed")]
+    #[test_case(true, -1 ; "zstd")]
+    #[tokio::test]
+    async fn test_a_write_the_server_ends_early_succeeds(
+        supports_zstd_bytestream: bool,
+        committed_size: i64,
+    ) {
+        let (cas, server) = cas_with_small_batches(FakeServer {
+            supports_zstd_bytestream,
+            early_committed_size: Some(committed_size),
+            ..Default::default()
+        })
+        .await;
+        let data = incompressible_bytes_of_len(EARLY_FINISH_BYTES);
+        cas.ensure_uploaded(vec![blob(&data)]).await.unwrap();
+        assert_eq!(
+            1,
+            server.bytestream_write_resource_names.lock().unwrap().len()
+        );
+    }
+
+    #[test_case(-1 ; "minus one uncompressed")]
+    #[test_case(1000 ; "part of the blob")]
+    #[tokio::test]
+    async fn test_a_wrong_committed_size_fails_the_upload(committed_size: i64) {
+        let (cas, _) = cas_with_small_batches(FakeServer {
+            early_committed_size: Some(committed_size),
+            ..Default::default()
+        })
+        .await;
+        let data = incompressible_bytes_of_len(EARLY_FINISH_BYTES);
+        let e = cas.ensure_uploaded(vec![blob(&data)]).await.unwrap_err();
+        assert!(format!("{e:#}").contains("committed"), "{e:#}");
+    }
+
+    #[test_case(100 ; "in a batch")]
+    #[test_case(100 * 1024 ; "through bytestream")]
+    #[tokio::test]
+    async fn test_an_unreadable_file_fails_the_upload(size: usize) {
+        let (cas, _) = cas_with_small_batches(FakeServer::default()).await;
         let dir = tempfile::tempdir().unwrap();
         let missing = (
-            digest::of_bytes(&[0; 100]),
+            digest::of_bytes(&vec![0; size]),
             Blob::File(dir.path().join("missing")),
         );
         let e = cas.ensure_uploaded(vec![missing]).await.unwrap_err();

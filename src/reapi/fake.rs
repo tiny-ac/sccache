@@ -63,6 +63,10 @@ pub(crate) struct FakeServer {
     pub(crate) find_missing_blobs_calls: AtomicUsize,
     pub(crate) batch_update_blobs_calls: AtomicUsize,
     pub(crate) batched_blob_count: AtomicUsize,
+    pub(crate) bytestream_write_resource_names: Mutex<Vec<String>>,
+    /// Answers each ByteStream write after its first request with this `committed_size`, as
+    /// a server that already has the blob does.
+    pub(crate) early_committed_size: Option<i64>,
     pub(crate) blobs: Mutex<HashMap<(String, i64), Vec<u8>>>,
     pub(crate) action_results: Mutex<HashMap<(String, i64), remexec::ActionResult>>,
 }
@@ -130,36 +134,52 @@ impl FakeServer {
         format!("grpc://{addr}")
     }
 
-    fn parse_resource_name(
+    /// `[<instance>/]{blobs,compressed-blobs/zstd}/<hash>/<size>`.
+    fn parse_read_resource_name(
         &self,
         resource_name: &str,
     ) -> std::result::Result<ResourceName, Status> {
-        let invalid = || Status::invalid_argument(resource_name.to_owned());
-        let blob_name = if self.instance_name.is_empty() {
-            resource_name
-        } else {
-            resource_name
-                .strip_prefix(&format!("{}/", self.instance_name))
-                .ok_or_else(invalid)?
-        };
-        let (is_zstd, hash_and_size) =
-            if let Some(hash_and_size) = blob_name.strip_prefix("compressed-blobs/zstd/") {
-                (true, hash_and_size)
-            } else if let Some(hash_and_size) = blob_name.strip_prefix("blobs/") {
-                (false, hash_and_size)
-            } else {
-                return Err(invalid());
-            };
-        let (hash, size) = hash_and_size.split_once('/').ok_or_else(invalid)?;
-        let size_bytes = size.parse().map_err(|_| invalid())?;
-        Ok(ResourceName {
-            digest: remexec::Digest {
-                hash: hash.to_owned(),
-                size_bytes,
-            },
-            is_zstd,
-        })
+        self.strip_instance_name(resource_name)
+            .and_then(parse_blob_name)
+            .ok_or_else(|| Status::invalid_argument(resource_name.to_owned()))
     }
+
+    /// `[<instance>/]uploads/<uuid>/{blobs,compressed-blobs/zstd}/<hash>/<size>`.
+    fn parse_write_resource_name(
+        &self,
+        resource_name: &str,
+    ) -> std::result::Result<ResourceName, Status> {
+        self.strip_instance_name(resource_name)
+            .and_then(|name| name.strip_prefix("uploads/"))
+            .and_then(|name| name.split_once('/'))
+            .filter(|(upload_id, _)| uuid::Uuid::parse_str(upload_id).is_ok())
+            .and_then(|(_, blob_name)| parse_blob_name(blob_name))
+            .ok_or_else(|| Status::invalid_argument(resource_name.to_owned()))
+    }
+
+    fn strip_instance_name<'a>(&self, resource_name: &'a str) -> Option<&'a str> {
+        if self.instance_name.is_empty() {
+            Some(resource_name)
+        } else {
+            resource_name.strip_prefix(&format!("{}/", self.instance_name))
+        }
+    }
+}
+
+/// `{blobs,compressed-blobs/zstd}/<hash>/<size>`.
+fn parse_blob_name(blob_name: &str) -> Option<ResourceName> {
+    let (is_zstd, hash_and_size) = match blob_name.strip_prefix("compressed-blobs/zstd/") {
+        Some(hash_and_size) => (true, hash_and_size),
+        None => (false, blob_name.strip_prefix("blobs/")?),
+    };
+    let (hash, size) = hash_and_size.split_once('/')?;
+    Some(ResourceName {
+        digest: remexec::Digest {
+            hash: hash.to_owned(),
+            size_bytes: size.parse().ok()?,
+        },
+        is_zstd,
+    })
 }
 
 /// Routes each request by its gRPC path, since sccache builds tonic without its `router`
@@ -382,7 +402,8 @@ impl ByteStream for FakeServer {
         if request.read_offset != 0 || request.read_limit != 0 {
             return Err(Status::invalid_argument("partial reads not supported"));
         }
-        let ResourceName { digest, is_zstd } = self.parse_resource_name(&request.resource_name)?;
+        let ResourceName { digest, is_zstd } =
+            self.parse_read_resource_name(&request.resource_name)?;
         if is_zstd && !self.supports_zstd_bytestream {
             return Err(Status::invalid_argument("compressed-blobs not offered"));
         }
@@ -416,8 +437,49 @@ impl ByteStream for FakeServer {
         Ok(Response::new(Box::pin(futures::stream::iter(chunks))))
     }
 
-    async fn write(&self, _: Request<Streaming<WriteRequest>>) -> RpcResult<WriteResponse> {
-        Err(Status::unimplemented("Write"))
+    async fn write(&self, request: Request<Streaming<WriteRequest>>) -> RpcResult<WriteResponse> {
+        let mut stream = request.into_inner();
+        let mut resource_name = None;
+        let mut data = vec![];
+        let mut finished = false;
+        while let Some(request) = stream.message().await? {
+            if resource_name.is_none() {
+                resource_name = Some(request.resource_name.clone());
+                self.bytestream_write_resource_names
+                    .lock()
+                    .unwrap()
+                    .push(request.resource_name);
+                if let Some(committed_size) = self.early_committed_size {
+                    return Ok(Response::new(WriteResponse { committed_size }));
+                }
+            }
+            if request.write_offset != data.len() as i64 {
+                return Err(Status::invalid_argument("write_offset"));
+            }
+            data.extend_from_slice(&request.data);
+            if request.finish_write {
+                finished = true;
+                break;
+            }
+        }
+        if !finished {
+            return Err(Status::invalid_argument("no finish_write"));
+        }
+        let committed_size = data.len() as i64;
+        let ResourceName { digest, is_zstd } =
+            self.parse_write_resource_name(&resource_name.unwrap_or_default())?;
+        if is_zstd {
+            data = zstd::bulk::decompress(&data, digest.size_bytes as usize)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        }
+        if digest::of_bytes(&data) != digest {
+            return Err(Status::invalid_argument("digest mismatch"));
+        }
+        self.blobs
+            .lock()
+            .unwrap()
+            .insert((digest.hash, digest.size_bytes), data);
+        Ok(Response::new(WriteResponse { committed_size }))
     }
 
     async fn query_write_status(
