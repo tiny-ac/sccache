@@ -14,7 +14,7 @@
 
 //! Looks actions up in a REAPI server's action cache.
 
-use super::client::{AuthChannel, Client, RPC_TIMEOUT, status_error, with_timeout};
+use super::client::{AuthChannel, Client, RPC_TIMEOUT, status_error, with_retries, with_timeout};
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use crate::errors::*;
 use remexec::action_cache_client::ActionCacheClient;
@@ -52,18 +52,18 @@ impl ActionCache {
                 action_digest.hash, action_digest.size_bytes
             ),
             RPC_TIMEOUT,
-            async {
+            with_retries(|| async {
                 match self
                     .action_cache_client
                     .clone()
-                    .get_action_result(request)
+                    .get_action_result(request.clone())
                     .await
                 {
                     Ok(response) => Ok(Some(response.into_inner())),
                     Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
                     Err(status) => Err(status_error(status)),
                 }
-            },
+            }),
         )
         .await
     }
@@ -72,7 +72,7 @@ impl ActionCache {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::reapi::client::rpc_code;
+    use crate::reapi::client::{RETRIES, rpc_code};
     use crate::reapi::digest;
     use crate::reapi::fake::FakeServer;
     use std::sync::Arc;
@@ -107,6 +107,23 @@ mod test {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn test_lookups_are_tried_again_while_the_server_is_busy() {
+        let server = Arc::new(FakeServer::default());
+        let action_cache = ActionCache::new(&server.serve_and_connect().await);
+        let action_digest = digest::of_bytes(b"action");
+        server.insert_action_result(&action_digest, remexec::ActionResult::default());
+        server.answer_busy("GetActionResult", RETRIES as usize);
+        assert!(
+            action_cache
+                .get_action_result(&action_digest)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(server.gave_every_busy_answer());
     }
 
     #[tokio::test]
