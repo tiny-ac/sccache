@@ -31,6 +31,8 @@ pub(crate) struct InputRootFile {
 
 pub(crate) struct InputRoot {
     pub(crate) digest: remexec::Digest,
+    /// The encoded `Directory` protos of the root and every directory under it.
+    pub(crate) directories: Vec<(remexec::Digest, Vec<u8>)>,
 }
 
 enum Node {
@@ -50,8 +52,11 @@ impl InputRoot {
         for file in files {
             add_file(&mut root, &file.path, file)?;
         }
+        let mut directories = vec![];
+        let digest = tree_digest(root, &mut directories);
         Ok(InputRoot {
-            digest: tree_digest(root),
+            digest,
+            directories,
         })
     }
 }
@@ -113,7 +118,10 @@ fn check_name(name: &str, file: &InputRootFile) -> Result<()> {
 
 // `BTreeMap` iterates in byte order, which for UTF-8 names is the code point order
 // REAPI requires of `Directory` protos.
-fn tree_digest(dir: BTreeMap<String, Node>) -> remexec::Digest {
+fn tree_digest(
+    dir: BTreeMap<String, Node>,
+    directories: &mut Vec<(remexec::Digest, Vec<u8>)>,
+) -> remexec::Digest {
     let mut directory_proto = remexec::Directory::default();
     for (name, node) in dir {
         match node {
@@ -128,20 +136,20 @@ fn tree_digest(dir: BTreeMap<String, Node>) -> remexec::Digest {
             }),
             Node::Directory(subdir) => directory_proto.directories.push(remexec::DirectoryNode {
                 name,
-                digest: Some(tree_digest(subdir)),
+                digest: Some(tree_digest(subdir, directories)),
             }),
         }
     }
-    proto_digest(&directory_proto)
-}
-
-fn proto_digest(proto: &impl Message) -> remexec::Digest {
-    digest::of_bytes(&proto.encode_to_vec())
+    let bytes = directory_proto.encode_to_vec();
+    let digest = digest::of_bytes(&bytes);
+    directories.push((digest.clone(), bytes));
+    digest
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::collections::HashMap;
     use test_case::test_case;
 
     fn file(path: &str, content: &[u8]) -> InputRootFile {
@@ -152,11 +160,31 @@ mod test {
         }
     }
 
+    fn proto_digest(proto: &impl Message) -> remexec::Digest {
+        digest::of_bytes(&proto.encode_to_vec())
+    }
+
     fn file_node(name: &str, content: &[u8]) -> remexec::FileNode {
         remexec::FileNode {
             name: name.to_owned(),
             digest: Some(digest::of_bytes(content)),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_directories_hold_every_directory_proto() {
+        let input_root =
+            InputRoot::build(&[file("a/x", b"1"), file("a/y/z", b"2"), file("b", b"3")]).unwrap();
+        let directories: HashMap<_, _> = input_root.directories.iter().cloned().collect();
+        assert_eq!(3, directories.len());
+        assert!(directories.contains_key(&input_root.digest));
+        for (digest, bytes) in &directories {
+            assert_eq!(*digest, digest::of_bytes(bytes));
+            let directory = remexec::Directory::decode(bytes.as_slice()).unwrap();
+            for subdir in directory.directories {
+                assert!(directories.contains_key(&subdir.digest.unwrap()));
+            }
         }
     }
 
