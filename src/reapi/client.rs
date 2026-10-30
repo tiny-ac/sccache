@@ -129,16 +129,7 @@ impl Client {
         } else if options.auth_token.is_some() {
             warn!("REAPI: sending the auth token without TLS");
         }
-        let auth_header = match options.auth_token.as_deref().map(str::trim) {
-            Some("") => bail!("the REAPI auth token is empty"),
-            Some(token) => {
-                let mut header = AsciiMetadataValue::try_from(format!("Bearer {token}"))
-                    .context("the REAPI auth token contains a non-ASCII or control character")?;
-                header.set_sensitive(true);
-                Some(header)
-            }
-            None => None,
-        };
+        let auth_header = auth_header(options.auth_token.as_deref())?;
         let channel = with_timeout(
             "failed to connect to the REAPI server",
             CONNECT_TIMEOUT,
@@ -215,6 +206,28 @@ impl Client {
 
     pub(crate) fn supports_zstd_bytestream(&self) -> bool {
         self.supports_zstd_bytestream
+    }
+}
+
+/// Fails if `options` has an invalid endpoint or auth token, without connecting.
+pub(super) fn check_connect_options(options: &ConnectOptions) -> Result<()> {
+    let endpoint = parse_endpoint(&options.endpoint)?;
+    Endpoint::from_shared(endpoint.http_url).context("the REAPI endpoint is not valid")?;
+    auth_header(options.auth_token.as_deref())?;
+    Ok(())
+}
+
+/// The bearer `authorization` header for `auth_token`, if any.
+fn auth_header(auth_token: Option<&str>) -> Result<Option<AsciiMetadataValue>> {
+    match auth_token.map(str::trim) {
+        Some("") => bail!("the REAPI auth token is empty"),
+        Some(token) => {
+            let mut header = AsciiMetadataValue::try_from(format!("Bearer {token}"))
+                .context("the REAPI auth token contains a non-ASCII or control character")?;
+            header.set_sensitive(true);
+            Ok(Some(header))
+        }
+        None => Ok(None),
     }
 }
 
@@ -695,5 +708,21 @@ mod test {
     fn test_endpoint_is_refused_without_echoing_it(endpoint: &str) {
         let e = parse_endpoint(endpoint).unwrap_err();
         assert!(!format!("{e:#}").contains("secret"), "{e:#}");
+    }
+
+    #[test_case("grpcs://farm:443", Some("token"), true ; "valid")]
+    #[test_case("farm:443", None, false ; "bad endpoint")]
+    #[test_case("grpcs://farm:443", Some(" "), false ; "empty token")]
+    fn test_connect_options_are_checked_without_connecting(
+        endpoint: &str,
+        auth_token: Option<&str>,
+        valid: bool,
+    ) {
+        let options = ConnectOptions {
+            endpoint: endpoint.to_owned(),
+            auth_token: auth_token.map(str::to_owned),
+            ..Default::default()
+        };
+        assert_eq!(valid, check_connect_options(&options).is_ok());
     }
 }

@@ -156,11 +156,12 @@ pub struct DistClientContainer {
 
 #[cfg(feature = "reapi")]
 fn reapi_executor(config: &Config) -> Option<Arc<crate::reapi::ReapiExecutor>> {
-    config
-        .dist
-        .reapi
-        .as_ref()
-        .map(|_| Arc::new(crate::reapi::ReapiExecutor::new(&config.dist.cache_dir)))
+    config.dist.reapi.as_ref().map(|reapi| {
+        Arc::new(crate::reapi::ReapiExecutor::new(
+            reapi,
+            &config.dist.cache_dir,
+        ))
+    })
 }
 
 #[cfg(not(feature = "reapi"))]

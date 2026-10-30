@@ -48,17 +48,24 @@ token = "secrettoken"
 
 # Experimental, needs sccache built with the reapi feature: a Remote
 # Execution API (REAPI) server for Rust compiles. Setting it turns
-# sccache-dist (even with scheduler_url set) and client-side mode off. The
-# server isn't contacted yet: Rust compiles run locally with the arguments a
-# REAPI worker uses, with a copy of the Rust sysroot under
-# <cache_dir>/reapi-sysroot-copies (never removed), and --show-stats lists,
-# by reason, the ones a REAPI server couldn't run.
+# sccache-dist (even with scheduler_url set) and client-side mode off.
+# sccache connects to the server but doesn't use it yet: Rust compiles run
+# locally with the arguments a REAPI worker uses, with a copy of the Rust
+# sysroot under <cache_dir>/reapi-sysroot-copies (never removed), and
+# --show-stats lists, by reason, the ones that couldn't use the server. A
+# failed connection is retried after 5 to 60 seconds; a server older than
+# REAPI v2.1, or one that refuses the token, isn't used until sccache restarts.
 #[dist.reapi]
 # grpc://host:port, or grpcs://host:port for TLS (required)
 endpoint = "grpcs://remote.example.com:443"
 instance_name = ""
-# a file holding the bearer token sent with every request
+# a file holding the bearer token sent with every request, read when sccache
+# starts
 auth_token_file = "/home/user/.config/sccache/reapi-token"
+# how long a compile waits for the connection to the server, up to 3600; a
+# compile that finds it not connected by then runs locally. 0, the default,
+# doesn't wait
+ready_wait_secs = 0
 
 # Multi-level cache configuration
 # Define cache levels in order (fast to slow).
