@@ -28,6 +28,7 @@ mod nvcc;
 mod nvhpc;
 mod preprocessor_cache;
 mod ptxas;
+mod remote;
 mod rust;
 mod tasking_vx;
 #[macro_use]
