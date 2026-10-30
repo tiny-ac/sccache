@@ -45,6 +45,8 @@ pub mod lru_disk_cache;
 mod mock_command;
 mod net;
 mod protocol;
+#[cfg(feature = "reapi")]
+mod reapi;
 pub mod server;
 #[doc(hidden)]
 pub mod util;
