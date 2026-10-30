@@ -178,8 +178,8 @@ mod test {
     use crate::compiler::{Cacheable, CompileCommand, LocalArg, SingleCompileCommand};
     use crate::dist;
     use crate::mock_command::{MockChild, MockCommandCreator, exit_status};
-    use crate::reapi::PathMapper;
     use crate::reapi::fake::FakeServer;
+    use crate::reapi::{PathMapper, ToolchainKey};
     use crate::server::SccacheService;
     use crate::test::utils::{new_creator, next_command};
     use std::ffi::OsString;
@@ -220,7 +220,11 @@ mod test {
                 path_mapper: PathMapper::new("/src".into(), "/src/target".into()),
                 arguments: vec![],
                 mapped_crate_root: None,
-                target_triple: "x86_64-unknown-linux-gnu".to_owned(),
+                toolchain: ToolchainKey::new(
+                    "abc123".to_owned(),
+                    "/toolchain".into(),
+                    "x86_64-unknown-linux-gnu".to_owned(),
+                ),
                 env: Default::default(),
                 input_root_files: vec![],
                 outputs: vec![],
