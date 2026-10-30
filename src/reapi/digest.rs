@@ -208,6 +208,13 @@ impl DigestCache {
         Ok(digest)
     }
 
+    /// Caches files however recently they changed.
+    #[cfg(test)]
+    pub(super) fn caching_new_files(mut self) -> Self {
+        self.min_age_to_cache = Duration::ZERO;
+        self
+    }
+
     pub(crate) fn save(&self) -> Result<()> {
         let to_save: HashMap<PathBuf, DigestCacheEntry> = self
             .entries
