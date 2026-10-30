@@ -30,6 +30,7 @@ mod pause;
 pub(crate) mod proto;
 mod remote_compile;
 mod sysroot;
+mod terminal_output;
 mod toolchains;
 
 pub(crate) use executor::ReapiExecutor;

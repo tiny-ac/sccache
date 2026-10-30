@@ -20,6 +20,7 @@ use super::digest::{self, DigestCache};
 use super::input_root::{InputRoot, InputRootFile};
 use super::mapping::{BUILD_ROOT_DIR, CompileLocallyReason, ReapiCompile, TOOLCHAIN_DIR};
 use super::proto::build::bazel::remote::execution::v2 as remexec;
+use super::terminal_output::without_terminal_controls;
 use crate::config::ReapiConfig;
 use crate::errors::*;
 use crate::mock_command::exit_status;
@@ -505,12 +506,16 @@ pub(super) async fn materialize(
             .map(|file| download_output(cas, compile, file, &worker_root)),
     )
     .await?;
-    let stdout = compile
-        .path_mapper
-        .worker_paths_to_local(&stdout, &worker_root);
-    let stderr = compile
-        .path_mapper
-        .worker_paths_to_local(&stderr, &worker_root);
+    let stdout = without_terminal_controls(
+        &compile
+            .path_mapper
+            .worker_paths_to_local(&stdout, &worker_root),
+    );
+    let stderr = without_terminal_controls(
+        &compile
+            .path_mapper
+            .worker_paths_to_local(&stderr, &worker_root),
+    );
     tokio::task::spawn_blocking(move || write_outputs(output_contents))
         .await
         .context(UnwritableOutputs)??;
@@ -1234,6 +1239,24 @@ pub(super) mod test {
             String::from_utf8(output.stdout).unwrap()
         );
         assert!(output.stderr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stdout_and_stderr_lose_terminal_controls_but_not_colors() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = remexec::ActionResult {
+            stdout_raw: b"\x1b]52;c;Zm9v\x07out".to_vec(),
+            stderr_raw: format!(
+                "{WORKER_ROOT_MARKER}/w/1\n\x1b]0;title\x07\x1b[33mwarning\x1b[0m\n"
+            )
+            .into_bytes(),
+            ..rlib_and_rmeta_result()
+        };
+        let output = materialize_in(dir.path(), &[b"rlib", b"rmeta"], result)
+            .await
+            .unwrap();
+        assert_eq!(b"out".as_slice(), output.stdout);
+        assert_eq!(b"\x1b[33mwarning\x1b[0m\n".as_slice(), output.stderr);
     }
 
     #[test_case(
