@@ -173,6 +173,7 @@ pub(crate) enum CompileLocallyReason {
     UnreadableInput,
     UploadFailed,
     ExecutionFailed,
+    ExecutionQueuedTooLong,
     CompileFailedOnWorker,
 }
 
@@ -225,6 +226,7 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::UnreadableInput => "failed to read an input to upload it",
             Self::UploadFailed => "failed to upload the action's blobs",
             Self::ExecutionFailed => "REAPI execution failed",
+            Self::ExecutionQueuedTooLong => "REAPI execution queued too long",
             Self::CompileFailedOnWorker => "compile failed on a worker",
         })
     }
