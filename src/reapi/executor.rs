@@ -22,12 +22,12 @@ use super::client::{ConnectOptions, RPC_TIMEOUT, check_connect_options};
 use super::connection::{Connection, ServerApis};
 use super::digest::DigestCache;
 use super::execution::{Execution, MissingActionBlobs};
-use super::mapping::{CompileLocallyReason, ReapiCompile};
+use super::mapping::{CompileLocallyReason, ReapiCompile, ToolchainKey};
 use super::pause::Pause;
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use super::remote_compile::{
-    ActionBlobs, ActionOptions, action_blobs, digest_input_root_files, materialize,
-    materialize_failure_reason,
+    ActionBlobs, ActionOptions, action_blobs, digest_input_root_files, download_stdout_or_stderr,
+    materialize, materialize_failure_reason, rustc_version_action_blobs,
 };
 use super::toolchains::{ToolchainFiles, Toolchains};
 use crate::compiler::{
@@ -38,9 +38,10 @@ use crate::config::{ReapiConfig, ReapiOnMiss};
 use crate::errors::*;
 use crate::mock_command::CommandCreatorSync;
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Directory under the dist cache dir for the sysroot copies local compiles use.
@@ -65,6 +66,23 @@ pub struct ReapiExecutor {
     action_options: ActionOptions,
     on_miss: ReapiOnMiss,
     is_linux_client: bool,
+    rustc_checks: Mutex<HashMap<ToolchainKey, Arc<RustcCheck>>>,
+}
+
+/// The check, once per toolchain, that the workers run its rustc.
+#[derive(Default)]
+struct RustcCheck {
+    outcome: tokio::sync::OnceCell<RustcOnWorkers>,
+    /// How many checks failed to reach a worker, and the last one's reason, so a compile that
+    /// waited for a check that failed doesn't start another.
+    failures: Mutex<(u64, Option<CompileLocallyReason>)>,
+}
+
+#[derive(Clone, Copy)]
+enum RustcOnWorkers {
+    Matches,
+    /// Compiles with the toolchain compile locally, for this reason.
+    Unusable(CompileLocallyReason),
 }
 
 /// What looking a compile up, and executing it on a miss, needs.
@@ -104,6 +122,7 @@ impl ReapiExecutor {
             action_options: ActionOptions::new(config),
             on_miss: config.on_miss,
             is_linux_client: cfg!(target_os = "linux"),
+            rustc_checks: Default::default(),
         }
     }
 
@@ -183,6 +202,7 @@ impl ReapiExecutor {
         } = lookup;
         let digest_cache = self.digest_cache.clone();
         let action_options = self.action_options.clone();
+        let toolchain_files = toolchain.clone();
         let digested = tokio::task::spawn_blocking(move || {
             let files = digest_input_root_files(&reapi_compile, &digest_cache)?;
             let action = action_blobs(&reapi_compile, &files, &toolchain, &action_options)?;
@@ -249,19 +269,49 @@ impl ReapiExecutor {
         let Some(execution) = &apis.execution else {
             return compile_locally(out_pretty, CompileLocallyReason::ExecutionUnsupported);
         };
+        let rustc_check = self
+            .rustc_checks
+            .lock()
+            .unwrap()
+            .entry(reapi_compile.toolchain.clone())
+            .or_default()
+            .clone();
+        // Without a call to make, the compile mustn't take the one a pause lets through.
+        if let Some(RustcOnWorkers::Unusable(reason)) = rustc_check.outcome.get() {
+            return compile_locally(out_pretty, *reason);
+        }
         if !self.execution_pause.may_call() {
             return compile_locally(out_pretty, CompileLocallyReason::ExecutionsPaused);
         }
-        let executed =
-            upload_and_execute(&apis, execution, &action, skip_cache_lookup, out_pretty).await;
+        let executed = async {
+            self.check_rustc_on_workers(
+                &rustc_check,
+                &apis,
+                execution,
+                &reapi_compile.toolchain,
+                &toolchain_files,
+                out_pretty,
+            )
+            .await?;
+            upload_and_execute(&apis, execution, &action, skip_cache_lookup, out_pretty).await
+        }
+        .await;
         let response = match executed {
             Ok(response) => {
                 self.execution_pause.call_succeeded();
                 response
             }
-            // An input that can't be read says nothing about the server.
-            Err(CompileLocallyReason::UnreadableInput) => {
-                return Err(CompileLocallyReason::UnreadableInput);
+            // An input that can't be read or hashed says nothing about the server, and the
+            // rustc check already counted the server's answer, even if its stdout then failed
+            // to download.
+            Err(
+                reason @ (CompileLocallyReason::UnreadableInput
+                | CompileLocallyReason::HashingInputsFailed
+                | CompileLocallyReason::DownloadingOutputsFailed
+                | CompileLocallyReason::RustcFailsOnWorkers
+                | CompileLocallyReason::RustcCommitDiffersOnWorkers),
+            ) => {
+                return Err(reason);
             }
             Err(reason) => {
                 if let Some(pause) = self.execution_pause.call_failed() {
@@ -294,6 +344,115 @@ impl ReapiExecutor {
         };
         Ok((outcome, output))
     }
+
+    /// Runs the `rustc -vV` of toolchain `key` on a worker, once per `key`. Fails when the
+    /// workers can't run that rustc, or when it prints another commit hash than the local one.
+    /// A check that fails to reach a worker isn't kept, so the next miss checks again, but
+    /// compiles that waited for it compile locally.
+    async fn check_rustc_on_workers(
+        &self,
+        check: &RustcCheck,
+        apis: &ServerApis,
+        execution: &Execution,
+        key: &ToolchainKey,
+        toolchain: &ToolchainFiles,
+        out_pretty: &str,
+    ) -> std::result::Result<(), CompileLocallyReason> {
+        let failures_before = check.failures.lock().unwrap().0;
+        let outcome = check
+            .outcome
+            .get_or_try_init(|| async {
+                let (failures, last_failure) = *check.failures.lock().unwrap();
+                if failures != failures_before
+                    && let Some(reason) = last_failure
+                {
+                    return Err(reason);
+                }
+                let checked = self
+                    .run_rustc_on_worker(apis, execution, key, toolchain, out_pretty)
+                    .await;
+                if let Err(reason) = checked {
+                    *check.failures.lock().unwrap() = (failures + 1, Some(reason));
+                }
+                checked
+            })
+            .await?;
+        match outcome {
+            RustcOnWorkers::Unusable(reason) => compile_locally(out_pretty, *reason),
+            RustcOnWorkers::Matches => Ok(()),
+        }
+    }
+
+    async fn run_rustc_on_worker(
+        &self,
+        apis: &ServerApis,
+        execution: &Execution,
+        key: &ToolchainKey,
+        toolchain: &ToolchainFiles,
+        out_pretty: &str,
+    ) -> std::result::Result<RustcOnWorkers, CompileLocallyReason> {
+        let (files, action_options) = (toolchain.clone(), self.action_options.clone());
+        let action = tokio::task::spawn_blocking(move || {
+            rustc_version_action_blobs(&files, &action_options)
+        })
+        .await
+        .map_err(Error::from)
+        .flatten()
+        .map_err(|e| {
+            warn!(
+                "[{}]: Compiling locally: failed to hash the toolchain: {:#}",
+                out_pretty, e
+            );
+            CompileLocallyReason::HashingInputsFailed
+        })?;
+        let response = upload_and_execute(apis, execution, &action, false, out_pretty).await?;
+        self.execution_pause.call_succeeded();
+        let result = response.result.unwrap_or_default();
+        let sysroot = key.sysroot.display();
+        if result.exit_code != 0 {
+            warn!(
+                "REAPI: rustc -vV of {sysroot} exits with {} on the workers; \
+                 compiling its misses locally",
+                result.exit_code
+            );
+            debug!(
+                "REAPI: rustc -vV of {sysroot} printed on stderr: {}",
+                loggable(&result.stderr_raw)
+            );
+            return Ok(RustcOnWorkers::Unusable(
+                CompileLocallyReason::RustcFailsOnWorkers,
+            ));
+        }
+        let stdout =
+            download_stdout_or_stderr(&apis.cas, &result.stdout_raw, result.stdout_digest.as_ref())
+                .await
+                .map_err(|e| {
+                    warn!("[{}]: Compiling locally: {:#}", out_pretty, e);
+                    CompileLocallyReason::DownloadingOutputsFailed
+                })?;
+        let stdout = String::from_utf8_lossy(&stdout);
+        let commit_hash = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("commit-hash: "));
+        if commit_hash != Some(key.commit_hash.as_str()) {
+            warn!(
+                "REAPI: rustc {sysroot} reports commit hash {} on the workers and {} locally; \
+                 compiling its misses locally",
+                loggable(commit_hash.unwrap_or_default().as_bytes()),
+                key.commit_hash
+            );
+            return Ok(RustcOnWorkers::Unusable(
+                CompileLocallyReason::RustcCommitDiffersOnWorkers,
+            ));
+        }
+        Ok(RustcOnWorkers::Matches)
+    }
+}
+
+/// Worker output for a log line: escaped, and cut to 200 chars.
+fn loggable(output: &[u8]) -> String {
+    let output: String = String::from_utf8_lossy(output).chars().take(200).collect();
+    format!("{output:?}")
 }
 
 /// Writes `result`'s outputs to `reapi_compile`'s local paths.
@@ -481,6 +640,7 @@ mod test {
     type Creator = Arc<Mutex<MockCommandCreator>>;
 
     const TARGET_TRIPLE: &str = "x86_64-unknown-linux-gnu";
+    const COMMIT_HASH: &str = "abc123";
     const RLIB: &str = "target/debug/deps/libfoo.rlib";
 
     #[derive(Clone, Copy)]
@@ -495,6 +655,7 @@ mod test {
     struct FakeCompilation {
         eligibility: Eligibility,
         dir: PathBuf,
+        commit_hash: String,
     }
 
     impl Compilation<Creator> for FakeCompilation {
@@ -522,7 +683,7 @@ mod test {
                 arguments: vec![],
                 mapped_crate_root: None,
                 toolchain: ToolchainKey::new(
-                    "abc123".to_owned(),
+                    self.commit_hash.clone(),
                     self.dir.join("sysroot"),
                     TARGET_TRIPLE.to_owned(),
                 ),
@@ -580,6 +741,8 @@ mod test {
         eligibility: Eligibility,
         cache_control: CacheControl,
         local_compile_changed: bool,
+        /// The local rustc's, which makes the toolchain key.
+        commit_hash: String,
     }
 
     impl Fixture {
@@ -606,6 +769,7 @@ mod test {
                 eligibility,
                 cache_control: CacheControl::Default,
                 local_compile_changed: true,
+                commit_hash: COMMIT_HASH.to_owned(),
             }
         }
 
@@ -613,6 +777,7 @@ mod test {
             FakeCompilation {
                 eligibility: self.eligibility,
                 dir: self.dir.path().to_owned(),
+                commit_hash: self.commit_hash.clone(),
             }
         }
 
@@ -660,6 +825,15 @@ mod test {
 
         /// Like `compile`, through `executor`.
         fn compile_with(&self, executor: &ReapiExecutor) -> (DistType, process::Output) {
+            self.compile_at_once(executor, 1).pop().unwrap()
+        }
+
+        /// Runs `n` compiles through `executor` at once.
+        fn compile_at_once(
+            &self,
+            executor: &ReapiExecutor,
+            n: usize,
+        ) -> Vec<(DistType, process::Output)> {
             let storage = Arc::new(crate::cache::disk::DiskCache::new(
                 self.dir.path(),
                 0,
@@ -669,31 +843,36 @@ mod test {
                 vec![],
             ));
             let service = SccacheService::mock_with_storage(storage, self.runtime.handle().clone());
-            let creator = new_creator();
-            next_command(&creator, Ok(MockChild::new(exit_status(0), "out", "err")));
-            let command = SingleCompileCommand {
-                executable: "rustc".into(),
-                arguments: vec![],
-                env_vars: vec![],
-                cwd: ".".into(),
-                share_jobserver: false,
-            };
-            let local_compile = LocalCompile {
-                service: &service,
-                creator: &creator,
-                command: crate::compiler::CCompileCommand::new(command),
-                stdout_stderr_mapper: None,
-            };
-            let job = RemoteJob {
-                compilation: Box::new(self.compilation()),
-                out_pretty: "lib.rs".to_owned(),
-                dist_job: None,
-                cache_control: self.cache_control,
-                local_compile_changed: self.local_compile_changed,
-            };
+            let creators: Vec<_> = (0..n).map(|_| new_creator()).collect();
+            let compiles = creators.iter().map(|creator| {
+                next_command(creator, Ok(MockChild::new(exit_status(0), "out", "err")));
+                let command = SingleCompileCommand {
+                    executable: "rustc".into(),
+                    arguments: vec![],
+                    env_vars: vec![],
+                    cwd: ".".into(),
+                    share_jobserver: false,
+                };
+                let local_compile = LocalCompile {
+                    service: &service,
+                    creator,
+                    command: crate::compiler::CCompileCommand::new(command),
+                    stdout_stderr_mapper: None,
+                };
+                let job = RemoteJob {
+                    compilation: Box::new(self.compilation()),
+                    out_pretty: "lib.rs".to_owned(),
+                    dist_job: None,
+                    cache_control: self.cache_control,
+                    local_compile_changed: self.local_compile_changed,
+                };
+                executor.compile(job, local_compile)
+            });
             self.runtime
-                .block_on(executor.compile(job, local_compile))
-                .unwrap()
+                .block_on(futures::future::join_all(compiles))
+                .into_iter()
+                .map(Result::unwrap)
+                .collect()
         }
     }
 
@@ -711,7 +890,8 @@ mod test {
         DistType::Reapi(ReapiOutcome::CompiledLocally(reason.to_owned()))
     }
 
-    /// A fixture whose misses execute on `server`, whose workers write the rlib.
+    /// A fixture whose misses execute on `server`, whose workers run the toolchain's rustc and
+    /// write the rlib.
     fn executing_fixture(server: FakeServer) -> Fixture {
         let mut fixture = Fixture::with_server(
             Eligibility::Eligible,
@@ -732,7 +912,132 @@ mod test {
             .lock()
             .unwrap()
             .insert(rlib, b"rlib".to_vec());
+        *fixture.server.worker_rustc_commit_hash.lock().unwrap() = Some(COMMIT_HASH.to_owned());
         fixture
+    }
+
+    #[test]
+    fn test_rustc_is_checked_on_a_worker_once() {
+        let fixture = executing_fixture(FakeServer::default());
+        let executor = fixture.executor();
+        let (dist_type, _) = fixture.compile_with(&executor);
+        assert_eq!(DistType::Reapi(ReapiOutcome::Executed), dist_type);
+        fixture.server.action_results.lock().unwrap().clear();
+        let (dist_type, _) = fixture.compile_with(&executor);
+        assert_eq!(DistType::Reapi(ReapiOutcome::Executed), dist_type);
+        // rustc -vV, then each compile.
+        assert_eq!(3, fixture.server.execute_calls.load(Ordering::SeqCst));
+    }
+
+    #[test_case::test_case(None, "rustc -vV fails on the workers" ; "rustc fails")]
+    #[test_case::test_case(
+        Some("def456"),
+        "rustc on the workers reports another commit hash" ;
+        "another commit"
+    )]
+    fn test_a_toolchain_whose_rustc_check_fails_compiles_locally(
+        worker_commit_hash: Option<&str>,
+        reason: &str,
+    ) {
+        let fixture = executing_fixture(FakeServer::default());
+        *fixture.server.worker_rustc_commit_hash.lock().unwrap() =
+            worker_commit_hash.map(str::to_owned);
+        let executor = fixture.executor();
+        for _ in 0..2 {
+            assert_eq!(compiled_locally(reason), fixture.compile_with(&executor).0);
+        }
+        // Only rustc -vV ran, once.
+        assert_eq!(1, fixture.server.execute_calls.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_compiles_that_waited_for_a_failed_rustc_check_dont_check_again() {
+        let fixture = executing_fixture(FakeServer {
+            fail_uploads: true.into(),
+            ..Default::default()
+        });
+        let executor = fixture.executor();
+        for (dist_type, _) in fixture.compile_at_once(&executor, 2) {
+            assert_eq!(
+                compiled_locally("failed to upload the action's blobs"),
+                dist_type
+            );
+        }
+        assert_eq!(
+            1,
+            fixture
+                .server
+                .find_missing_blobs_calls
+                .load(Ordering::SeqCst)
+        );
+    }
+
+    /// Fails executions until they pause, then ends the pause.
+    fn pause_executions(fixture: &Fixture, executor: &ReapiExecutor) {
+        fixture.server.fail_uploads.store(true, Ordering::SeqCst);
+        for _ in 0..FAILURES_TO_PAUSE {
+            fixture.compile_with(executor);
+        }
+        assert_eq!(
+            compiled_locally("REAPI executions paused after failures"),
+            fixture.compile_with(executor).0
+        );
+        fixture.server.fail_uploads.store(false, Ordering::SeqCst);
+        executor.execution_pause.end();
+    }
+
+    #[test]
+    fn test_a_toolchain_known_to_fail_its_rustc_check_leaves_the_call_after_a_pause() {
+        let mut fixture = executing_fixture(FakeServer::default());
+        let executor = fixture.executor();
+        fixture.commit_hash = "def456".to_owned();
+        let rustc_differs = compiled_locally("rustc on the workers reports another commit hash");
+        assert_eq!(rustc_differs, fixture.compile_with(&executor).0);
+        fixture.commit_hash = COMMIT_HASH.to_owned();
+        pause_executions(&fixture, &executor);
+        fixture.commit_hash = "def456".to_owned();
+        assert_eq!(rustc_differs, fixture.compile_with(&executor).0);
+        fixture.commit_hash = COMMIT_HASH.to_owned();
+        assert_eq!(
+            DistType::Reapi(ReapiOutcome::Executed),
+            fixture.compile_with(&executor).0
+        );
+    }
+
+    #[test]
+    fn test_a_rustc_check_the_workers_answer_ends_a_pause() {
+        let mut fixture = executing_fixture(FakeServer::default());
+        let executor = fixture.executor();
+        pause_executions(&fixture, &executor);
+        fixture.commit_hash = "def456".to_owned();
+        assert_eq!(
+            compiled_locally("rustc on the workers reports another commit hash"),
+            fixture.compile_with(&executor).0
+        );
+        fixture.commit_hash = COMMIT_HASH.to_owned();
+        assert_eq!(
+            DistType::Reapi(ReapiOutcome::Executed),
+            fixture.compile_with(&executor).0
+        );
+    }
+
+    #[test]
+    fn test_a_rustc_check_that_didnt_reach_a_worker_runs_again() {
+        let fixture = executing_fixture(FakeServer {
+            fail_uploads: true.into(),
+            ..Default::default()
+        });
+        let executor = fixture.executor();
+        assert_eq!(
+            compiled_locally("failed to upload the action's blobs"),
+            fixture.compile_with(&executor).0
+        );
+        fixture.server.fail_uploads.store(false, Ordering::SeqCst);
+        assert_eq!(
+            DistType::Reapi(ReapiOutcome::Executed),
+            fixture.compile_with(&executor).0
+        );
+        assert_eq!(2, fixture.server.execute_calls.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -746,7 +1051,8 @@ mod test {
         // The execution cached its result.
         let (dist_type, _) = fixture.compile();
         assert_eq!(DistType::Reapi(ReapiOutcome::ActionCacheHit), dist_type);
-        assert_eq!(1, fixture.server.actions_run.load(Ordering::SeqCst));
+        // rustc -vV, then the compile.
+        assert_eq!(2, fixture.server.actions_run.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -798,9 +1104,9 @@ mod test {
         let (dist_type, output) = fixture.compile();
         assert_eq!(compiled_locally("compile failed on a worker"), dist_type);
         assert_eq!(b"out".as_slice(), output.stdout);
-        // The failure wasn't cached.
+        // rustc -vV and the compile, twice: the server cached neither.
         fixture.compile();
-        assert_eq!(2, fixture.server.actions_run.load(Ordering::SeqCst));
+        assert_eq!(4, fixture.server.actions_run.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -839,7 +1145,7 @@ mod test {
     #[test]
     fn test_a_failed_upload_compiles_locally() {
         let fixture = executing_fixture(FakeServer {
-            fail_uploads: true,
+            fail_uploads: true.into(),
             ..Default::default()
         });
         let (dist_type, _) = fixture.compile();
@@ -871,8 +1177,9 @@ mod test {
         fixture.put_result_in_action_cache(|_| {});
         let (dist_type, _) = fixture.compile();
         assert_eq!(DistType::Reapi(ReapiOutcome::ActionCacheHit), dist_type);
-        assert_eq!(1, fixture.server.execute_calls.load(Ordering::SeqCst));
-        assert_eq!(0, fixture.server.actions_run.load(Ordering::SeqCst));
+        assert_eq!(2, fixture.server.execute_calls.load(Ordering::SeqCst));
+        // Only rustc -vV ran.
+        assert_eq!(1, fixture.server.actions_run.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -883,7 +1190,8 @@ mod test {
         });
         let (dist_type, _) = fixture.compile();
         assert_eq!(DistType::Reapi(ReapiOutcome::Executed), dist_type);
-        assert_eq!(2, fixture.server.execute_calls.load(Ordering::SeqCst));
+        // rustc -vV twice, since the CAS forgot the blobs, then the compile.
+        assert_eq!(3, fixture.server.execute_calls.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -892,7 +1200,8 @@ mod test {
         fixture.put_result_in_action_cache(|result| result.exit_code = 1);
         let (dist_type, _) = fixture.compile();
         assert_eq!(DistType::Reapi(ReapiOutcome::Executed), dist_type);
-        assert_eq!(1, fixture.server.actions_run.load(Ordering::SeqCst));
+        // rustc -vV, then the compile.
+        assert_eq!(2, fixture.server.actions_run.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -1111,6 +1420,7 @@ mod test {
             &FakeCompilation {
                 eligibility: Eligibility::Eligible,
                 dir: "/".into(),
+                commit_hash: COMMIT_HASH.to_owned(),
             },
         );
         let mut expected = OsString::from("--sysroot=");

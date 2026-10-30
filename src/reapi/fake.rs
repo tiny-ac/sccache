@@ -74,7 +74,7 @@ pub(crate) struct FakeServer {
     /// sccache hashes it.
     pub(crate) delete_at_find_missing: Mutex<Option<PathBuf>>,
     /// Answers BatchUpdateBlobs with INTERNAL.
-    pub(crate) fail_uploads: bool,
+    pub(crate) fail_uploads: AtomicBool,
     pub(crate) batch_update_blobs_calls: AtomicUsize,
     pub(crate) batched_blob_count: AtomicUsize,
     pub(crate) bytestream_write_resource_names: Mutex<Vec<String>>,
@@ -84,6 +84,9 @@ pub(crate) struct FakeServer {
     /// The files each execution writes, by output path; only declared ones count.
     pub(crate) worker_outputs: Mutex<HashMap<String, Vec<u8>>>,
     pub(crate) worker_exit_code: i32,
+    /// The commit hash `rustc -vV` prints on the workers; `None` fails it, as on a worker
+    /// that can't run the toolchain.
+    pub(crate) worker_rustc_commit_hash: Mutex<Option<String>>,
     /// Forgets every blob at the next Execute, as a CAS that evicted them.
     pub(crate) forget_blobs_at_next_execute: AtomicBool,
     pub(crate) execute_calls: AtomicUsize,
@@ -345,7 +348,7 @@ impl ContentAddressableStorage for FakeServer {
         if request.instance_name != self.instance_name {
             return Err(Status::invalid_argument(request.instance_name));
         }
-        if self.fail_uploads {
+        if self.fail_uploads.load(Ordering::SeqCst) {
             return Err(Status::internal("the CAS is on fire"));
         }
         self.batched_blob_count
@@ -646,9 +649,28 @@ impl FakeServer {
         Ok(())
     }
 
-    /// Writes the outputs `command` declares that are in `worker_outputs`.
+    /// Writes the outputs `command` declares that are in `worker_outputs`, or prints
+    /// `rustc -vV` into the CAS, as servers that don't inline stdout do.
     fn run(&self, command: &remexec::Command) -> remexec::ActionResult {
         self.actions_run.fetch_add(1, Ordering::SeqCst);
+        if command
+            .arguments
+            .last()
+            .is_some_and(|script| script.ends_with("/bin/rustc -vV\n"))
+        {
+            return match &*self.worker_rustc_commit_hash.lock().unwrap() {
+                Some(commit_hash) => remexec::ActionResult {
+                    stdout_digest: Some(self.insert_blob(
+                        format!("rustc 1.0.0\ncommit-hash: {commit_hash}\n").as_bytes(),
+                    )),
+                    ..Default::default()
+                },
+                None => remexec::ActionResult {
+                    exit_code: 127,
+                    ..Default::default()
+                },
+            };
+        }
         let worker_outputs = self.worker_outputs.lock().unwrap();
         let output_files = command
             .output_paths
@@ -764,7 +786,7 @@ impl Execution for FakeServer {
             )])));
         }
         let key = (action_digest.hash.clone(), action_digest.size_bytes);
-        let cached_result = (!request.skip_cache_lookup)
+        let cached_result = (!request.skip_cache_lookup && !action.do_not_cache)
             .then(|| self.action_results.lock().unwrap().get(&key).cloned())
             .flatten();
         let response = match cached_result {
@@ -776,7 +798,7 @@ impl Execution for FakeServer {
             None => {
                 let result = self.run(&command);
                 // Servers commonly leave failed results out of the action cache.
-                if result.exit_code == 0 {
+                if result.exit_code == 0 && !action.do_not_cache {
                     self.action_results
                         .lock()
                         .unwrap()

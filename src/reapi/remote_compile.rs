@@ -109,6 +109,18 @@ fn toolchain_library_path_exports() -> String {
     )
 }
 
+/// The command that prints the toolchain's `rustc -vV`, run the way compiles run rustc.
+fn rustc_version_command() -> remexec::Command {
+    let script = format!(
+        "{ENTER_WORKER_ROOT}{}exec \"$PWD\"/{TOOLCHAIN_DIR}/bin/rustc -vV\n",
+        toolchain_library_path_exports()
+    );
+    remexec::Command {
+        arguments: vec!["/bin/sh".to_owned(), "-c".to_owned(), script],
+        ..Default::default()
+    }
+}
+
 /// The paths `compile`'s command declares as outputs, input-root-relative.
 fn command_output_paths(compile: &ReapiCompile) -> impl Iterator<Item = String> + '_ {
     compile
@@ -209,7 +221,17 @@ pub(super) fn action_blobs(
         build_command(compile),
         files.iter().chain(toolchain),
         options,
+        false,
     )
+}
+
+/// The [`ActionBlobs`] of the action that prints `toolchain`'s `rustc -vV`. Servers neither
+/// answer it from their action cache nor cache its result, so it runs on a worker each time.
+pub(super) fn rustc_version_action_blobs(
+    toolchain: &[(InputRootFile, PathBuf)],
+    options: &ActionOptions,
+) -> Result<ActionBlobs> {
+    command_action_blobs(rustc_version_command(), toolchain.iter(), options, true)
 }
 
 /// The [`ActionBlobs`] of the action that runs `command` on `files`.
@@ -217,9 +239,11 @@ fn command_action_blobs<'a>(
     command: remexec::Command,
     files: impl Iterator<Item = &'a (InputRootFile, PathBuf)> + Clone,
     options: &ActionOptions,
+    do_not_cache: bool,
 ) -> Result<ActionBlobs> {
     let input_root = InputRoot::build(files.clone().map(|(file, _)| file))?;
-    let (command, action) = build_action(command, input_root.digest, options);
+    let (command, mut action) = build_action(command, input_root.digest, options);
+    action.do_not_cache = do_not_cache;
     let command_bytes = command.encode_to_vec();
     let action_bytes = action.encode_to_vec();
     let action_digest = digest::of_bytes(&action_bytes);
@@ -505,7 +529,7 @@ pub(super) fn materialize_failure_reason(e: &Error) -> CompileLocallyReason {
 }
 
 /// Returns `inline`, or the blob at `digest` when the server didn't inline it.
-async fn download_stdout_or_stderr(
+pub(super) async fn download_stdout_or_stderr(
     cas: &Cas,
     inline: &[u8],
     digest: Option<&remexec::Digest>,
@@ -823,6 +847,40 @@ pub(super) mod test {
         }
         assert!(file_names.contains(&"lib.rs".to_owned()), "{file_names:?}");
         assert!(file_names.contains(&"rustc".to_owned()), "{file_names:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_the_rustc_version_action_runs_the_toolchains_rustc() {
+        let dir = tempfile::tempdir().unwrap();
+        let sysroot = fake_sysroot(&dir.path().join("sysroot"));
+        let digest_cache = DigestCache::load(dir.path().join("digests.json"));
+        let toolchain =
+            toolchain_files(&sysroot, "x86_64-unknown-linux-gnu", &digest_cache).unwrap();
+        let options = ActionOptions::new(&config_with_salt_and_platform());
+        let action_blobs = rustc_version_action_blobs(&toolchain, &options).unwrap();
+        let blobs: std::collections::HashMap<_, _> = action_blobs.blobs.into_iter().collect();
+        let bytes = |digest: &remexec::Digest| match &blobs[digest] {
+            Blob::Bytes(bytes) => bytes.clone(),
+            Blob::File(path) => panic!("{path:?}"),
+        };
+        let action =
+            remexec::Action::decode(bytes(&action_blobs.action_digest).as_slice()).unwrap();
+        assert_eq!(options.salt, action.salt);
+        assert!(action.do_not_cache);
+        let command =
+            remexec::Command::decode(bytes(action.command_digest.as_ref().unwrap()).as_slice())
+                .unwrap();
+        let script = &command.arguments[2];
+        assert!(
+            script.ends_with(&format!("\"$PWD\"/{TOOLCHAIN_DIR}/bin/rustc -vV\n")),
+            "{script}"
+        );
+        let (rustc, _) = toolchain
+            .iter()
+            .find(|(file, _)| file.path.ends_with("/bin/rustc"))
+            .unwrap();
+        assert!(blobs.contains_key(&rustc.digest));
     }
 
     #[cfg(unix)]
