@@ -56,6 +56,8 @@ pub(crate) struct FakeServer {
     pub(crate) corrupt_reads: AtomicBool,
     /// Serves blobs with a byte too many.
     pub(crate) oversize_reads: AtomicBool,
+    /// Answers ByteStream reads with this code.
+    pub(crate) read_error: Mutex<Option<tonic::Code>>,
     /// Answers GetActionResult with this code.
     pub(crate) lookup_error: Mutex<Option<tonic::Code>>,
     /// Answers GetActionResult with NOT_FOUND, as when another client's execution adds the
@@ -478,6 +480,9 @@ impl ByteStream for FakeServer {
     type ReadStream = Pin<Box<dyn Stream<Item = std::result::Result<ReadResponse, Status>> + Send>>;
 
     async fn read(&self, request: Request<ReadRequest>) -> RpcResult<Self::ReadStream> {
+        if let Some(code) = *self.read_error.lock().unwrap() {
+            return Err(Status::new(code, "read_error"));
+        }
         let request = request.into_inner();
         if request.read_offset != 0 || request.read_limit != 0 {
             return Err(Status::invalid_argument("partial reads not supported"));
