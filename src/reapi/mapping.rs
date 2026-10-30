@@ -154,6 +154,15 @@ pub(crate) enum CompileLocallyReason {
     HashingToolchainFailed,
     MissingRustcOrStd,
     NonUtf8ToolchainPath,
+    CacheBypassed,
+    LocalCompileUnchanged,
+    HashingInputsFailed,
+    NotInActionCache,
+    ActionCacheLookupFailed,
+    UnusableResult,
+    WorkerRootInOutput,
+    DownloadingOutputsFailed,
+    UnwritableOutputs,
 }
 
 impl std::fmt::Display for CompileLocallyReason {
@@ -186,6 +195,15 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::HashingToolchainFailed => "failed to hash the toolchain",
             Self::MissingRustcOrStd => "toolchain without rustc or std",
             Self::NonUtf8ToolchainPath => "non-UTF-8 toolchain path",
+            Self::CacheBypassed => "SCCACHE_RECACHE or SCCACHE_NO_CACHE set",
+            Self::LocalCompileUnchanged => "local compile without the worker's arguments",
+            Self::HashingInputsFailed => "failed to hash the inputs",
+            Self::NotInActionCache => "not in the action cache",
+            Self::ActionCacheLookupFailed => "action cache lookup failed",
+            Self::UnusableResult => "unusable action cache result",
+            Self::WorkerRootInOutput => "worker root in an output",
+            Self::DownloadingOutputsFailed => "failed to download the outputs",
+            Self::UnwritableOutputs => "failed to write the outputs",
         })
     }
 }

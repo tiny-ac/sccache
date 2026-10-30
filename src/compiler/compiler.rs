@@ -1132,6 +1132,8 @@ pub enum DistType {
 /// What happened to a compile in a REAPI build.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReapiOutcome {
+    /// Found in the action cache, with its outputs written to their local paths.
+    ActionCacheHit,
     /// Compiled locally, for the reason given.
     CompiledLocally(String),
 }

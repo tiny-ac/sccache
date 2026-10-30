@@ -387,12 +387,28 @@ pub(super) async fn materialize(
     let stderr = compile
         .path_mapper
         .worker_paths_to_local(&stderr, &worker_root);
-    tokio::task::spawn_blocking(move || write_outputs(output_contents)).await??;
+    tokio::task::spawn_blocking(move || write_outputs(output_contents))
+        .await
+        .context(UnwritableOutputs)??;
     Ok(process::Output {
         status: exit_status_from_code(exit_code),
         stdout,
         stderr,
     })
+}
+
+/// Why a compile runs locally after `materialize` failed with `e`.
+pub(super) fn materialize_failure_reason(e: &Error) -> CompileLocallyReason {
+    if e.is::<WorkerRootInOutput>() {
+        CompileLocallyReason::WorkerRootInOutput
+    } else if e.is::<UnusableResult>() {
+        CompileLocallyReason::UnusableResult
+    } else if e.is::<UnwritableOutputs>() {
+        CompileLocallyReason::UnwritableOutputs
+    } else {
+        // `materialize` gives a type to every error except the CAS's.
+        CompileLocallyReason::DownloadingOutputsFailed
+    }
 }
 
 /// Returns `inline`, or the blob at `digest` when the server didn't inline it.
@@ -499,7 +515,8 @@ async fn download_output(
     }
     let dir = local_path
         .parent()
-        .with_context(|| format!("output {} has no parent directory", local_path.display()))?;
+        .with_context(|| format!("output {} has no parent directory", local_path.display()))
+        .context(UnwritableOutputs)?;
     let temp_file = NamedTempFile::new_in(dir)
         .with_context(|| format!("failed to create a file in {}", dir.display()))
         .context(UnwritableOutputs)?;
@@ -794,7 +811,7 @@ pub(super) mod test {
         }
     }
 
-    fn inline_output(path: &str, data: &[u8]) -> remexec::OutputFile {
+    pub(in crate::reapi) fn inline_output(path: &str, data: &[u8]) -> remexec::OutputFile {
         remexec::OutputFile {
             contents: data.to_vec(),
             ..cas_output(path, data)
@@ -802,7 +819,9 @@ pub(super) mod test {
     }
 
     /// A successful result with `output_files` from a worker whose worker root is /w/1.
-    fn worker_result(output_files: Vec<remexec::OutputFile>) -> remexec::ActionResult {
+    pub(in crate::reapi) fn worker_result(
+        output_files: Vec<remexec::OutputFile>,
+    ) -> remexec::ActionResult {
         remexec::ActionResult {
             output_files,
             stderr_raw: format!("{WORKER_ROOT_MARKER}/w/1\nwarning: in /w/1/src/lib.rs\n")

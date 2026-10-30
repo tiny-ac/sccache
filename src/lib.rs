@@ -46,7 +46,6 @@ mod mock_command;
 mod net;
 mod protocol;
 #[cfg(feature = "reapi")]
-#[allow(dead_code)] // The REAPI executor calls it.
 mod reapi;
 pub mod server;
 #[doc(hidden)]
