@@ -58,6 +58,8 @@ pub(crate) struct FakeServer {
     pub(crate) oversize_reads: AtomicBool,
     /// Answers ByteStream reads with this code.
     pub(crate) read_error: Mutex<Option<tonic::Code>>,
+    /// Answers this many calls to each method, by name, with UNAVAILABLE, as a busy server.
+    pub(crate) busy_answers: Mutex<HashMap<&'static str, usize>>,
     /// Answers GetActionResult with this code.
     pub(crate) lookup_error: Mutex<Option<tonic::Code>>,
     /// Answers GetActionResult with NOT_FOUND, as when another client's execution adds the
@@ -326,6 +328,9 @@ impl ContentAddressableStorage for FakeServer {
         request: Request<remexec::FindMissingBlobsRequest>,
     ) -> RpcResult<remexec::FindMissingBlobsResponse> {
         self.find_missing_blobs_calls.fetch_add(1, Ordering::SeqCst);
+        if self.take_busy_answer("FindMissingBlobs") {
+            return Err(Status::unavailable("busy"));
+        }
         if let Some(path) = self.delete_at_find_missing.lock().unwrap().take() {
             std::fs::remove_file(path).unwrap();
         }
@@ -349,6 +354,9 @@ impl ContentAddressableStorage for FakeServer {
         request: Request<remexec::BatchUpdateBlobsRequest>,
     ) -> RpcResult<remexec::BatchUpdateBlobsResponse> {
         self.batch_update_blobs_calls.fetch_add(1, Ordering::SeqCst);
+        if self.take_busy_answer("BatchUpdateBlobs") {
+            return Err(Status::unavailable("busy"));
+        }
         let request = request.into_inner();
         if request.instance_name != self.instance_name {
             return Err(Status::invalid_argument(request.instance_name));
@@ -458,6 +466,9 @@ impl ActionCache for FakeServer {
         if let Some(code) = *self.lookup_error.lock().unwrap() {
             return Err(Status::new(code, "lookup_error"));
         }
+        if self.take_busy_answer("GetActionResult") {
+            return Err(Status::unavailable("busy"));
+        }
         let request = request.into_inner();
         if request.instance_name != self.instance_name {
             return Err(Status::invalid_argument(request.instance_name));
@@ -490,6 +501,9 @@ impl ByteStream for FakeServer {
     async fn read(&self, request: Request<ReadRequest>) -> RpcResult<Self::ReadStream> {
         if let Some(code) = *self.read_error.lock().unwrap() {
             return Err(Status::new(code, "read_error"));
+        }
+        if self.take_busy_answer("Read") {
+            return Err(Status::unavailable("busy"));
         }
         let request = request.into_inner();
         if request.read_offset != 0 || request.read_limit != 0 {
@@ -531,6 +545,9 @@ impl ByteStream for FakeServer {
     }
 
     async fn write(&self, request: Request<Streaming<WriteRequest>>) -> RpcResult<WriteResponse> {
+        if self.take_busy_answer("Write") {
+            return Err(Status::unavailable("busy"));
+        }
         let mut stream = request.into_inner();
         let mut resource_name = None;
         let mut data = vec![];
@@ -721,6 +738,31 @@ fn take_one(counter: &AtomicUsize) -> bool {
 }
 
 impl FakeServer {
+    /// Answers the next `count` calls to `method` with UNAVAILABLE.
+    pub(crate) fn answer_busy(&self, method: &'static str, count: usize) {
+        self.busy_answers.lock().unwrap().insert(method, count);
+    }
+
+    /// Whether every busy answer `answer_busy` asked for was given, so a misspelled method
+    /// fails the test.
+    pub(crate) fn gave_every_busy_answer(&self) -> bool {
+        self.busy_answers
+            .lock()
+            .unwrap()
+            .values()
+            .all(|&count| count == 0)
+    }
+
+    fn take_busy_answer(&self, method: &str) -> bool {
+        match self.busy_answers.lock().unwrap().get_mut(method) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// A stream that sends `operation`, or breaks per the switches.
     fn finishing_stream(&self, operation: Operation) -> OperationStream {
         if !take_one(&self.streams_to_break) {

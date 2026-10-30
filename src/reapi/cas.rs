@@ -15,7 +15,9 @@
 //! Uploads blobs to a REAPI server's content-addressable storage (CAS), and downloads blobs
 //! from it and checks them against their digests.
 
-use super::client::{AuthChannel, Client, RPC_TIMEOUT, RpcError, status_error, with_timeout};
+use super::client::{
+    AuthChannel, Client, RPC_TIMEOUT, RpcError, status_error, with_retries, with_timeout,
+};
 use super::digest;
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use super::proto::google::bytestream::byte_stream_client::ByteStreamClient;
@@ -251,17 +253,21 @@ impl Cas {
             digest.hash, digest.size_bytes
         );
         let download_result = with_timeout(&description, download_timeout(size_bytes), async {
-            let mut stream = self
-                .bytestream_client
-                .clone()
-                .read(ReadRequest {
-                    resource_name,
-                    read_offset: 0,
-                    read_limit: 0,
-                })
-                .await
-                .map_err(status_error)?
-                .into_inner();
+            // Only opening the stream is tried again. Its chunks go straight to `out`, so a
+            // broken stream isn't read again.
+            let mut stream = with_retries(|| async {
+                self.bytestream_client
+                    .clone()
+                    .read(ReadRequest {
+                        resource_name: resource_name.clone(),
+                        read_offset: 0,
+                        read_limit: 0,
+                    })
+                    .await
+                    .map_err(status_error)
+            })
+            .await?
+            .into_inner();
             while let Some(chunk) = stream.message().await.map_err(status_error)? {
                 // The write task stopped on an error; `write_task.await` returns it.
                 if tx.send(chunk.data).await.is_err() {
@@ -344,7 +350,7 @@ impl Cas {
             futures::future::try_join_all(large_blobs.into_iter().map(|large_blob| {
                 self.upload_with_permit(vec![large_blob], |blobs| async move {
                     for (digest, blob) in blobs {
-                        self.write_blob(digest, blob).await?;
+                        with_retries(|| self.write_blob(digest.clone(), blob.clone())).await?;
                     }
                     Ok(())
                 })
@@ -402,13 +408,13 @@ impl Cas {
             let response = with_timeout(
                 "failed to ask the REAPI CAS which blobs it lacks",
                 RPC_TIMEOUT,
-                async {
+                with_retries(|| async {
                     self.cas_client
                         .clone()
-                        .find_missing_blobs(request)
+                        .find_missing_blobs(request.clone())
                         .await
                         .map_err(status_error)
-                },
+                }),
             )
             .await?;
             missing.extend(response.into_inner().missing_blob_digests);
@@ -444,13 +450,18 @@ impl Cas {
             "failed to upload a batch of {} blobs to the REAPI CAS",
             unanswered.len()
         );
-        let response = with_timeout(&description, upload_timeout(bytes), async {
-            self.cas_client
-                .clone()
-                .batch_update_blobs(request)
-                .await
-                .map_err(status_error)
-        })
+        // A blob the server refuses in its answer isn't sent again.
+        let response = with_timeout(
+            &description,
+            upload_timeout(bytes),
+            with_retries(|| async {
+                self.cas_client
+                    .clone()
+                    .batch_update_blobs(request.clone())
+                    .await
+                    .map_err(status_error)
+            }),
+        )
         .await?
         .into_inner();
         for response in response.responses {
@@ -629,7 +640,7 @@ impl<W: Write> Write for HashingWriter<W> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::reapi::client::rpc_code;
+    use crate::reapi::client::{RETRIES, rpc_code};
     use crate::reapi::fake::FakeServer;
     use rand::{RngCore, SeedableRng};
     use std::sync::Arc;
@@ -896,6 +907,39 @@ mod test {
         // The refused blob isn't remembered as present.
         assert!(cas.ensure_uploaded(vec![wrong()]).await.is_err());
         assert_eq!(2, server.find_missing_blobs_calls.load(Ordering::SeqCst));
+    }
+
+    #[test_case("FindMissingBlobs" ; "find missing blobs")]
+    #[test_case("BatchUpdateBlobs" ; "batch update blobs")]
+    #[tokio::test]
+    async fn test_upload_calls_are_tried_again_while_the_server_is_busy(method: &'static str) {
+        let (cas, server) = cas_with(FakeServer::default()).await;
+        server.answer_busy(method, RETRIES as usize);
+        cas.ensure_uploaded(vec![blob(b"new")]).await.unwrap();
+        assert!(server.has_blob(b"new"));
+        assert!(server.gave_every_busy_answer());
+    }
+
+    #[tokio::test]
+    async fn test_bytestream_writes_are_tried_again_while_the_server_is_busy() {
+        let (cas, server) = cas_with_small_batches(FakeServer::default()).await;
+        let large = incompressible_bytes_of_len(BYTESTREAM_WRITE_CHUNK_BYTES + 10);
+        server.answer_busy("Write", RETRIES as usize);
+        cas.ensure_uploaded(vec![(digest::of_bytes(&large), Blob::Bytes(large.clone()))])
+            .await
+            .unwrap();
+        assert!(server.has_blob(&large));
+        assert!(server.gave_every_busy_answer());
+    }
+
+    #[tokio::test]
+    async fn test_downloads_are_tried_again_while_the_server_is_busy() {
+        let (cas, server) = cas_and_server(false).await;
+        let data = incompressible_bytes();
+        let digest = server.insert_blob(&data);
+        server.answer_busy("Read", RETRIES as usize);
+        assert_eq!(data, cas.download_blob(&digest, MAX_BYTES).await.unwrap());
+        assert!(server.gave_every_busy_answer());
     }
 
     #[tokio::test]
