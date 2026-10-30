@@ -31,6 +31,7 @@ mod sysroot;
 
 pub(crate) use executor::ReapiExecutor;
 pub(crate) use mapping::{
-    ActionEnv, CompileLocallyReason, NotEligible, PathMapper, ReapiCompile, lexically_normalize,
+    ActionEnv, CompileLocallyReason, NotEligible, PathMapper, ReapiCompile, ToolchainKey,
+    lexically_normalize,
 };
 pub(crate) use sysroot::sysroot_copy;
