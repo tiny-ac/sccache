@@ -230,6 +230,18 @@ impl TestFixture {
     }
 }
 
+/// rustc from PATH, or from CARGO_HOME in CI environments that only have it there.
+#[cfg(any(feature = "dist-client", feature = "reapi"))]
+pub fn find_rustc() -> PathBuf {
+    if let Ok(path) = which::which("rustc") {
+        path
+    } else if let Ok(cargo_home) = env::var("CARGO_HOME") {
+        PathBuf::from(cargo_home).join("bin").join("rustc")
+    } else {
+        panic!("rustc not found in PATH or CARGO_HOME")
+    }
+}
+
 pub fn single_threaded_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()

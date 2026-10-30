@@ -1011,6 +1011,16 @@ where
         Err(crate::reapi::CompileLocallyReason::NotRust.into())
     }
 
+    /// Changes that make the local compile write the same outputs as a REAPI worker. May
+    /// make a sysroot copy under `sysroot_copies_dir`, so call it from a blocking thread.
+    #[cfg(feature = "reapi")]
+    fn reapi_local_compile_changes(
+        &self,
+        _sysroot_copies_dir: &Path,
+    ) -> Option<LocalCompileChanges> {
+        None
+    }
+
     /// Create a function that will create the inputs used to perform a distributed compilation
     #[cfg(feature = "dist-client")]
     fn into_dist_packagers(

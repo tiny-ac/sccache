@@ -30,3 +30,4 @@ mod sysroot;
 pub(crate) use mapping::{
     ActionEnv, CompileLocallyReason, NotEligible, PathMapper, ReapiCompile, lexically_normalize,
 };
+pub(crate) use sysroot::sysroot_copy;

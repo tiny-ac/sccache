@@ -23,6 +23,7 @@
 //! under [`TOOLCHAIN_DIR`].
 
 use crate::errors::*;
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 /// The input root's directory for files under the local build root.
@@ -178,11 +179,38 @@ impl PathMapper {
         }
     }
 
+    /// `--remap-path-prefix` arguments that make a local compile name its paths as a
+    /// worker's compile does. rustc applies the last matching mapping, so the build root,
+    /// often inside the cwd, comes last.
+    pub(crate) fn input_root_remap_args(&self) -> Vec<OsString> {
+        let remap = |from: &Path, to: &str| {
+            let mut arg = OsString::from("--remap-path-prefix=");
+            arg.push(from);
+            arg.push("=");
+            arg.push(to);
+            arg
+        };
+        vec![
+            remap(&self.cwd, "."),
+            remap(&self.build_root, BUILD_ROOT_DIR),
+        ]
+    }
+
     /// Maps paths under `worker_root`, and input-root-relative paths under
-    /// [`BUILD_ROOT_DIR`], in an action's stdout or stderr to local paths. Only the start of
-    /// each path changes, so the text around it doesn't matter.
+    /// [`BUILD_ROOT_DIR`], in an action's stdout or stderr to local paths.
     pub(super) fn worker_paths_to_local(&self, text: &[u8], worker_root: &str) -> Vec<u8> {
-        let worker_root = worker_root.as_bytes();
+        self.paths_to_local(text, Some(worker_root.as_bytes()))
+    }
+
+    /// Maps [`BUILD_ROOT_DIR`] paths in the stdout or stderr of a local compile run with
+    /// [`Self::input_root_remap_args`] to local paths.
+    pub(crate) fn input_root_paths_to_local(&self, text: &[u8]) -> Vec<u8> {
+        self.paths_to_local(text, None)
+    }
+
+    /// Maps paths in `text` to local paths, rewriting only each path's start, so where a path
+    /// ends doesn't matter. With `worker_root`, paths under it map too.
+    fn paths_to_local(&self, text: &[u8], worker_root: Option<&[u8]>) -> Vec<u8> {
         let cwd = self.cwd.as_os_str().as_encoded_bytes();
         let build_root = self.build_root.as_os_str().as_encoded_bytes();
         let mut out = Vec::with_capacity(text.len());
@@ -193,7 +221,7 @@ impl PathMapper {
                 i += 1;
                 continue;
             }
-            let (in_worker_root, path) = match text[i..].strip_prefix(worker_root) {
+            let (in_worker_root, path) = match worker_root.and_then(|r| text[i..].strip_prefix(r)) {
                 Some([b'/', rest @ ..]) => (true, rest),
                 Some(rest) if rest.first().is_none_or(|&b| !is_path_byte(b)) => (true, rest),
                 Some(_) | None => (false, &text[i..]),
@@ -206,7 +234,8 @@ impl PathMapper {
                 i += skipped + BUILD_ROOT_DIR.len();
             } else if in_worker_root {
                 out.extend_from_slice(cwd);
-                if skipped > worker_root.len() {
+                // Skipping the worker root's `/` too means a path follows.
+                if worker_root.is_some_and(|r| skipped > r.len()) {
                     out.push(b'/');
                 }
                 i += skipped;
@@ -337,6 +366,29 @@ mod test {
     }
 
     #[test]
+    fn test_input_root_remap_puts_the_build_root_last() {
+        // `path_mapper()`'s build root is inside its cwd.
+        assert_eq!(
+            [
+                "--remap-path-prefix=/ws=.",
+                "--remap-path-prefix=/ws/target=.sccache-build"
+            ],
+            path_mapper().input_root_remap_args().as_slice()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_input_root_paths_map_to_local() {
+        assert_eq!(
+            b"--> /ws/target/debug/build/foo-1/out/gen.rs:3:5 in /up/x".as_slice(),
+            path_mapper().input_root_paths_to_local(
+                b"--> .sccache-build/debug/build/foo-1/out/gen.rs:3:5 in /up/x"
+            )
+        );
+    }
+
+    #[test]
     fn test_mapping_worker_paths_keeps_other_bytes() {
         assert_eq!(
             b"\xff /ws/x\xfe".as_slice(),
@@ -355,5 +407,103 @@ mod test {
             None,
             mapper.to_input_root(&Path::new("/ws/target").join(name))
         );
+    }
+
+    /// A sysroot in `dir` of symlinks to the real one's entries, with a rust-src that has the
+    /// file rustc looks for, so the test sees a rust-src whether or not one is installed.
+    #[cfg(unix)]
+    fn sysroot_with_rust_src(dir: &Path) -> PathBuf {
+        let output = std::process::Command::new(crate::test::utils::find_rustc())
+            .args(["--print", "sysroot"])
+            .output()
+            .unwrap();
+        let real = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+        let sysroot = dir.join("sysroot");
+        for (from, skip) in [("", "lib"), ("lib", "rustlib"), ("lib/rustlib", "src")] {
+            std::fs::create_dir_all(sysroot.join(from)).unwrap();
+            for entry in std::fs::read_dir(real.join(from)).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_name() != skip {
+                    std::os::unix::fs::symlink(
+                        entry.path(),
+                        sysroot.join(from).join(entry.file_name()),
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        let std_root = sysroot.join("lib/rustlib/src/rust/library/std/src/lib.rs");
+        std::fs::create_dir_all(std_root.parent().unwrap()).unwrap();
+        std::fs::write(std_root, "").unwrap();
+        sysroot
+    }
+
+    /// Compiles a crate at `root` with `sysroot` and the remap arguments a local compile gets
+    /// for REAPI, and returns the rlib.
+    #[cfg(unix)]
+    fn compile_remapped(root: &Path, sysroot: &Path) -> Vec<u8> {
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("target/debug/deps")).unwrap();
+        // rustc sees its working directory with symlinks resolved, e.g. macOS's /var as
+        // /private/var, and so does cargo.
+        let root = &root.canonicalize().unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            // std's generics, built into the rlib with debuginfo, name std's sources.
+            "pub fn source_path() -> &'static str { file!() }\n\
+             pub fn strings() -> Vec<String> { vec![format!(\"{}\", 1)] }\n",
+        )
+        .unwrap();
+        let path_mapper = PathMapper::new(root.to_owned(), root.join("target"));
+        let mut sysroot_arg = OsString::from("--sysroot=");
+        sysroot_arg.push(sysroot);
+        let status = std::process::Command::new(crate::test::utils::find_rustc())
+            .current_dir(root)
+            .args([
+                "--crate-name=foo",
+                "--crate-type=lib",
+                "--edition=2021",
+                "-Cdebuginfo=2",
+                "-Cmetadata=fixed",
+                "--emit=link",
+                "-o",
+                "target/debug/deps/libfoo.rlib",
+                "src/lib.rs",
+            ])
+            .args(path_mapper.input_root_remap_args())
+            .arg(sysroot_arg)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::read(root.join("target/debug/deps/libfoo.rlib")).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn names_rust_src(rlib: &[u8]) -> bool {
+        memchr::memmem::find(rlib, b"rustlib/src/rust").is_some()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_remapped_compiles_match_across_checkouts_and_sysroot_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let sysroot = sysroot_with_rust_src(dir.path());
+        // Outside the checkouts, so the sysroot copies' paths aren't remapped.
+        let copy_a = crate::reapi::sysroot_copy(&sysroot, &dir.path().join("copies-a")).unwrap();
+        let copy_b = crate::reapi::sysroot_copy(&sysroot, &dir.path().join("copies-b")).unwrap();
+        let a = compile_remapped(&dir.path().join("a/checkout"), &copy_a);
+        let b = compile_remapped(&dir.path().join("b/another-checkout"), &copy_b);
+        assert!(!names_rust_src(&a), "the rlib names rust-src");
+        assert!(a == b, "the rlibs differ");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_sysroot_with_rust_src_puts_it_in_the_rlib() {
+        // Shows that the test above would see rust-src if the copy kept it.
+        let dir = tempfile::tempdir().unwrap();
+        let sysroot = sysroot_with_rust_src(dir.path());
+        let rlib = compile_remapped(&dir.path().join("checkout"), &sysroot);
+        assert!(names_rust_src(&rlib), "the rlib doesn't name rust-src");
     }
 }
