@@ -46,6 +46,20 @@ cache_dir = "/home/user/.cache/sccache-dist-client"
 type = "token"
 token = "secrettoken"
 
+# Experimental, needs sccache built with the reapi feature: a Remote
+# Execution API (REAPI) server for Rust compiles. Setting it turns
+# sccache-dist off, even with scheduler_url set. The server isn't contacted yet:
+# Rust compiles run locally with the arguments a REAPI worker uses, with a
+# copy of the Rust sysroot under <cache_dir>/reapi-sysroot-copies (never
+# removed), and --show-stats lists, by reason, the ones a REAPI server
+# couldn't run.
+#[dist.reapi]
+# grpc://host:port, or grpcs://host:port for TLS (required)
+endpoint = "grpcs://remote.example.com:443"
+instance_name = ""
+# a file holding the bearer token sent with every request
+auth_token_file = "/home/user/.config/sccache/reapi-token"
+
 # Multi-level cache configuration
 # Define cache levels in order (fast to slow).
 # Each level must be separately configured below.

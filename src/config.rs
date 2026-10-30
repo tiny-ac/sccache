@@ -772,6 +772,19 @@ pub struct DistConfig {
     #[serde(deserialize_with = "deserialize_size_from_str")]
     pub toolchain_cache_size: u64,
     pub rewrite_includes_only: bool,
+    /// A Remote Execution API (REAPI) server for Rust compiles. Experimental.
+    pub reapi: Option<ReapiConfig>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReapiConfig {
+    /// `grpc://host:port`, or `grpcs://host:port` for TLS.
+    pub endpoint: String,
+    #[serde(default)]
+    pub instance_name: String,
+    /// A file holding the bearer token sent with every request.
+    pub auth_token_file: Option<PathBuf>,
 }
 
 impl Default for DistConfig {
@@ -783,6 +796,7 @@ impl Default for DistConfig {
             toolchains: Default::default(),
             toolchain_cache_size: default_toolchain_cache_size(),
             rewrite_includes_only: false,
+            reapi: None,
         }
     }
 }
@@ -2862,6 +2876,10 @@ cache_dir = "/home/user/.cache/sccache-dist-client"
 type = "token"
 token = "secrettoken"
 
+[dist.reapi]
+endpoint = "grpc://farm:8980"
+instance_name = "main"
+auth_token_file = "/token"
 
 [cache.azure]
 container = "azurecontainer"
@@ -3040,6 +3058,11 @@ key_prefix = "cosprefix"
                 toolchains: vec![],
                 toolchain_cache_size: 5368709120,
                 rewrite_includes_only: false,
+                reapi: Some(ReapiConfig {
+                    endpoint: "grpc://farm:8980".to_owned(),
+                    instance_name: "main".to_owned(),
+                    auth_token_file: Some(PathBuf::from("/token")),
+                }),
             },
             server_startup_timeout_ms: Some(10000),
             basedirs: vec![],
@@ -3569,4 +3592,48 @@ fn test_cache_type_by_name_matches_features() {
             }
         }
     }
+}
+
+#[test]
+fn test_reapi_config_defaults() {
+    let config: FileConfig = toml::from_str(
+        r#"
+[dist.reapi]
+endpoint = "grpcs://farm.example.com:443"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        Some(ReapiConfig {
+            endpoint: "grpcs://farm.example.com:443".to_owned(),
+            instance_name: String::new(),
+            auth_token_file: None,
+        }),
+        config.dist.reapi
+    );
+}
+
+#[test]
+fn test_reapi_config_rejects_unknown_key() {
+    let config = toml::from_str::<FileConfig>(
+        r#"
+[dist.reapi]
+endpoint = "grpc://farm:8980"
+enpoint = "x"
+"#,
+    );
+    let e = config.unwrap_err();
+    assert!(e.to_string().contains("enpoint"), "{e}");
+}
+
+#[test]
+fn test_reapi_config_requires_endpoint() {
+    let config = toml::from_str::<FileConfig>(
+        r#"
+[dist.reapi]
+instance_name = "main"
+"#,
+    );
+    let e = config.unwrap_err();
+    assert!(e.to_string().contains("endpoint"), "{e}");
 }
