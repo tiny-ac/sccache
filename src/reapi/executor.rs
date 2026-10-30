@@ -18,7 +18,7 @@
 //! local compiles by reason.
 
 use super::cas::UnreadableBlob;
-use super::client::{ConnectOptions, RPC_TIMEOUT, check_connect_options};
+use super::client::{ConnectOptions, RPC_TIMEOUT, check_connect_options, rpc_code};
 use super::connection::{Connection, ServerApis};
 use super::digest::DigestCache;
 use super::execution::{Execution, MissingActionBlobs};
@@ -230,6 +230,9 @@ impl ReapiExecutor {
             }
             Err(e) => {
                 warn!("[{}]: Compiling locally: {:#}", out_pretty, e);
+                if is_refused_read(&e) {
+                    return Err(CompileLocallyReason::CredentialsRefused);
+                }
                 if let Some(pause) = self.lookup_pause.call_failed() {
                     warn!(
                         "REAPI: action cache lookups are failing; compiling locally for {pause:?}"
@@ -301,11 +304,12 @@ impl ReapiExecutor {
                 self.execution_pause.call_succeeded();
                 response
             }
-            // An input that can't be read or hashed says nothing about the server, and the
-            // rustc check already counted the server's answer, even if its stdout then failed
-            // to download.
+            // An input that can't be read or hashed says nothing about the server. The rustc
+            // check already counted the server's answer, even if its stdout then failed to
+            // download. Refused credentials make the connection check them again instead.
             Err(
                 reason @ (CompileLocallyReason::UnreadableInput
+                | CompileLocallyReason::CredentialsRefused
                 | CompileLocallyReason::HashingInputsFailed
                 | CompileLocallyReason::DownloadingOutputsFailed
                 | CompileLocallyReason::RustcFailsOnWorkers
@@ -428,7 +432,11 @@ impl ReapiExecutor {
                 .await
                 .map_err(|e| {
                     warn!("[{}]: Compiling locally: {:#}", out_pretty, e);
-                    CompileLocallyReason::DownloadingOutputsFailed
+                    if is_refused_read(&e) {
+                        CompileLocallyReason::CredentialsRefused
+                    } else {
+                        CompileLocallyReason::DownloadingOutputsFailed
+                    }
                 })?;
         let stdout = String::from_utf8_lossy(&stdout);
         let commit_hash = stdout
@@ -466,7 +474,11 @@ async fn write_outputs(
     materialize(&apis.cas, reapi_compile, result)
         .await
         .map_err(|e| {
-            let reason = materialize_failure_reason(&e);
+            let reason = if is_refused_read(&e) {
+                CompileLocallyReason::CredentialsRefused
+            } else {
+                materialize_failure_reason(&e)
+            };
             // The same result fails the same way on every build.
             let log_level = match reason {
                 CompileLocallyReason::UnusableResult | CompileLocallyReason::WorkerRootInOutput => {
@@ -516,7 +528,10 @@ async fn upload_and_execute(
     };
     executed.map_err(|e| {
         warn!("[{}]: Compiling locally: {:#}", out_pretty, e);
-        CompileLocallyReason::ExecutionFailed
+        match rpc_code(&e) {
+            Some(tonic::Code::Unauthenticated) => CompileLocallyReason::CredentialsRefused,
+            _ => CompileLocallyReason::ExecutionFailed,
+        }
     })
 }
 
@@ -531,11 +546,22 @@ async fn upload(
         .map_err(|e| {
             warn!("[{}]: Compiling locally: {:#}", out_pretty, e);
             if e.is::<UnreadableBlob>() {
-                CompileLocallyReason::UnreadableInput
-            } else {
-                CompileLocallyReason::UploadFailed
+                return CompileLocallyReason::UnreadableInput;
+            }
+            match rpc_code(&e) {
+                Some(tonic::Code::Unauthenticated) => CompileLocallyReason::CredentialsRefused,
+                _ => CompileLocallyReason::UploadFailed,
             }
         })
+}
+
+/// Whether `e` is a read the server refused. A server lets any credentials it accepts read,
+/// so a refused read means refused credentials.
+fn is_refused_read(e: &Error) -> bool {
+    matches!(
+        rpc_code(e),
+        Some(tonic::Code::Unauthenticated | tonic::Code::PermissionDenied)
+    )
 }
 
 /// Logs that `out_pretty` compiles locally for `reason`, and returns `reason` as the error.
@@ -604,7 +630,14 @@ impl<T: CommandCreatorSync> RemoteExecutor<T> for ReapiExecutor {
                     &out_pretty,
                 )
                 .await?;
-            self.look_up_or_execute(lookup, &out_pretty).await
+            let apis = lookup.apis.clone();
+            let looked_up = self.look_up_or_execute(lookup, &out_pretty).await;
+            if let (Err(CompileLocallyReason::CredentialsRefused), Some(connection)) =
+                (&looked_up, &self.connection)
+            {
+                connection.credentials_refused(&apis).await;
+            }
+            looked_up
         }
         .await;
         match looked_up {
@@ -1117,6 +1150,93 @@ mod test {
         });
         let (dist_type, _) = fixture.compile();
         assert_eq!(compiled_locally("REAPI execution failed"), dist_type);
+    }
+
+    /// Compiles twice, refused both times, then once more with the server answering and the
+    /// result in the action cache.
+    fn compile_after_refusing_twice(fixture: &Fixture) {
+        let executor = fixture.executor();
+        for _ in 0..2 {
+            assert_eq!(
+                compiled_locally("REAPI server refused the credentials"),
+                fixture.compile_with(&executor).0
+            );
+        }
+        *fixture.server.lookup_error.lock().unwrap() = None;
+        *fixture.server.upload_error.lock().unwrap() = None;
+        *fixture.server.read_error.lock().unwrap() = None;
+        fixture.put_result_in_action_cache(|_| {});
+        assert_eq!(
+            compiled_locally("REAPI server refused the credentials"),
+            fixture.compile_with(&executor).0
+        );
+        // The first refusal connected again, and the second ended the connection.
+        assert_eq!(2, fixture.server.capabilities_calls.load(Ordering::SeqCst));
+    }
+
+    #[test_case::test_case(
+        FakeServer {
+            lookup_error: Some(tonic::Code::Unauthenticated).into(),
+            ..Default::default()
+        } ;
+        "lookup unauthenticated"
+    )]
+    #[test_case::test_case(
+        FakeServer {
+            lookup_error: Some(tonic::Code::PermissionDenied).into(),
+            ..Default::default()
+        } ;
+        "lookup permission denied"
+    )]
+    #[test_case::test_case(
+        FakeServer {
+            upload_error: Some(tonic::Code::Unauthenticated).into(),
+            ..Default::default()
+        } ;
+        "upload unauthenticated"
+    )]
+    #[test_case::test_case(
+        FakeServer {
+            execute_error: Some(tonic::Code::Unauthenticated),
+            ..Default::default()
+        } ;
+        "execute unauthenticated"
+    )]
+    #[test_case::test_case(
+        FakeServer {
+            read_error: Some(tonic::Code::PermissionDenied).into(),
+            ..Default::default()
+        } ;
+        "rustc check download permission denied"
+    )]
+    fn test_credentials_refused_twice_compile_everything_locally(server: FakeServer) {
+        compile_after_refusing_twice(&executing_fixture(server));
+    }
+
+    #[test]
+    fn test_outputs_refused_twice_compile_everything_locally() {
+        let fixture = Fixture::new(Eligibility::Eligible);
+        // Without inline contents, the client downloads the rlib from the CAS.
+        fixture.put_result_in_action_cache(|result| result.output_files[0].contents.clear());
+        *fixture.server.read_error.lock().unwrap() = Some(tonic::Code::PermissionDenied);
+        compile_after_refusing_twice(&fixture);
+    }
+
+    #[test]
+    fn test_credentials_refused_once_are_checked_again() {
+        let fixture = Fixture::new(Eligibility::Eligible);
+        *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Unauthenticated);
+        let executor = fixture.executor();
+        assert_eq!(
+            compiled_locally("REAPI server refused the credentials"),
+            fixture.compile_with(&executor).0
+        );
+        *fixture.server.lookup_error.lock().unwrap() = None;
+        fixture.put_result_in_action_cache(|_| {});
+        assert_eq!(
+            DistType::Reapi(ReapiOutcome::ActionCacheHit),
+            fixture.compile_with(&executor).0
+        );
     }
 
     #[test]

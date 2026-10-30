@@ -22,7 +22,7 @@ use super::client::{Client, ConnectOptions, CredentialsRefused, IncompatibleServ
 use super::execution::Execution;
 use super::mapping::CompileLocallyReason;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
@@ -53,6 +53,9 @@ pub(super) struct Connection {
     state: tokio::sync::Mutex<State>,
     failures_in_a_row: AtomicU32,
     attempts_ended: watch::Sender<u64>,
+    /// Set once the server refused the credentials after connecting, and sccache connected
+    /// again to check them.
+    rechecked_credentials: AtomicBool,
 }
 
 impl Connection {
@@ -62,6 +65,7 @@ impl Connection {
             state: tokio::sync::Mutex::new(State::NotConnected),
             failures_in_a_row: AtomicU32::new(0),
             attempts_ended: watch::Sender::new(0),
+            rechecked_credentials: AtomicBool::new(false),
         })
     }
 
@@ -96,6 +100,28 @@ impl Connection {
             {
                 return Err(CompileLocallyReason::Connecting);
             }
+        }
+    }
+
+    /// For a server that refused the credentials on a call through `apis`. The first time,
+    /// the next compile connects again, and GetCapabilities decides, as at the first connect,
+    /// since a proxy may refuse a call once. The second time, every compile runs locally until
+    /// the sccache server restarts.
+    pub(super) async fn credentials_refused(&self, apis: &Arc<ServerApis>) {
+        let mut state = self.state.lock().await;
+        // A call through an earlier connection says nothing about the current one.
+        if !matches!(&*state, State::Connected(current) if Arc::ptr_eq(current, apis)) {
+            return;
+        }
+        if self.rechecked_credentials.swap(true, Ordering::Relaxed) {
+            warn!(
+                "REAPI: the server refused the credentials again; compiling locally until the \
+                 sccache server restarts"
+            );
+            *state = State::Refused(CompileLocallyReason::CredentialsRefused);
+        } else {
+            warn!("REAPI: the server refused the credentials; connecting again to check them");
+            *state = State::NotConnected;
         }
     }
 
@@ -257,6 +283,32 @@ mod test {
             );
         }
         assert_eq!(1, capabilities_calls(&server));
+    }
+
+    #[tokio::test]
+    async fn test_refused_credentials_are_checked_again_once() {
+        let (server, connection) = serve(FakeServer::default()).await;
+        let apis = connection.server_apis(in_secs(10)).await.unwrap();
+        connection.credentials_refused(&apis).await;
+        let apis = connection.server_apis(in_secs(10)).await.unwrap();
+        assert_eq!(2, capabilities_calls(&server));
+        connection.credentials_refused(&apis).await;
+        assert_eq!(
+            Some(CompileLocallyReason::CredentialsRefused),
+            connection.server_apis(in_secs(10)).await.err()
+        );
+        assert_eq!(2, capabilities_calls(&server));
+    }
+
+    #[tokio::test]
+    async fn test_a_refusal_through_an_earlier_connection_is_ignored() {
+        let (server, connection) = serve(FakeServer::default()).await;
+        let earlier = connection.server_apis(in_secs(10)).await.unwrap();
+        connection.credentials_refused(&earlier).await;
+        connection.server_apis(in_secs(10)).await.unwrap();
+        connection.credentials_refused(&earlier).await;
+        assert!(connection.server_apis(in_secs(10)).await.is_ok());
+        assert_eq!(2, capabilities_calls(&server));
     }
 
     #[test]
