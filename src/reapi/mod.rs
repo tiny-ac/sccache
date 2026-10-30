@@ -24,3 +24,7 @@ mod fake;
 mod input_root;
 mod mapping;
 pub(crate) mod proto;
+
+pub(crate) use mapping::{
+    CompileLocallyReason, NotEligible, PathMapper, ReapiCompile, lexically_normalize,
+};
