@@ -14,12 +14,13 @@
 
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use crate::errors::*;
+use prost::Message;
 use remexec::capabilities_client::CapabilitiesClient;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
-use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue};
+use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue, BinaryMetadataValue};
 use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
@@ -55,6 +56,14 @@ const REQUIRED_API_MAJOR_VERSION: i32 = 2;
 const MIN_API_MINOR_VERSION: i32 = 1;
 /// Used when the server doesn't advertise a batch limit.
 const DEFAULT_MAX_BATCH_BYTES: usize = 2 * 1024 * 1024;
+/// The `RequestMetadata` mnemonic of a compile's action, as rules_rust names it.
+pub(super) const RUSTC_MNEMONIC: &str = "Rustc";
+/// The mnemonic of the action that runs `rustc -vV` on a worker.
+pub(super) const RUSTC_VERSION_MNEMONIC: &str = "RustcVersion";
+/// Carries a [`remexec::RequestMetadata`], which a server logs to tell its clients, their runs
+/// and their actions apart.
+pub(super) const REQUEST_METADATA_HEADER: &str =
+    "build.bazel.remote.execution.v2.requestmetadata-bin";
 
 #[derive(Clone, Default)]
 pub(crate) struct ConnectOptions {
@@ -66,6 +75,9 @@ pub(crate) struct ConnectOptions {
     pub(crate) auth_token: Option<String>,
     /// Sent with every request.
     pub(crate) headers: BTreeMap<String, String>,
+    /// Sent in every request's `RequestMetadata`, so that the server can tell this sccache
+    /// server's calls from those of earlier runs and other clients.
+    pub(crate) tool_invocation_id: String,
     /// PEM certificates that TLS trusts instead of the system's root certificates.
     pub(crate) tls_ca_certificates: Option<Certificate>,
     /// The PEM certificate and key TLS sends to a server that asks for a client certificate.
@@ -74,10 +86,12 @@ pub(crate) struct ConnectOptions {
 
 pub(crate) type ReapiChannel = InterceptedService<Channel, HeadersInterceptor>;
 
-/// Adds `headers` to every request.
+/// Adds `headers` to every request, and `request_metadata` to a request that has no
+/// `RequestMetadata` of its own.
 #[derive(Clone)]
 pub(crate) struct HeadersInterceptor {
     headers: Arc<[(AsciiMetadataKey, AsciiMetadataValue)]>,
+    request_metadata: BinaryMetadataValue,
 }
 
 impl Interceptor for HeadersInterceptor {
@@ -87,6 +101,11 @@ impl Interceptor for HeadersInterceptor {
     ) -> std::result::Result<tonic::Request<()>, tonic::Status> {
         for (name, value) in self.headers.iter() {
             request.metadata_mut().insert(name.clone(), value.clone());
+        }
+        if !request.metadata().contains_key(REQUEST_METADATA_HEADER) {
+            request
+                .metadata_mut()
+                .insert_bin(REQUEST_METADATA_HEADER, self.request_metadata.clone());
         }
         Ok(request)
     }
@@ -159,6 +178,7 @@ impl std::fmt::Display for CredentialsRefused {
 pub(crate) struct Client {
     instance_name: String,
     channel: ReapiChannel,
+    request_metadata: remexec::RequestMetadata,
     max_batch_bytes: usize,
     supports_zstd_bytestream: bool,
     executes_actions: bool,
@@ -189,7 +209,23 @@ impl Client {
             },
         )
         .await?;
-        let channel = InterceptedService::new(channel, HeadersInterceptor { headers });
+        let request_metadata = remexec::RequestMetadata {
+            tool_details: Some(remexec::ToolDetails {
+                tool_name: "sccache".to_owned(),
+                tool_version: env!("CARGO_PKG_VERSION").to_owned(),
+            }),
+            tool_invocation_id: options.tool_invocation_id.clone(),
+            ..Default::default()
+        };
+        let channel = InterceptedService::new(
+            channel,
+            HeadersInterceptor {
+                headers,
+                request_metadata: BinaryMetadataValue::from_bytes(
+                    &request_metadata.encode_to_vec(),
+                ),
+            },
+        );
 
         let capabilities = with_timeout(
             "failed to get the REAPI server's capabilities",
@@ -254,6 +290,7 @@ impl Client {
         Ok(Client {
             instance_name: options.instance_name.clone(),
             channel,
+            request_metadata,
             max_batch_bytes,
             supports_zstd_bytestream,
             executes_actions,
@@ -269,6 +306,11 @@ impl Client {
         self.channel.clone()
     }
 
+    /// The `RequestMetadata` of every call that isn't for one action.
+    pub(crate) fn request_metadata(&self) -> &remexec::RequestMetadata {
+        &self.request_metadata
+    }
+
     pub(crate) fn max_batch_bytes(&self) -> usize {
         self.max_batch_bytes
     }
@@ -280,6 +322,27 @@ impl Client {
     pub(crate) fn executes_actions(&self) -> bool {
         self.executes_actions
     }
+}
+
+/// `message` as a request whose `RequestMetadata` is `request_metadata` with the ID and
+/// mnemonic of the action the call is for.
+pub(super) fn action_request<T>(
+    message: T,
+    request_metadata: &remexec::RequestMetadata,
+    action_digest: &remexec::Digest,
+    action_mnemonic: &str,
+) -> tonic::Request<T> {
+    let request_metadata = remexec::RequestMetadata {
+        action_id: action_digest.hash.clone(),
+        action_mnemonic: action_mnemonic.to_owned(),
+        ..request_metadata.clone()
+    };
+    let mut request = tonic::Request::new(message);
+    request.metadata_mut().insert_bin(
+        REQUEST_METADATA_HEADER,
+        BinaryMetadataValue::from_bytes(&request_metadata.encode_to_vec()),
+    );
+    request
 }
 
 /// Fails if `options` has an invalid endpoint, auth token, header or TLS file, without
