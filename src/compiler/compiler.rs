@@ -954,6 +954,7 @@ where
     )>;
 
     /// The compile with its paths mapped for REAPI, or why it can't run through REAPI.
+    /// May run rustc and read files, so call it from a blocking thread.
     #[cfg(feature = "reapi")]
     fn map_for_reapi(
         &self,
