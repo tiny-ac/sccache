@@ -194,7 +194,9 @@ impl<T: CommandCreatorSync> RemoteExecutor<T> for ReapiExecutor {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::compiler::{Cacheable, CompileCommand, LocalArg, SingleCompileCommand};
+    use crate::compiler::{
+        CacheControl, Cacheable, CompileCommand, LocalArg, SingleCompileCommand,
+    };
     use crate::dist;
     use crate::mock_command::{MockChild, MockCommandCreator, exit_status};
     use crate::reapi::fake::FakeServer;
@@ -336,6 +338,8 @@ mod test {
             }),
             out_pretty: "lib.rs".to_owned(),
             dist_job: None,
+            cache_control: CacheControl::Default,
+            local_compile_changed: true,
         };
         runtime
             .block_on(executor.compile(job, local_compile))
