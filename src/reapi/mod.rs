@@ -25,6 +25,7 @@ mod input_root;
 mod mapping;
 pub(crate) mod proto;
 mod remote_compile;
+mod sysroot;
 
 pub(crate) use mapping::{
     ActionEnv, CompileLocallyReason, NotEligible, PathMapper, ReapiCompile, lexically_normalize,
