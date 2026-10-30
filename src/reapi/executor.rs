@@ -21,6 +21,7 @@ use super::connection::{Connection, ServerApis};
 use super::digest::DigestCache;
 use super::lookup_pause::LookupPause;
 use super::mapping::{CompileLocallyReason, ReapiCompile};
+use super::proto::build::bazel::remote::execution::v2 as remexec;
 use super::remote_compile::{
     ActionOptions, action_blobs, digest_input_root_files, materialize, materialize_failure_reason,
 };
@@ -206,33 +207,44 @@ impl ReapiExecutor {
             // it counts as a miss.
             _ => return compile_locally(out_pretty, CompileLocallyReason::NotInActionCache),
         };
-        match materialize(&apis.cas, &reapi_compile, &result).await {
-            Ok(output) => {
-                debug!(
-                    "[{}]: REAPI action cache hit {}",
-                    out_pretty, action_digest.hash
-                );
-                Ok(output)
-            }
-            Err(e) => {
-                let reason = materialize_failure_reason(&e);
-                // The same result fails the same way on every build.
-                let log_level = match reason {
-                    CompileLocallyReason::UnusableResult
-                    | CompileLocallyReason::WorkerRootInOutput => log::Level::Debug,
-                    _ => log::Level::Warn,
-                };
-                log!(
-                    log_level,
-                    "[{}]: Compiling locally: action cache result {}: {:#}",
-                    out_pretty,
-                    action_digest.hash,
-                    e
-                );
-                Err(reason)
-            }
-        }
+        let output =
+            write_outputs(&apis, &reapi_compile, &result, &action_digest, out_pretty).await?;
+        debug!(
+            "[{}]: REAPI action cache hit {}",
+            out_pretty, action_digest.hash
+        );
+        Ok(output)
     }
+}
+
+/// Writes `result`'s outputs to `reapi_compile`'s local paths.
+async fn write_outputs(
+    apis: &ServerApis,
+    reapi_compile: &ReapiCompile,
+    result: &remexec::ActionResult,
+    action_digest: &remexec::Digest,
+    out_pretty: &str,
+) -> std::result::Result<process::Output, CompileLocallyReason> {
+    materialize(&apis.cas, reapi_compile, result)
+        .await
+        .map_err(|e| {
+            let reason = materialize_failure_reason(&e);
+            // The same result fails the same way on every build.
+            let log_level = match reason {
+                CompileLocallyReason::UnusableResult | CompileLocallyReason::WorkerRootInOutput => {
+                    log::Level::Debug
+                }
+                _ => log::Level::Warn,
+            };
+            log!(
+                log_level,
+                "[{}]: Compiling locally: result of action {}: {:#}",
+                out_pretty,
+                action_digest.hash,
+                e
+            );
+            reason
+        })
 }
 
 /// Logs that `out_pretty` compiles locally for `reason`, and returns `reason` as the error.
