@@ -36,7 +36,9 @@ basedirs = ["/home/user/project"]
 [dist]
 # where to find the scheduler
 scheduler_url = "http://1.2.3.4:10600"
-# a set of prepackaged toolchains
+# a set of prepackaged toolchains; with [dist.reapi], a client that doesn't
+# run Linux takes the Linux toolchain workers run from a path_override entry
+# (see docs/Reapi.md)
 toolchains = []
 # the maximum size of the toolchain cache in bytes
 toolchain_cache_size = 5368709120
@@ -79,7 +81,7 @@ salt = ""
 # what a compile that misses the action cache does: "execute" runs it on the
 # server's workers, and the server caches the result; "local" compiles it
 # locally, and sccache never writes to the server. Execution needs a Linux
-# client
+# client, or a toolchain from dist.toolchains (see docs/Reapi.md)
 on_miss = "execute"
 # how long a miss that the server reports queued waits for a worker before it
 # compiles locally

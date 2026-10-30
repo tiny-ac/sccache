@@ -159,6 +159,7 @@ fn reapi_executor(config: &Config) -> Option<Arc<crate::reapi::ReapiExecutor>> {
     config.dist.reapi.as_ref().map(|reapi| {
         Arc::new(crate::reapi::ReapiExecutor::new(
             reapi,
+            &config.dist.toolchains,
             &config.dist.cache_dir,
         ))
     })

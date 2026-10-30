@@ -35,11 +35,12 @@ use super::remote_compile::{
     download_stdout_or_stderr, materialize, materialize_failure_reason, rustc_version_action_blobs,
 };
 use super::toolchains::{ToolchainFiles, Toolchains};
+use super::worker_toolchains::WorkerToolchains;
 use crate::compiler::{
     CacheControl, Compilation, DistInputOptions, DistType, LocalCompile, LocalCompileChanges,
     ReapiOutcome, RemoteExecutor, RemoteJob,
 };
-use crate::config::{ReapiConfig, ReapiOnMiss};
+use crate::config::{DistToolchainConfig, ReapiConfig, ReapiOnMiss};
 use crate::errors::*;
 use crate::mock_command::CommandCreatorSync;
 use async_trait::async_trait;
@@ -53,6 +54,7 @@ use tonic::transport::{Certificate, Identity};
 
 /// Directory under the dist cache dir for the sysroot copies local compiles use.
 const SYSROOT_COPIES_DIR: &str = "reapi-sysroot-copies";
+const WORKER_TOOLCHAINS_DIR: &str = "reapi-worker-toolchains";
 /// File under the dist cache dir that keeps toolchain file digests across restarts.
 const DIGEST_CACHE_FILE: &str = "reapi-digests.json";
 /// Bounds an execution, with its reattaches and its retry after uploading again. Longer than
@@ -77,6 +79,8 @@ pub struct ReapiExecutor {
     on_miss: ReapiOnMiss,
     queue_timeout: Duration,
     is_linux_client: bool,
+    /// The toolchains workers run for a client that doesn't run Linux.
+    worker_toolchains: WorkerToolchains,
     rustc_checks: Mutex<HashMap<ToolchainKey, Arc<RustcCheck>>>,
     /// Set when the server refuses an execution, so misses compile locally until the sccache
     /// server restarts.
@@ -104,11 +108,18 @@ struct Lookup {
     reapi_compile: ReapiCompile,
     apis: Arc<ServerApis>,
     toolchain: ToolchainFiles,
+    /// Whether `toolchain` runs on Linux workers, so that a miss can execute.
+    toolchain_runs_on_workers: bool,
 }
 
 impl ReapiExecutor {
-    /// Reads the TLS files once, so a changed one takes a restart.
-    pub fn new(config: &ReapiConfig, dist_cache_dir: &Path) -> Self {
+    /// Reads the TLS files once, so a changed one takes a restart. `dist_toolchains` gives the
+    /// Linux toolchains of a client that doesn't run Linux.
+    pub fn new(
+        config: &ReapiConfig,
+        dist_toolchains: &[DistToolchainConfig],
+        dist_cache_dir: &Path,
+    ) -> Self {
         let connection = match read_connect_options(config) {
             Ok(options) => Some(Connection::new(options)),
             Err(e) => {
@@ -139,6 +150,10 @@ impl ReapiExecutor {
                 .queue_timeout_secs
                 .map_or(DEFAULT_QUEUE_TIMEOUT, Duration::from_secs),
             is_linux_client: cfg!(target_os = "linux"),
+            worker_toolchains: WorkerToolchains::new(
+                dist_toolchains,
+                dist_cache_dir.join(WORKER_TOOLCHAINS_DIR),
+            ),
             rustc_checks: Default::default(),
             executions_refused: AtomicBool::new(false),
         }
@@ -157,7 +172,7 @@ impl ReapiExecutor {
             return compile_locally(out_pretty, CompileLocallyReason::CacheBypassed);
         }
         let mapped = tokio::task::spawn_blocking(move || compilation.map_for_reapi()).await;
-        let reapi_compile = match mapped {
+        let mut reapi_compile = match mapped {
             Ok(Ok(reapi_compile)) => reapi_compile,
             Ok(Err(not_eligible)) => {
                 match &not_eligible.detail {
@@ -192,16 +207,44 @@ impl ReapiExecutor {
             return compile_locally(out_pretty, CompileLocallyReason::ActionCacheLookupsPaused);
         }
         let deadline = Instant::now() + self.ready_wait;
-        let ready = tokio::try_join!(
-            connection.server_apis(deadline),
-            self.toolchains.files(&reapi_compile.toolchain, deadline)
-        );
-        match ready {
-            Ok((apis, toolchain)) => Ok(Lookup {
-                reapi_compile,
-                apis,
-                toolchain,
-            }),
+        // A proc macro this compile loads is a shared library for the client's OS, which a
+        // Linux rustc can't load.
+        let loads_proc_macro = !self.is_linux_client
+            && reapi_compile.input_root_files.iter().any(|path| {
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| matches!(extension, "dylib" | "so" | "dll"))
+            });
+        let local_toolchain = reapi_compile.toolchain.clone();
+        let toolchain = async {
+            let (toolchain, toolchain_runs_on_workers) = if self.is_linux_client {
+                (local_toolchain, true)
+            } else {
+                match self
+                    .worker_toolchains
+                    .toolchain(&local_toolchain, deadline)
+                    .await?
+                {
+                    Some(_) if loads_proc_macro => {
+                        return Err(CompileLocallyReason::ProcMacroForClientOs);
+                    }
+                    Some(worker_toolchain) => (worker_toolchain, true),
+                    None => (local_toolchain, false),
+                }
+            };
+            let files = self.toolchains.files(&toolchain, deadline).await?;
+            Ok((toolchain, files, toolchain_runs_on_workers))
+        };
+        match tokio::try_join!(connection.server_apis(deadline), toolchain) {
+            Ok((apis, (toolchain_key, toolchain, toolchain_runs_on_workers))) => {
+                reapi_compile.toolchain = toolchain_key;
+                Ok(Lookup {
+                    reapi_compile,
+                    apis,
+                    toolchain,
+                    toolchain_runs_on_workers,
+                })
+            }
             Err(reason) => compile_locally(out_pretty, reason),
         }
     }
@@ -217,6 +260,7 @@ impl ReapiExecutor {
             reapi_compile,
             apis,
             toolchain,
+            toolchain_runs_on_workers,
         } = lookup;
         let digest_cache = self.digest_cache.clone();
         let action_options = self.action_options.clone();
@@ -283,8 +327,9 @@ impl ReapiExecutor {
         if self.on_miss == ReapiOnMiss::Local {
             return compile_locally(out_pretty, CompileLocallyReason::NotInActionCache);
         }
-        // The toolchain sent is the client's own, and REAPI workers run Linux.
-        if !self.is_linux_client {
+        // Without a worker toolchain, the toolchain sent is the client's own, and REAPI workers
+        // run Linux.
+        if !toolchain_runs_on_workers {
             return compile_locally(out_pretty, CompileLocallyReason::NonLinuxToolchain);
         }
         let Some(execution) = &apis.execution else {
@@ -796,6 +841,8 @@ mod test {
     #[derive(Clone, Copy)]
     enum Eligibility {
         Eligible,
+        /// Eligible, and loads a proc macro.
+        UsesProcMacro,
         Ineligible,
         Panics,
     }
@@ -823,7 +870,7 @@ mod test {
 
         fn map_for_reapi(&self) -> std::result::Result<ReapiCompile, crate::reapi::NotEligible> {
             match self.eligibility {
-                Eligibility::Eligible => {}
+                Eligibility::Eligible | Eligibility::UsesProcMacro => {}
                 Eligibility::Ineligible => return Err(CompileLocallyReason::Staticlib.into()),
                 Eligibility::Panics => panic!("map_for_reapi"),
             }
@@ -838,7 +885,13 @@ mod test {
                     TARGET_TRIPLE.to_owned(),
                 ),
                 env: Default::default(),
-                input_root_files: vec![ws.join("src/lib.rs")],
+                input_root_files: match self.eligibility {
+                    Eligibility::UsesProcMacro => vec![
+                        ws.join("src/lib.rs"),
+                        ws.join("target/debug/deps/libderive.dylib"),
+                    ],
+                    _ => vec![ws.join("src/lib.rs")],
+                },
                 outputs: vec![ws.join(RLIB)],
             })
         }
@@ -962,7 +1015,7 @@ mod test {
 
         /// An executor on a Linux client.
         fn executor(&self) -> ReapiExecutor {
-            let mut executor = ReapiExecutor::new(&self.config, &self.dir.path().join("dist"));
+            let mut executor = ReapiExecutor::new(&self.config, &[], &self.dir.path().join("dist"));
             executor.is_linux_client = true;
             executor
         }
@@ -1239,6 +1292,71 @@ mod test {
             compiled_locally("REAPI server doesn't execute actions"),
             dist_type
         );
+    }
+
+    /// An executor on a client that doesn't run Linux, with `fixture`'s sysroot packed as the
+    /// toolchain workers run, but for a rustc that holds `linux rustc`.
+    fn non_linux_executor_with_worker_toolchain(fixture: &Fixture) -> ReapiExecutor {
+        let sysroot = fixture.dir.path().join("sysroot");
+        let archive = fixture.dir.path().join("toolchain.tar.gz");
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            std::fs::File::create(&archive).unwrap(),
+            flate2::Compression::fast(),
+        ));
+        builder.append_dir_all("toolchain", &sysroot).unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(b"linux rustc".len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(
+                &mut header,
+                "toolchain/bin/rustc",
+                b"linux rustc".as_slice(),
+            )
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+        let mut executor = ReapiExecutor::new(
+            &fixture.config,
+            &[DistToolchainConfig::PathOverride {
+                compiler_executable: sysroot.join("bin/rustc"),
+                archive,
+                archive_compiler_executable: "/toolchain/bin/rustc".to_owned(),
+            }],
+            &fixture.dir.path().join("dist"),
+        );
+        executor.is_linux_client = false;
+        executor
+    }
+
+    #[test]
+    fn test_a_miss_on_another_os_executes_with_the_worker_toolchain() {
+        let fixture = executing_fixture(FakeServer::default());
+        let executor = non_linux_executor_with_worker_toolchain(&fixture);
+        let (dist_type, _) = fixture.compile_with(&executor);
+        assert_eq!(DistType::Reapi(ReapiOutcome::Executed), dist_type);
+        assert!(fixture.server.has_blob(b"linux rustc"));
+        // So that a changed archive has its rustc checked again.
+        let checked: Vec<_> = (executor.rustc_checks.lock().unwrap().keys())
+            .map(|toolchain| toolchain.sysroot.clone())
+            .collect();
+        assert!(
+            matches!(&checked[..], [sysroot] if sysroot.ends_with("toolchain")),
+            "{checked:?}"
+        );
+    }
+
+    #[test]
+    fn test_a_proc_macro_on_another_os_compiles_locally() {
+        let mut fixture = executing_fixture(FakeServer::default());
+        fixture.eligibility = Eligibility::UsesProcMacro;
+        let executor = non_linux_executor_with_worker_toolchain(&fixture);
+        let (dist_type, _) = fixture.compile_with(&executor);
+        assert_eq!(
+            compiled_locally("proc macro for the client's OS"),
+            dist_type
+        );
+        assert_eq!(0, fixture.server.execute_calls.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -1823,8 +1941,11 @@ mod test {
 
     #[test]
     fn test_local_compiles_get_the_sysroot_copies_dir_under_the_dist_cache_dir() {
-        let executor =
-            ReapiExecutor::new(&config("grpc://farm:8980".to_owned(), 0), "/cache".as_ref());
+        let executor = ReapiExecutor::new(
+            &config("grpc://farm:8980".to_owned(), 0),
+            &[],
+            "/cache".as_ref(),
+        );
         let changes = RemoteExecutor::<Creator>::local_compile_changes(
             &executor,
             &FakeCompilation {

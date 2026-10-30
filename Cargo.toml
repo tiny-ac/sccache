@@ -276,6 +276,8 @@ dist-server = [
 dist-tests = ["dist-client", "dist-server"]
 # Enables a Remote Execution API (REAPI) client. Experimental.
 reapi = [
+  # To unpack the [[dist.toolchains]] archives of clients that don't run Linux.
+  "flate2",
   "prost",
   "prost-types",
   "sha2",
