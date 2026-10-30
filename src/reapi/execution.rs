@@ -14,7 +14,7 @@
 
 //! Executes actions on a REAPI server's workers.
 
-use super::client::{AuthChannel, Client, RPC_TIMEOUT, RpcError, with_timeout};
+use super::client::{AuthChannel, Client, RPC_TIMEOUT, RpcError, rpc_code, with_timeout};
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use super::proto::google::longrunning::{Operation, operation};
 use super::proto::google::rpc;
@@ -181,10 +181,6 @@ fn may_succeed_on_retry(e: &Error) -> bool {
     }
 }
 
-fn rpc_code(e: &Error) -> Option<tonic::Code> {
-    e.downcast_ref::<RpcError>().map(|e| e.code)
-}
-
 /// [`rpc_status_error`] for a failed Execution API call, whose details carry the
 /// `google.rpc.Status`'s details.
 fn execution_status_error(status: tonic::Status) -> Error {
@@ -340,7 +336,7 @@ mod test {
     #[tokio::test]
     async fn test_a_failed_precondition_without_missing_blobs_keeps_its_code() {
         let e = execute(FakeServer {
-            without_matching_worker: true,
+            execute_error: Some(tonic::Code::FailedPrecondition),
             ..writing_server()
         })
         .await

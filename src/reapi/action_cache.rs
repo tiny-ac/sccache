@@ -72,10 +72,10 @@ impl ActionCache {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::reapi::client::rpc_code;
     use crate::reapi::digest;
     use crate::reapi::fake::FakeServer;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
 
     #[tokio::test]
     async fn test_a_miss_is_none() {
@@ -132,14 +132,11 @@ mod test {
     async fn test_a_failed_lookup_is_an_error() {
         let server = Arc::new(FakeServer::default());
         let action_cache = ActionCache::new(&server.serve_and_connect().await);
-        server.fail_lookups.store(true, Ordering::SeqCst);
+        *server.lookup_error.lock().unwrap() = Some(tonic::Code::Internal);
         let e = action_cache
             .get_action_result(&digest::of_bytes(b"action"))
             .await
             .unwrap_err();
-        assert!(
-            format!("{e:#}").contains("Internal: the action cache is on fire"),
-            "{e:#}"
-        );
+        assert_eq!(Some(tonic::Code::Internal), rpc_code(&e), "{e:#}");
     }
 }

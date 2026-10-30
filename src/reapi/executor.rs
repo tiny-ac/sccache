@@ -953,7 +953,7 @@ mod test {
     #[test]
     fn test_compiles_that_waited_for_a_failed_rustc_check_dont_check_again() {
         let fixture = executing_fixture(FakeServer {
-            fail_uploads: true.into(),
+            upload_error: Some(tonic::Code::Internal).into(),
             ..Default::default()
         });
         let executor = fixture.executor();
@@ -974,7 +974,7 @@ mod test {
 
     /// Fails executions until they pause, then ends the pause.
     fn pause_executions(fixture: &Fixture, executor: &ReapiExecutor) {
-        fixture.server.fail_uploads.store(true, Ordering::SeqCst);
+        *fixture.server.upload_error.lock().unwrap() = Some(tonic::Code::Internal);
         for _ in 0..FAILURES_TO_PAUSE {
             fixture.compile_with(executor);
         }
@@ -982,7 +982,7 @@ mod test {
             compiled_locally("REAPI executions paused after failures"),
             fixture.compile_with(executor).0
         );
-        fixture.server.fail_uploads.store(false, Ordering::SeqCst);
+        *fixture.server.upload_error.lock().unwrap() = None;
         executor.execution_pause.end();
     }
 
@@ -1024,7 +1024,7 @@ mod test {
     #[test]
     fn test_a_rustc_check_that_didnt_reach_a_worker_runs_again() {
         let fixture = executing_fixture(FakeServer {
-            fail_uploads: true.into(),
+            upload_error: Some(tonic::Code::Internal).into(),
             ..Default::default()
         });
         let executor = fixture.executor();
@@ -1032,7 +1032,7 @@ mod test {
             compiled_locally("failed to upload the action's blobs"),
             fixture.compile_with(&executor).0
         );
-        fixture.server.fail_uploads.store(false, Ordering::SeqCst);
+        *fixture.server.upload_error.lock().unwrap() = None;
         assert_eq!(
             DistType::Reapi(ReapiOutcome::Executed),
             fixture.compile_with(&executor).0
@@ -1112,7 +1112,7 @@ mod test {
     #[test]
     fn test_a_refused_execution_compiles_locally() {
         let fixture = executing_fixture(FakeServer {
-            without_matching_worker: true,
+            execute_error: Some(tonic::Code::FailedPrecondition),
             ..Default::default()
         });
         let (dist_type, _) = fixture.compile();
@@ -1122,7 +1122,7 @@ mod test {
     #[test]
     fn test_misses_compile_locally_after_executions_fail() {
         let fixture = executing_fixture(FakeServer {
-            without_matching_worker: true,
+            execute_error: Some(tonic::Code::FailedPrecondition),
             ..Default::default()
         });
         let executor = fixture.executor();
@@ -1145,7 +1145,7 @@ mod test {
     #[test]
     fn test_a_failed_upload_compiles_locally() {
         let fixture = executing_fixture(FakeServer {
-            fail_uploads: true.into(),
+            upload_error: Some(tonic::Code::Internal).into(),
             ..Default::default()
         });
         let (dist_type, _) = fixture.compile();
@@ -1246,7 +1246,7 @@ mod test {
     #[test]
     fn test_a_failed_lookup_compiles_locally() {
         let fixture = Fixture::new(Eligibility::Eligible);
-        fixture.server.fail_lookups.store(true, Ordering::Relaxed);
+        *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Internal);
         let (dist_type, output) = fixture.compile();
         assert_eq!(compiled_locally("action cache lookup failed"), dist_type);
         assert_eq!(b"out".as_slice(), output.stdout);
@@ -1255,7 +1255,7 @@ mod test {
     #[test]
     fn test_compiles_skip_the_lookup_after_failures() {
         let fixture = Fixture::new(Eligibility::Eligible);
-        fixture.server.fail_lookups.store(true, Ordering::Relaxed);
+        *fixture.server.lookup_error.lock().unwrap() = Some(tonic::Code::Internal);
         let executor = fixture.executor();
         for _ in 0..FAILURES_TO_PAUSE {
             assert_eq!(

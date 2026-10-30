@@ -56,8 +56,8 @@ pub(crate) struct FakeServer {
     pub(crate) corrupt_reads: AtomicBool,
     /// Serves blobs with a byte too many.
     pub(crate) oversize_reads: AtomicBool,
-    /// Answers GetActionResult with INTERNAL.
-    pub(crate) fail_lookups: AtomicBool,
+    /// Answers GetActionResult with this code.
+    pub(crate) lookup_error: Mutex<Option<tonic::Code>>,
     /// Answers GetActionResult with NOT_FOUND, as when another client's execution adds the
     /// result after the lookup.
     pub(crate) lookups_miss: bool,
@@ -73,8 +73,8 @@ pub(crate) struct FakeServer {
     /// Deletes this file at the next FindMissingBlobs, as a build that removes an input after
     /// sccache hashes it.
     pub(crate) delete_at_find_missing: Mutex<Option<PathBuf>>,
-    /// Answers BatchUpdateBlobs with INTERNAL.
-    pub(crate) fail_uploads: AtomicBool,
+    /// Answers BatchUpdateBlobs with this code.
+    pub(crate) upload_error: Mutex<Option<tonic::Code>>,
     pub(crate) batch_update_blobs_calls: AtomicUsize,
     pub(crate) batched_blob_count: AtomicUsize,
     pub(crate) bytestream_write_resource_names: Mutex<Vec<String>>,
@@ -93,8 +93,9 @@ pub(crate) struct FakeServer {
     pub(crate) actions_run: AtomicUsize,
     /// Finishes each Execute with a missing-blobs status in the ExecuteResponse.
     pub(crate) missing_blobs_in_response: bool,
-    /// Refuses each Execute with FAILED_PRECONDITION, as when no worker matches the platform.
-    pub(crate) without_matching_worker: bool,
+    /// Refuses each Execute with this code, such as FAILED_PRECONDITION when no worker
+    /// matches the platform.
+    pub(crate) execute_error: Option<tonic::Code>,
     /// Finishes each Execute with an operation error.
     pub(crate) fail_operations: bool,
     /// Breaks this many Execute and WaitExecution streams, after a first, unfinished
@@ -348,8 +349,8 @@ impl ContentAddressableStorage for FakeServer {
         if request.instance_name != self.instance_name {
             return Err(Status::invalid_argument(request.instance_name));
         }
-        if self.fail_uploads.load(Ordering::SeqCst) {
-            return Err(Status::internal("the CAS is on fire"));
+        if let Some(code) = *self.upload_error.lock().unwrap() {
+            return Err(Status::new(code, "upload_error"));
         }
         self.batched_blob_count
             .fetch_add(request.requests.len(), Ordering::SeqCst);
@@ -444,8 +445,8 @@ impl ActionCache for FakeServer {
         &self,
         request: Request<remexec::GetActionResultRequest>,
     ) -> RpcResult<remexec::ActionResult> {
-        if self.fail_lookups.load(Ordering::SeqCst) {
-            return Err(Status::internal("the action cache is on fire"));
+        if let Some(code) = *self.lookup_error.lock().unwrap() {
+            return Err(Status::new(code, "lookup_error"));
         }
         let request = request.into_inner();
         if request.instance_name != self.instance_name {
@@ -761,10 +762,8 @@ impl Execution for FakeServer {
         let action: remexec::Action = self.decode_blob(Some(&action_digest))?;
         let command: remexec::Command = self.decode_blob(action.command_digest.as_ref())?;
         self.check_input_root(action.input_root_digest.as_ref())?;
-        if self.without_matching_worker {
-            return Err(Status::failed_precondition(
-                "no worker matches the platform",
-            ));
+        if let Some(code) = self.execute_error {
+            return Err(Status::new(code, "execute_error"));
         }
         if self.missing_blobs_in_response {
             let response = remexec::ExecuteResponse {
