@@ -263,7 +263,7 @@ dist-server = [
 dist-tests = ["dist-client", "dist-server"]
 
 [workspace]
-exclude = ["tests/test-crate"]
+exclude = ["scripts/reapi-protogen", "tests/test-crate"]
 members = ["tests/integration/randomize_readdir"]
 
 [[bench]]
