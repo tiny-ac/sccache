@@ -98,6 +98,7 @@ pub(crate) enum CompileLocallyReason {
     NonUtf8EnvVar,
     UnsupportedEnvVarName,
     SecretLikeEnvVar,
+    UnreadableDependencies,
 }
 
 impl std::fmt::Display for CompileLocallyReason {
@@ -118,6 +119,7 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::NonUtf8EnvVar => "non-UTF-8 env var",
             Self::UnsupportedEnvVarName => "env var the REAPI command can't pass to rustc",
             Self::SecretLikeEnvVar => "secret-like env var",
+            Self::UnreadableDependencies => "unreadable dependencies",
         })
     }
 }
