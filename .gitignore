@@ -14,6 +14,8 @@ target
 
 # Ignore lockfiles of test crates used in the integration tests
 tests/**/Cargo.lock
+# Checked in to pin the REAPI fixture's dependencies.
+!tests/integration/reapi/fixture/Cargo.lock
 
 # VSCode Workspace files
 **.code-workspace
