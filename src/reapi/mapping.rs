@@ -34,10 +34,24 @@ pub struct ReapiCompile {
     /// output as it was given.
     pub(crate) mapped_crate_root: Option<String>,
     pub(crate) target_triple: String,
+    pub(crate) env: ActionEnv,
     /// Local paths of the files that go into the input root.
     pub(crate) input_root_files: Vec<PathBuf>,
     /// Local paths the compile writes.
     pub(crate) outputs: Vec<PathBuf>,
+}
+
+/// The environment a compile's action runs with.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct ActionEnv {
+    /// Variables set to these values.
+    pub(crate) vars: Vec<(String, String)>,
+    /// Variables holding paths, given relative to the input root. The command sets each to the
+    /// worker's absolute path for it, so `env!("CARGO_MANIFEST_DIR")` names a directory that
+    /// exists on the worker.
+    pub(crate) path_vars: Vec<(String, String)>,
+    /// Variables the crate reads that aren't set locally, which the command unsets.
+    pub(crate) unset_vars: Vec<String>,
 }
 
 /// Error for a compile that can't run through REAPI.
@@ -81,6 +95,9 @@ pub(crate) enum CompileLocallyReason {
     NativeCpu,
     ProfileUse,
     RemapPathPrefix,
+    NonUtf8EnvVar,
+    UnsupportedEnvVarName,
+    SecretLikeEnvVar,
 }
 
 impl std::fmt::Display for CompileLocallyReason {
@@ -98,6 +115,9 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::NativeCpu => "-C target-cpu=native or -Z tune-cpu=native",
             Self::ProfileUse => "-C profile-use or -C profile-sample-use",
             Self::RemapPathPrefix => "--remap-path-prefix",
+            Self::NonUtf8EnvVar => "non-UTF-8 env var",
+            Self::UnsupportedEnvVarName => "env var the REAPI command can't pass to rustc",
+            Self::SecretLikeEnvVar => "secret-like env var",
         })
     }
 }
