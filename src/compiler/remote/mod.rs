@@ -17,6 +17,7 @@ use crate::errors::*;
 use crate::mock_command::CommandCreatorSync;
 use crate::server::SccacheService;
 use async_trait::async_trait;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process;
 
@@ -51,16 +52,53 @@ pub struct DistInputOptions {
     pub rewrite_includes_only: bool,
 }
 
+/// Maps paths in a local compile's stdout or stderr.
+pub type StdoutStderrMapper = Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
+
+/// An argument an executor appends to a local compile.
+pub struct LocalArg {
+    pub arg: OsString,
+    /// `arg` as it goes into the hash key, with a path that doesn't change the outputs
+    /// replaced by a placeholder.
+    pub hashed_as: OsString,
+}
+
+/// How an executor changes a local compile: arguments to append, and a mapper for the paths
+/// they change in its stdout and stderr.
+#[derive(Default)]
+pub struct LocalCompileChanges {
+    pub args: Vec<LocalArg>,
+    pub stdout_stderr_mapper: Option<StdoutStderrMapper>,
+}
+
 /// The job's local compile, for when an executor doesn't run it remotely.
 pub struct LocalCompile<'a, T: CommandCreatorSync> {
     pub service: &'a SccacheService<T>,
     pub creator: &'a T,
     pub command: Box<dyn CompileCommand<T>>,
+    pub stdout_stderr_mapper: Option<StdoutStderrMapper>,
 }
 
 impl<T: CommandCreatorSync> LocalCompile<'_, T> {
     pub async fn run(&self) -> Result<process::Output> {
-        self.command.execute(self.service, self.creator).await
+        let result = self.command.execute(self.service, self.creator).await;
+        let Some(mapper) = &self.stdout_stderr_mapper else {
+            return result;
+        };
+        let map = |mut output: process::Output| {
+            output.stdout = mapper(&output.stdout);
+            output.stderr = mapper(&output.stderr);
+            output
+        };
+        // A compiler that exits non-zero comes back as a `ProcessError`, whose stderr the user
+        // reads most.
+        match result {
+            Ok(output) => Ok(map(output)),
+            Err(error) => match error.downcast::<ProcessError>() {
+                Ok(ProcessError(output)) => Err(ProcessError(map(output)).into()),
+                Err(error) => Err(error),
+            },
+        }
     }
 }
 
@@ -70,6 +108,14 @@ pub trait RemoteExecutor<T: CommandCreatorSync>: Send + Sync {
     /// Options for preprocessing the sources sccache-dist compiles, or `None` when the executor
     /// doesn't use sccache-dist.
     fn dist_input_options(&self) -> Option<DistInputOptions>;
+
+    /// Changes to the local compile of `compilation`. The arguments go after the compile's
+    /// own, so an executor returns them only for compilers that accept them there, and never
+    /// with `dist_input_options`, since sccache-dist compiles don't get them. Called from a
+    /// blocking thread, so it may read files.
+    fn local_compile_changes(&self, _compilation: &dyn Compilation<T>) -> LocalCompileChanges {
+        LocalCompileChanges::default()
+    }
 
     /// Compiles `job`, remotely or with `local_compile`, and writes its outputs where a
     /// local compile would. A remote compile that can't complete leaves none of its outputs.
