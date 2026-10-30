@@ -45,7 +45,7 @@ impl InputRoot {
     /// Builds the directory tree of `files`, in any order. Fails if two files share a path
     /// with different digests or executable bits, if a file's path is also a directory
     /// (`a` and `a/b`), or if a path has an empty, `.` or `..` component.
-    pub(crate) fn build(files: &[InputRootFile]) -> Result<Self> {
+    pub(crate) fn build<'a>(files: impl IntoIterator<Item = &'a InputRootFile>) -> Result<Self> {
         let mut root = BTreeMap::new();
         for file in files {
             add_file(&mut root, &file.path, file)?;
