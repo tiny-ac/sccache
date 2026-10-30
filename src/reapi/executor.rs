@@ -45,6 +45,7 @@ const MAX_READY_WAIT: Duration = Duration::from_secs(3600);
 pub struct ReapiExecutor {
     /// `None` when `[dist.reapi]` is misconfigured.
     connection: Option<Arc<Connection>>,
+    digest_cache: Arc<DigestCache>,
     toolchains: Arc<Toolchains>,
     ready_wait: Duration,
     sysroot_copies_dir: PathBuf,
@@ -75,9 +76,11 @@ impl ReapiExecutor {
             );
             ready_wait = MAX_READY_WAIT;
         }
+        let digest_cache = Arc::new(DigestCache::load(dist_cache_dir.join(DIGEST_CACHE_FILE)));
         ReapiExecutor {
             connection,
-            toolchains: Toolchains::new(DigestCache::load(dist_cache_dir.join(DIGEST_CACHE_FILE))),
+            toolchains: Toolchains::new(digest_cache.clone()),
+            digest_cache,
             ready_wait,
             sysroot_copies_dir: dist_cache_dir.join(SYSROOT_COPIES_DIR),
         }
@@ -209,6 +212,9 @@ mod test {
 
     type Creator = Arc<Mutex<MockCommandCreator>>;
 
+    const TARGET_TRIPLE: &str = "x86_64-unknown-linux-gnu";
+    const RLIB: &str = "target/debug/deps/libfoo.rlib";
+
     #[derive(Clone, Copy)]
     enum Eligibility {
         Eligible,
@@ -216,11 +222,11 @@ mod test {
         Panics,
     }
 
-    /// A compile with the toolchain at `sysroot`, whose local compile gets
-    /// `--sysroot=<sysroot_copies_dir>`.
+    /// A compile of `dir/ws/src/lib.rs` into `dir/ws/target/debug/deps/libfoo.rlib` with the
+    /// toolchain at `dir/sysroot`. Its local compile gets `--sysroot=<sysroot_copies_dir>`.
     struct FakeCompilation {
         eligibility: Eligibility,
-        sysroot: PathBuf,
+        dir: PathBuf,
     }
 
     impl Compilation<Creator> for FakeCompilation {
@@ -242,18 +248,19 @@ mod test {
                 Eligibility::Ineligible => return Err(CompileLocallyReason::Staticlib.into()),
                 Eligibility::Panics => panic!("map_for_reapi"),
             }
+            let ws = self.dir.join("ws");
             Ok(ReapiCompile {
-                path_mapper: PathMapper::new("/src".into(), "/src/target".into()),
+                path_mapper: PathMapper::new(ws.clone(), ws.join("target")),
                 arguments: vec![],
                 mapped_crate_root: None,
                 toolchain: ToolchainKey::new(
                     "abc123".to_owned(),
-                    self.sysroot.clone(),
-                    "x86_64-unknown-linux-gnu".to_owned(),
+                    self.dir.join("sysroot"),
+                    TARGET_TRIPLE.to_owned(),
                 ),
                 env: Default::default(),
-                input_root_files: vec![],
-                outputs: vec![],
+                input_root_files: vec![ws.join("src/lib.rs")],
+                outputs: vec![ws.join(RLIB)],
             })
         }
 
@@ -294,56 +301,97 @@ mod test {
         }
     }
 
-    /// Compiles through an executor for a fake server, waiting 10s for it, with the config
-    /// changed by `configure`, which gets a temp dir holding the toolchain at `sysroot`.
+    /// An executor that waits up to 10s for a fake server, and a temp dir holding the
+    /// toolchain and `ws/src/lib.rs`.
+    struct Fixture {
+        runtime: tokio::runtime::Runtime,
+        server: Arc<FakeServer>,
+        dir: tempfile::TempDir,
+        config: ReapiConfig,
+        eligibility: Eligibility,
+        cache_control: CacheControl,
+        local_compile_changed: bool,
+    }
+
+    impl Fixture {
+        fn new(eligibility: Eligibility) -> Self {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let server = Arc::new(FakeServer::default());
+            let config = config(runtime.block_on(server.serve()), 10);
+            let dir = tempfile::tempdir().unwrap();
+            fake_sysroot(dir.path());
+            let lib_rs = dir.path().join("ws/src/lib.rs");
+            std::fs::create_dir_all(lib_rs.parent().unwrap()).unwrap();
+            std::fs::write(&lib_rs, "pub fn f() {}").unwrap();
+            // Cargo creates the output directory before running rustc.
+            std::fs::create_dir_all(dir.path().join("ws/target/debug/deps")).unwrap();
+            Fixture {
+                runtime,
+                server,
+                dir,
+                config,
+                eligibility,
+                cache_control: CacheControl::Default,
+                local_compile_changed: true,
+            }
+        }
+
+        fn compilation(&self) -> FakeCompilation {
+            FakeCompilation {
+                eligibility: self.eligibility,
+                dir: self.dir.path().to_owned(),
+            }
+        }
+
+        /// Runs the compile through the executor. A local compile writes `out` to stdout and
+        /// `err` to stderr.
+        fn compile(&self) -> (DistType, process::Output) {
+            let executor = ReapiExecutor::new(&self.config, &self.dir.path().join("dist"));
+            let storage = Arc::new(crate::cache::disk::DiskCache::new(
+                self.dir.path(),
+                0,
+                self.runtime.handle(),
+                Default::default(),
+                crate::cache::CacheMode::ReadWrite,
+                vec![],
+            ));
+            let service = SccacheService::mock_with_storage(storage, self.runtime.handle().clone());
+            let creator = new_creator();
+            next_command(&creator, Ok(MockChild::new(exit_status(0), "out", "err")));
+            let command = SingleCompileCommand {
+                executable: "rustc".into(),
+                arguments: vec![],
+                env_vars: vec![],
+                cwd: ".".into(),
+                share_jobserver: false,
+            };
+            let local_compile = LocalCompile {
+                service: &service,
+                creator: &creator,
+                command: crate::compiler::CCompileCommand::new(command),
+                stdout_stderr_mapper: None,
+            };
+            let job = RemoteJob {
+                compilation: Box::new(self.compilation()),
+                out_pretty: "lib.rs".to_owned(),
+                dist_job: None,
+                cache_control: self.cache_control,
+                local_compile_changed: self.local_compile_changed,
+            };
+            self.runtime
+                .block_on(executor.compile(job, local_compile))
+                .unwrap()
+        }
+    }
+
+    /// Compiles with the config changed by `configure`, which gets the fixture's temp dir.
     fn compile(
         eligibility: Eligibility,
         configure: impl FnOnce(&mut ReapiConfig, &Path),
     ) -> (DistType, process::Output) {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let server = Arc::new(FakeServer::default());
-        let mut config = config(runtime.block_on(server.serve()), 10);
-        let cache_dir = tempfile::tempdir().unwrap();
-        let sysroot = fake_sysroot(cache_dir.path());
-        configure(&mut config, cache_dir.path());
-        let executor = ReapiExecutor::new(&config, &cache_dir.path().join("dist"));
-        let storage = Arc::new(crate::cache::disk::DiskCache::new(
-            cache_dir.path(),
-            0,
-            runtime.handle(),
-            Default::default(),
-            crate::cache::CacheMode::ReadWrite,
-            vec![],
-        ));
-        let service = SccacheService::mock_with_storage(storage, runtime.handle().clone());
-        let creator = new_creator();
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "out", "err")));
-        let command = SingleCompileCommand {
-            executable: "rustc".into(),
-            arguments: vec![],
-            env_vars: vec![],
-            cwd: ".".into(),
-            share_jobserver: false,
-        };
-        let local_compile = LocalCompile {
-            service: &service,
-            creator: &creator,
-            command: crate::compiler::CCompileCommand::new(command),
-            stdout_stderr_mapper: None,
-        };
-        let job = RemoteJob {
-            compilation: Box::new(FakeCompilation {
-                eligibility,
-                sysroot,
-            }),
-            out_pretty: "lib.rs".to_owned(),
-            dist_job: None,
-            cache_control: CacheControl::Default,
-            local_compile_changed: true,
-        };
-        runtime
-            .block_on(executor.compile(job, local_compile))
-            .unwrap()
+        let mut fixture = Fixture::new(eligibility);
+        configure(&mut fixture.config, fixture.dir.path());
+        fixture.compile()
     }
 
     fn compiled_locally(reason: &str) -> DistType {
@@ -429,7 +477,7 @@ mod test {
             &executor,
             &FakeCompilation {
                 eligibility: Eligibility::Eligible,
-                sysroot: "/toolchain".into(),
+                dir: "/".into(),
             },
         );
         let mut expected = OsString::from("--sysroot=");
