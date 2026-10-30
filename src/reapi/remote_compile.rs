@@ -33,6 +33,8 @@ use tempfile::{NamedTempFile, TempPath};
 
 /// Starts the stderr line where the worker reports the worker root.
 pub(super) const WORKER_ROOT_MARKER: &str = "sccache-reapi-pwd:";
+/// Starts a worker's script, with `$PWD` set to the physical worker root.
+const ENTER_WORKER_ROOT: &str = "set -e\ncd -P .\nPWD=$(pwd -P)\n";
 
 /// The command a worker runs for `compile`, which doesn't depend on the checkout path. A
 /// shell script adds the worker root, known only when the action runs, to path env vars and
@@ -41,9 +43,8 @@ pub(super) fn build_command(compile: &ReapiCompile) -> remexec::Command {
     // rustc's paths use the physical cwd, so $PWD must too for the remaps and the worker
     // root line to match them. `materialize` reads the worker root line to map the worker
     // root to local paths.
-    let mut script = format!(
-        "set -e\ncd -P .\nPWD=$(pwd -P)\nprintf '{WORKER_ROOT_MARKER}%s\\n' \"$PWD\" >&2\n"
-    );
+    let mut script =
+        format!("{ENTER_WORKER_ROOT}printf '{WORKER_ROOT_MARKER}%s\\n' \"$PWD\" >&2\n");
     // Names go into the script unquoted; the mapping only lets identifiers through.
     debug_assert!(
         compile
@@ -73,9 +74,9 @@ pub(super) fn build_command(compile: &ReapiCompile) -> remexec::Command {
     // Execution may hardlink input root files from their CAS, so rustc may not find its
     // libraries and sysroot from its own path; the script sets both.
     // rustc applies the last matching --remap-path-prefix, so BUILD_ROOT_DIR's comes last.
+    script.push_str(&toolchain_library_path_exports());
     script.push_str(&format!(
-        "export LD_LIBRARY_PATH=\"$PWD\"/{TOOLCHAIN_DIR}/lib DYLD_LIBRARY_PATH=\"$PWD\"/{TOOLCHAIN_DIR}/lib\n\
-         exec \"$PWD\"/{TOOLCHAIN_DIR}/bin/rustc --sysroot \"$PWD\"/{TOOLCHAIN_DIR} \"$@\"{mapped_crate_root_arg} \
+        "exec \"$PWD\"/{TOOLCHAIN_DIR}/bin/rustc --sysroot \"$PWD\"/{TOOLCHAIN_DIR} \"$@\"{mapped_crate_root_arg} \
          --remap-path-prefix=\"$PWD\"=. --remap-path-prefix=\"$PWD\"/{BUILD_ROOT_DIR}={BUILD_ROOT_DIR}\n"
     ));
     let mut arguments = vec![
@@ -100,6 +101,12 @@ pub(super) fn build_command(compile: &ReapiCompile) -> remexec::Command {
         output_paths,
         ..Default::default()
     }
+}
+
+fn toolchain_library_path_exports() -> String {
+    format!(
+        "export LD_LIBRARY_PATH=\"$PWD\"/{TOOLCHAIN_DIR}/lib DYLD_LIBRARY_PATH=\"$PWD\"/{TOOLCHAIN_DIR}/lib\n"
+    )
 }
 
 /// The paths `compile`'s command declares as outputs, input-root-relative.
@@ -161,14 +168,13 @@ impl ActionOptions {
     }
 }
 
-/// The command that runs `compile`, and the action that runs it on the input root
+/// `command` with `options`' platform, and the action that runs it on the input root
 /// `input_root_digest`.
 fn build_action(
-    compile: &ReapiCompile,
+    mut command: remexec::Command,
     input_root_digest: remexec::Digest,
     options: &ActionOptions,
 ) -> (remexec::Command, remexec::Action) {
-    let mut command = build_command(compile);
     // REAPI v2.2+ servers read the platform from the Action; the spec asks to set it on the
     // Command too, for older ones.
     #[expect(deprecated)]
@@ -199,13 +205,25 @@ pub(super) fn action_blobs(
     toolchain: &[(InputRootFile, PathBuf)],
     options: &ActionOptions,
 ) -> Result<ActionBlobs> {
-    let all_files = files.iter().chain(toolchain);
-    let input_root = InputRoot::build(all_files.clone().map(|(file, _)| file))?;
-    let (command, action) = build_action(compile, input_root.digest, options);
+    command_action_blobs(
+        build_command(compile),
+        files.iter().chain(toolchain),
+        options,
+    )
+}
+
+/// The [`ActionBlobs`] of the action that runs `command` on `files`.
+fn command_action_blobs<'a>(
+    command: remexec::Command,
+    files: impl Iterator<Item = &'a (InputRootFile, PathBuf)> + Clone,
+    options: &ActionOptions,
+) -> Result<ActionBlobs> {
+    let input_root = InputRoot::build(files.clone().map(|(file, _)| file))?;
+    let (command, action) = build_action(command, input_root.digest, options);
     let command_bytes = command.encode_to_vec();
     let action_bytes = action.encode_to_vec();
     let action_digest = digest::of_bytes(&action_bytes);
-    let mut blobs: Vec<(remexec::Digest, Blob)> = all_files
+    let mut blobs: Vec<(remexec::Digest, Blob)> = files
         .map(|(file, local_path)| (file.digest.clone(), Blob::File(local_path.clone())))
         .collect();
     blobs.extend(
@@ -908,8 +926,11 @@ pub(super) mod test {
     #[test]
     fn test_the_command_and_the_action_carry_the_platform() {
         let options = ActionOptions::new(&config_with_salt_and_platform());
-        let (command, action) =
-            build_action(&reapi_compile_in("/ws"), digest::of_bytes(b""), &options);
+        let (command, action) = build_action(
+            build_command(&reapi_compile_in("/ws")),
+            digest::of_bytes(b""),
+            &options,
+        );
         let platform = Some(remexec::Platform {
             properties: vec![remexec::platform::Property {
                 name: "OSFamily".to_owned(),
