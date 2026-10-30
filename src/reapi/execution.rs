@@ -21,6 +21,17 @@ use super::proto::google::rpc;
 use crate::errors::*;
 use prost::Message;
 use remexec::execution_client::ExecutionClient;
+use std::time::Duration;
+
+/// Reattaches in a row without the server reporting progress before giving up.
+const MAX_REATTACHES: u32 = 3;
+/// The wait before the first reattach, doubled before each next one. Short in tests, which
+/// break streams on purpose.
+const REATTACH_BACKOFF: Duration = if cfg!(test) {
+    Duration::from_millis(1)
+} else {
+    Duration::from_millis(500)
+};
 
 /// Error for an Execute the server refused because its CAS is missing blobs the action
 /// needs.
@@ -54,8 +65,9 @@ impl Execution {
     }
 
     /// Runs the action on a worker, or answers from the action cache unless
-    /// `skip_cache_lookup`. Fails with [`MissingActionBlobs`] when the CAS is missing blobs
-    /// the action needs. The caller bounds how long it takes.
+    /// `skip_cache_lookup`. Reattaches after a broken stream. Fails with
+    /// [`MissingActionBlobs`] when the CAS is missing blobs the action needs. The caller
+    /// bounds how long it takes.
     pub(crate) async fn execute_action(
         &self,
         action_digest: &remexec::Digest,
@@ -65,21 +77,55 @@ impl Execution {
             "failed to execute action {}/{} on the REAPI server",
             action_digest.hash, action_digest.size_bytes
         );
-        let mut stream = self
-            .execute_stream(action_digest, skip_cache_lookup)
-            .await
-            .with_context(|| description.clone())?;
-        while let Some(operation) = stream
-            .message()
-            .await
-            .map_err(execution_status_error)
-            .with_context(|| description.clone())?
-        {
-            if operation.done {
-                return execute_response(operation.result).with_context(|| description.clone());
+        let mut operation_name: Option<String> = None;
+        let mut reattaches_without_progress = 0;
+        loop {
+            let stream = match operation_name.clone() {
+                Some(name) => match self.wait_execution_stream(name).await {
+                    // The server lost the operation.
+                    Err(e) if rpc_code(&e) == Some(tonic::Code::NotFound) => {
+                        operation_name = None;
+                        self.execute_stream(action_digest, skip_cache_lookup).await
+                    }
+                    waited => waited,
+                },
+                None => self.execute_stream(action_digest, skip_cache_lookup).await,
+            };
+            let last_error = match stream {
+                Ok(mut stream) => loop {
+                    match stream.message().await {
+                        Ok(Some(operation)) if operation.done => {
+                            return execute_response(operation.result).context(description);
+                        }
+                        Ok(Some(operation)) => {
+                            reattaches_without_progress = 0;
+                            if !operation.name.is_empty() {
+                                operation_name = Some(operation.name);
+                            }
+                        }
+                        Ok(None) => {
+                            break anyhow!("the stream ended before the operation finished");
+                        }
+                        Err(status) => break execution_status_error(status),
+                    }
+                },
+                Err(e) => e,
+            };
+            if !may_succeed_on_retry(&last_error) {
+                return Err(last_error.context(description));
             }
+            if reattaches_without_progress == MAX_REATTACHES {
+                return Err(last_error.context(format!(
+                    "{description}: no progress after {MAX_REATTACHES} reattaches"
+                )));
+            }
+            debug!(
+                "REAPI: reattaching to action {}/{} after: {last_error:#}",
+                action_digest.hash, action_digest.size_bytes
+            );
+            tokio::time::sleep(REATTACH_BACKOFF * (1 << reattaches_without_progress)).await;
+            reattaches_without_progress += 1;
         }
-        bail!("{description}: the Execute stream ended before the operation finished")
     }
 
     async fn execute_stream(
@@ -103,6 +149,35 @@ impl Execution {
             }
         })
         .await
+    }
+
+    async fn wait_execution_stream(&self, name: String) -> Result<tonic::Streaming<Operation>> {
+        let request = remexec::WaitExecutionRequest { name };
+        with_timeout("the WaitExecution call", RPC_TIMEOUT, async {
+            match self.execution_client.clone().wait_execution(request).await {
+                Ok(response) => Ok(response.into_inner()),
+                Err(status) => Err(execution_status_error(status)),
+            }
+        })
+        .await
+    }
+}
+
+/// Whether reattaching or executing again may get past `e`, as after a dropped connection,
+/// busy workers or a timeout.
+fn may_succeed_on_retry(e: &Error) -> bool {
+    if e.is::<MissingActionBlobs>() {
+        return false;
+    }
+    match rpc_code(e) {
+        Some(code) => matches!(
+            code,
+            tonic::Code::Unavailable
+                | tonic::Code::Internal
+                | tonic::Code::Unknown
+                | tonic::Code::Cancelled
+        ),
+        None => true,
     }
 }
 
@@ -179,9 +254,10 @@ fn execute_response(result: Option<operation::Result>) -> Result<remexec::Execut
 mod test {
     use super::*;
     use crate::reapi::digest;
-    use crate::reapi::fake::FakeServer;
+    use crate::reapi::fake::{FakeServer, StreamBreak};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use test_case::test_case;
 
     /// A server whose workers write `out`.
     fn writing_server() -> FakeServer {
@@ -282,5 +358,149 @@ mod test {
         .await
         .unwrap_err();
         assert_eq!(Some(tonic::Code::Internal), rpc_code(&e));
+    }
+
+    #[tokio::test]
+    async fn test_a_broken_stream_reattaches() {
+        let server = Arc::new(FakeServer {
+            streams_to_break: 1.into(),
+            keep_operations: true,
+            ..writing_server()
+        });
+        let execution = Execution::new(&server.serve_and_connect().await);
+        let response = execution
+            .execute_action(&insert_action(&server), false)
+            .await
+            .unwrap();
+        assert_eq!("out", response.result.unwrap().output_files[0].path);
+        assert_eq!(1, server.execute_calls.load(Ordering::SeqCst));
+        assert_eq!(1, server.wait_execution_calls.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_an_operation_the_server_lost_executes_again() {
+        let server = Arc::new(FakeServer {
+            streams_to_break: 1.into(),
+            ..writing_server()
+        });
+        let execution = Execution::new(&server.serve_and_connect().await);
+        execution
+            .execute_action(&insert_action(&server), false)
+            .await
+            .unwrap();
+        assert_eq!(1, server.wait_execution_calls.load(Ordering::SeqCst));
+        assert_eq!(2, server.execute_calls.load(Ordering::SeqCst));
+    }
+
+    #[test_case(tonic::Code::Unavailable ; "unavailable")]
+    #[test_case(tonic::Code::Internal ; "internal")]
+    #[test_case(tonic::Code::Unknown ; "unknown")]
+    #[test_case(tonic::Code::Cancelled ; "cancelled")]
+    #[tokio::test]
+    async fn test_a_stream_broken_with_a_transient_code_reattaches(code: tonic::Code) {
+        execute(FakeServer {
+            streams_to_break: 1.into(),
+            stream_break: StreamBreak::Status(code),
+            ..writing_server()
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_stream_broken_with_another_code_fails() {
+        let server = Arc::new(FakeServer {
+            streams_to_break: 1.into(),
+            stream_break: StreamBreak::Status(tonic::Code::PermissionDenied),
+            ..writing_server()
+        });
+        let execution = Execution::new(&server.serve_and_connect().await);
+        let e = execution
+            .execute_action(&insert_action(&server), false)
+            .await
+            .unwrap_err();
+        assert_eq!(Some(tonic::Code::PermissionDenied), rpc_code(&e));
+        assert_eq!(1, server.execute_calls.load(Ordering::SeqCst));
+    }
+
+    #[test_case(MAX_REATTACHES as usize, true ; "as many as it reattaches")]
+    #[test_case(MAX_REATTACHES as usize + 1, false ; "one more")]
+    #[tokio::test]
+    async fn test_streams_without_progress_are_reattached_up_to_max_reattaches(
+        broken_streams: usize,
+        finishes: bool,
+    ) {
+        let executed = execute(FakeServer {
+            streams_to_break: broken_streams.into(),
+            break_before_operation: true,
+            ..writing_server()
+        })
+        .await;
+        assert_eq!(finishes, executed.is_ok(), "{executed:?}");
+        if let Err(e) = executed {
+            assert_eq!(Some(tonic::Code::Unavailable), rpc_code(&e));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_streams_that_make_progress_reattach_past_max_reattaches() {
+        execute(FakeServer {
+            streams_to_break: (MAX_REATTACHES as usize + 2).into(),
+            keep_operations: true,
+            ..writing_server()
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_streams_that_end_unfinished_say_so() {
+        let e = execute(FakeServer {
+            streams_to_break: (MAX_REATTACHES as usize + 1).into(),
+            stream_break: StreamBreak::End,
+            break_before_operation: true,
+            ..writing_server()
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{e:#}").contains("the stream ended before the operation finished"),
+            "{e:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refused_calls_are_retried() {
+        let server = Arc::new(FakeServer {
+            executes_to_refuse: 1.into(),
+            streams_to_break: 1.into(),
+            keep_operations: true,
+            wait_executions_to_refuse: 1.into(),
+            ..writing_server()
+        });
+        let execution = Execution::new(&server.serve_and_connect().await);
+        execution
+            .execute_action(&insert_action(&server), false)
+            .await
+            .unwrap();
+        assert_eq!(2, server.execute_calls.load(Ordering::SeqCst));
+        assert_eq!(2, server.wait_execution_calls.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_blobs_lost_with_the_operation_are_missing_action_blobs() {
+        let server = Arc::new(FakeServer {
+            streams_to_break: 1.into(),
+            forget_blobs_on_break: true,
+            ..writing_server()
+        });
+        let execution = Execution::new(&server.serve_and_connect().await);
+        let e = execution
+            .execute_action(&insert_action(&server), false)
+            .await
+            .unwrap_err();
+        assert!(e.is::<MissingActionBlobs>(), "{e:#}");
+        // The first Execute and one more, with no reattaches after it.
+        assert_eq!(2, server.execute_calls.load(Ordering::SeqCst));
     }
 }
