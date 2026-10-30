@@ -810,6 +810,9 @@ pub struct ReapiConfig {
     /// What a compile that misses the action cache does.
     #[serde(default)]
     pub on_miss: ReapiOnMiss,
+    /// How long a miss that the server reports queued waits for a worker before compiling
+    /// locally; 60 if unset.
+    pub queue_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2980,6 +2983,7 @@ auth_token_file = "/token"
 ready_wait_secs = 5
 salt = "1"
 on_miss = "local"
+queue_timeout_secs = 120
 
 [dist.reapi.platform]
 OSFamily = "linux"
@@ -3170,6 +3174,7 @@ key_prefix = "cosprefix"
                     salt: "1".to_owned(),
                     platform: [("OSFamily".to_owned(), "linux".to_owned())].into(),
                     on_miss: ReapiOnMiss::Local,
+                    queue_timeout_secs: Some(120),
                 }),
             },
             server_startup_timeout_ms: Some(10000),
@@ -3717,6 +3722,7 @@ endpoint = "grpcs://farm.example.com:443"
             salt: String::new(),
             platform: BTreeMap::new(),
             on_miss: ReapiOnMiss::Execute,
+            queue_timeout_secs: None,
         }),
         config.dist.reapi
     );
