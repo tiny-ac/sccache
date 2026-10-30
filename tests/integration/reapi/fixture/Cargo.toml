@@ -1,0 +1,15 @@
+[package]
+edition = "2021"
+name = "reapi-fixture"
+publish = false
+version = "0.1.0"
+
+# Covers a plain crate (itoa), a build script that sets cfgs (libc), a library that
+# includes a file its build script writes to OUT_DIR (serde), and a crate whose execution
+# loads a proc macro (reapi-fixture, through serde_derive).
+[dependencies]
+itoa = "=1.0.18"
+libc = "=0.2.190"
+serde = { version = "=1.0.229", features = ["derive"] }
+
+[workspace]
