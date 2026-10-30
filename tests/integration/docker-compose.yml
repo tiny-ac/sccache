@@ -119,6 +119,18 @@ services:
       - test
       - webdav
 
+  nativelink:
+    image: sccache-test-nativelink
+    build:
+      context: reapi
+    pull_policy: build
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "bash", "-c", "cat < /dev/null > /dev/tcp/127.0.0.1/50051"]
+    profiles:
+      - test
+      - reapi
+
   test-redis-deprecated:
     <<: *test-runner
     image: rust:latest
@@ -344,6 +356,19 @@ services:
     profiles:
       - test
       - zstd
+
+  test-reapi:
+    <<: *test-runner
+    # The worker's image, so the rustc sccache uploads finds the same system libraries.
+    image: sccache-test-nativelink
+    pull_policy: never
+    entrypoint: /sccache/tests/integration/scripts/test-reapi.sh
+    depends_on:
+      nativelink:
+        condition: service_healthy
+    profiles:
+      - test
+      - reapi
 
   test-basedirs:
     <<: *test-runner

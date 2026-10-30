@@ -1,0 +1,62 @@
+// One NativeLink process with a CAS, an action cache, a scheduler and a local worker.
+{
+  stores: [
+    {
+      name: "AC",
+      filesystem: {
+        content_path: "/data/ac",
+        temp_path: "/data/ac-tmp",
+        eviction_policy: { max_bytes: 1000000000 },
+      },
+    },
+    {
+      name: "CAS",
+      fast_slow: {
+        fast: {
+          filesystem: {
+            content_path: "/data/cas",
+            temp_path: "/data/cas-tmp",
+            eviction_policy: { max_bytes: 10000000000 },
+          },
+        },
+        slow: { noop: {} },
+      },
+    },
+  ],
+  schedulers: [
+    {
+      name: "SCHEDULER",
+      simple: { supported_platform_properties: {} },
+    },
+  ],
+  workers: [
+    {
+      local: {
+        worker_api_endpoint: { uri: "grpc://127.0.0.1:50061" },
+        cas_fast_slow_store: "CAS",
+        upload_action_result: { ac_store: "AC" },
+        work_directory: "/data/work",
+        platform_properties: {},
+      },
+    },
+  ],
+  servers: [
+    {
+      name: "public",
+      listener: { http: { socket_address: "0.0.0.0:50051" } },
+      services: {
+        cas: [{ instance_name: "", cas_store: "CAS" }],
+        ac: [{ instance_name: "", ac_store: "AC" }],
+        execution: [{ instance_name: "", cas_store: "CAS", scheduler: "SCHEDULER" }],
+        capabilities: [{ instance_name: "", remote_execution: { scheduler: "SCHEDULER" } }],
+        bytestream: [{ instance_name: "", cas_store: "CAS" }],
+      },
+    },
+    {
+      name: "workers",
+      listener: { http: { socket_address: "0.0.0.0:50061" } },
+      services: { worker_api: { scheduler: "SCHEDULER" }, health: {} },
+    },
+  ],
+  global: { max_open_files: 24576 },
+}
