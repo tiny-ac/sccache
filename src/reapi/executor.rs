@@ -22,7 +22,7 @@ use super::digest::DigestCache;
 use super::lookup_pause::LookupPause;
 use super::mapping::{CompileLocallyReason, ReapiCompile};
 use super::remote_compile::{
-    action_digest, digest_input_root_files, materialize, materialize_failure_reason,
+    ActionOptions, action_digest, digest_input_root_files, materialize, materialize_failure_reason,
 };
 use super::toolchains::{ToolchainFiles, Toolchains};
 use crate::compiler::{
@@ -54,6 +54,7 @@ pub struct ReapiExecutor {
     ready_wait: Duration,
     sysroot_copies_dir: PathBuf,
     lookup_pause: LookupPause,
+    action_options: ActionOptions,
 }
 
 /// What a lookup in the action cache needs.
@@ -89,6 +90,7 @@ impl ReapiExecutor {
             ready_wait,
             sysroot_copies_dir: dist_cache_dir.join(SYSROOT_COPIES_DIR),
             lookup_pause: LookupPause::default(),
+            action_options: ActionOptions::new(config),
         }
     }
 
@@ -166,9 +168,10 @@ impl ReapiExecutor {
             toolchain,
         } = lookup;
         let digest_cache = self.digest_cache.clone();
+        let action_options = self.action_options.clone();
         let digested = tokio::task::spawn_blocking(move || {
             let files = digest_input_root_files(&reapi_compile, &digest_cache)?;
-            let digest = action_digest(&reapi_compile, &files, &toolchain)?;
+            let digest = action_digest(&reapi_compile, &files, &toolchain, &action_options)?;
             Ok::<_, Error>((reapi_compile, digest))
         })
         .await;
@@ -416,9 +419,8 @@ mod test {
     fn config(endpoint: String, ready_wait_secs: u64) -> ReapiConfig {
         ReapiConfig {
             endpoint,
-            instance_name: String::new(),
-            auth_token_file: None,
             ready_wait_secs,
+            ..Default::default()
         }
     }
 
@@ -476,7 +478,13 @@ mod test {
                 &digest_cache,
             )
             .unwrap();
-            let action_digest = action_digest(&compile, &files, &toolchain).unwrap();
+            let action_digest = action_digest(
+                &compile,
+                &files,
+                &toolchain,
+                &ActionOptions::new(&self.config),
+            )
+            .unwrap();
             let rlib_path = compile
                 .path_mapper
                 .to_input_root(&compile.outputs[0])
@@ -567,6 +575,18 @@ mod test {
         assert_eq!(b"rlib".as_slice(), std::fs::read(ws.join(RLIB)).unwrap());
         let expected_stderr = format!("warning: in {}/src/lib.rs\n", ws.display());
         assert_eq!(expected_stderr.as_bytes(), output.stderr);
+    }
+
+    #[test]
+    fn test_a_hit_needs_the_same_salt() {
+        let mut fixture = Fixture::new(Eligibility::Eligible);
+        fixture.config.salt = "1".to_owned();
+        fixture.put_result_in_action_cache(|_| {});
+        let (dist_type, _) = fixture.compile();
+        assert_eq!(DistType::Reapi(ReapiOutcome::ActionCacheHit), dist_type);
+        fixture.config.salt = "2".to_owned();
+        let (dist_type, _) = fixture.compile();
+        assert_eq!(compiled_locally("not in the action cache"), dist_type);
     }
 
     #[test]

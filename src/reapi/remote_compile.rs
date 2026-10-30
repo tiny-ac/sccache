@@ -20,6 +20,7 @@ use super::digest::{self, DigestCache};
 use super::input_root::{InputRoot, InputRootFile};
 use super::mapping::{BUILD_ROOT_DIR, CompileLocallyReason, ReapiCompile, TOOLCHAIN_DIR};
 use super::proto::build::bazel::remote::execution::v2 as remexec;
+use crate::config::ReapiConfig;
 use crate::errors::*;
 use crate::mock_command::exit_status;
 use memchr::memmem;
@@ -132,18 +133,66 @@ pub(super) fn digest_input_root_files(
         .collect()
 }
 
+/// What every action gets from `[dist.reapi]`.
+#[derive(Debug, Default, Clone)]
+pub(super) struct ActionOptions {
+    salt: Vec<u8>,
+    platform: Option<remexec::Platform>,
+}
+
+impl ActionOptions {
+    pub(super) fn new(config: &ReapiConfig) -> Self {
+        // BTreeMap order is the sorted order REAPI requires.
+        let platform = (!config.platform.is_empty()).then(|| remexec::Platform {
+            properties: config
+                .platform
+                .iter()
+                .map(|(name, value)| remexec::platform::Property {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+        });
+        ActionOptions {
+            salt: config.salt.clone().into_bytes(),
+            platform,
+        }
+    }
+}
+
+/// The command that runs `compile`, and the action that runs it on the input root
+/// `input_root_digest`.
+fn build_action(
+    compile: &ReapiCompile,
+    input_root_digest: remexec::Digest,
+    options: &ActionOptions,
+) -> (remexec::Command, remexec::Action) {
+    let mut command = build_command(compile);
+    // REAPI v2.2+ servers read the platform from the Action; the spec asks to set it on the
+    // Command too, for older ones.
+    #[expect(deprecated)]
+    {
+        command.platform = options.platform.clone();
+    }
+    let action = remexec::Action {
+        command_digest: Some(digest::of_bytes(&command.encode_to_vec())),
+        input_root_digest: Some(input_root_digest),
+        platform: options.platform.clone(),
+        salt: options.salt.clone(),
+        ..Default::default()
+    };
+    (command, action)
+}
+
 /// The digest of the action that runs `compile` on `files` and `toolchain`'s files.
 pub(super) fn action_digest(
     compile: &ReapiCompile,
     files: &[InputRootFile],
     toolchain: &[(InputRootFile, PathBuf)],
+    options: &ActionOptions,
 ) -> Result<remexec::Digest> {
     let input_root = InputRoot::build(files.iter().chain(toolchain.iter().map(|(file, _)| file)))?;
-    let action = remexec::Action {
-        command_digest: Some(digest::of_bytes(&build_command(compile).encode_to_vec())),
-        input_root_digest: Some(input_root.digest),
-        ..Default::default()
-    };
+    let (_, action) = build_action(compile, input_root.digest, options);
     Ok(digest::of_bytes(&action.encode_to_vec()))
 }
 
@@ -669,6 +718,7 @@ pub(super) mod test {
         lib_rs: &str,
         sysroot: &Path,
         change: fn(&mut ReapiCompile),
+        options: &ActionOptions,
     ) -> remexec::Digest {
         let cwd = dir.join("ws");
         let lib_rs_path = cwd.join("src/lib.rs");
@@ -681,7 +731,7 @@ pub(super) mod test {
         let files = digest_input_root_files(&compile, &digest_cache).unwrap();
         let toolchain =
             toolchain_files(sysroot, "x86_64-unknown-linux-gnu", &digest_cache).unwrap();
-        action_digest(&compile, &files, &toolchain).unwrap()
+        action_digest(&compile, &files, &toolchain, options).unwrap()
     }
 
     #[cfg(unix)]
@@ -693,7 +743,13 @@ pub(super) mod test {
         let other_sysroot = fake_sysroot(&toolchains.path().join("b"));
         let digest = |lib_rs, sysroot: &Path, change: fn(&mut ReapiCompile)| {
             let checkout = tempfile::tempdir().unwrap();
-            action_digest_in(checkout.path(), lib_rs, sysroot, change)
+            action_digest_in(
+                checkout.path(),
+                lib_rs,
+                sysroot,
+                change,
+                &ActionOptions::default(),
+            )
         };
         let unchanged: fn(&mut ReapiCompile) = |_| {};
         let first = digest("pub fn f() {}", &sysroot, unchanged);
@@ -726,6 +782,71 @@ pub(super) mod test {
             }),
             "another env var value"
         );
+    }
+
+    fn config_with_salt_and_platform() -> ReapiConfig {
+        ReapiConfig {
+            salt: "1".to_owned(),
+            platform: [("OSFamily".to_owned(), "linux".to_owned())].into(),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_the_action_depends_on_the_salt_and_the_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let sysroot = fake_sysroot(&dir.path().join("sysroot"));
+        let digest = |change: fn(&mut ReapiConfig)| {
+            let mut config = config_with_salt_and_platform();
+            change(&mut config);
+            let checkout = tempfile::tempdir().unwrap();
+            action_digest_in(
+                checkout.path(),
+                "pub fn f() {}",
+                &sysroot,
+                |_| {},
+                &ActionOptions::new(&config),
+            )
+        };
+        let first = digest(|_| {});
+        assert_eq!(first, digest(|_| {}), "the same options");
+        assert_ne!(
+            first,
+            digest(|config| config.salt.push('2')),
+            "another salt"
+        );
+        assert_ne!(
+            first,
+            digest(|config| {
+                config
+                    .platform
+                    .insert("OSFamily".to_owned(), "windows".to_owned());
+            }),
+            "another platform property value"
+        );
+        assert_ne!(
+            first,
+            digest(|config| config.platform.clear()),
+            "no platform"
+        );
+    }
+
+    #[test]
+    fn test_the_command_and_the_action_carry_the_platform() {
+        let options = ActionOptions::new(&config_with_salt_and_platform());
+        let (command, action) =
+            build_action(&reapi_compile_in("/ws"), digest::of_bytes(b""), &options);
+        let platform = Some(remexec::Platform {
+            properties: vec![remexec::platform::Property {
+                name: "OSFamily".to_owned(),
+                value: "linux".to_owned(),
+            }],
+        });
+        #[expect(deprecated)]
+        let command_platform = command.platform;
+        assert_eq!(platform, command_platform);
+        assert_eq!(platform, action.platform);
     }
 
     #[test]

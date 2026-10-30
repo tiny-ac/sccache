@@ -32,7 +32,10 @@ use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
 use std::str::FromStr;
 use std::sync::{LazyLock, Mutex};
-use std::{collections::HashMap, fmt};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+};
 use typed_path::Utf8TypedPathBuf;
 
 use crate::errors::*;
@@ -776,7 +779,7 @@ pub struct DistConfig {
     pub reapi: Option<ReapiConfig>,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReapiConfig {
     /// `grpc://host:port`, or `grpcs://host:port` for TLS.
@@ -789,6 +792,13 @@ pub struct ReapiConfig {
     /// toolchain before compiling locally.
     #[serde(default)]
     pub ready_wait_secs: u64,
+    /// Added to every action, so compiles with different salts don't share action cache
+    /// entries.
+    #[serde(default)]
+    pub salt: String,
+    /// Platform properties set on every action, such as `OSFamily`. A name can't repeat.
+    #[serde(default)]
+    pub platform: BTreeMap<String, String>,
 }
 
 impl Default for DistConfig {
@@ -2887,6 +2897,10 @@ endpoint = "grpc://farm:8980"
 instance_name = "main"
 auth_token_file = "/token"
 ready_wait_secs = 5
+salt = "1"
+
+[dist.reapi.platform]
+OSFamily = "linux"
 
 [cache.azure]
 container = "azurecontainer"
@@ -3070,6 +3084,8 @@ key_prefix = "cosprefix"
                     instance_name: "main".to_owned(),
                     auth_token_file: Some(PathBuf::from("/token")),
                     ready_wait_secs: 5,
+                    salt: "1".to_owned(),
+                    platform: [("OSFamily".to_owned(), "linux".to_owned())].into(),
                 }),
             },
             server_startup_timeout_ms: Some(10000),
@@ -3617,6 +3633,8 @@ endpoint = "grpcs://farm.example.com:443"
             instance_name: String::new(),
             auth_token_file: None,
             ready_wait_secs: 0,
+            salt: String::new(),
+            platform: BTreeMap::new(),
         }),
         config.dist.reapi
     );

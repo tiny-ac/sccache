@@ -61,6 +61,12 @@ auth_token_file = "/home/user/.config/sccache/reapi-token"
 # its toolchain, up to 3600; a compile that finds either not ready by then runs
 # locally. 0, the default, doesn't wait
 ready_wait_secs = 0
+# added to every action, so compiles with different salts don't share action
+# cache entries
+salt = ""
+# platform properties set on every action; a name can't repeat
+#[dist.reapi.platform]
+#OSFamily = "linux"
 
 # Multi-level cache configuration
 # Define cache levels in order (fast to slow).
