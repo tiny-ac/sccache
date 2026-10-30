@@ -22,4 +22,5 @@ mod digest;
 #[cfg(test)]
 mod fake;
 mod input_root;
+mod mapping;
 pub(crate) mod proto;
