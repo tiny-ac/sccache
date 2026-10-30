@@ -16,11 +16,11 @@
 //! cache, and runs the ones it doesn't have locally, with the arguments a REAPI worker would
 //! use. The stats count the hits, and the local compiles by reason.
 
-use super::client::{ConnectOptions, check_connect_options};
+use super::client::{ConnectOptions, RPC_TIMEOUT, check_connect_options};
 use super::connection::{Connection, ServerApis};
 use super::digest::DigestCache;
-use super::lookup_pause::LookupPause;
 use super::mapping::{CompileLocallyReason, ReapiCompile};
+use super::pause::Pause;
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use super::remote_compile::{
     ActionOptions, action_blobs, digest_input_root_files, materialize, materialize_failure_reason,
@@ -54,7 +54,7 @@ pub struct ReapiExecutor {
     toolchains: Arc<Toolchains>,
     ready_wait: Duration,
     sysroot_copies_dir: PathBuf,
-    lookup_pause: LookupPause,
+    lookup_pause: Pause,
     action_options: ActionOptions,
 }
 
@@ -90,7 +90,7 @@ impl ReapiExecutor {
             digest_cache,
             ready_wait,
             sysroot_copies_dir: dist_cache_dir.join(SYSROOT_COPIES_DIR),
-            lookup_pause: LookupPause::default(),
+            lookup_pause: Pause::new(RPC_TIMEOUT),
             action_options: ActionOptions::new(config),
         }
     }
@@ -139,7 +139,7 @@ impl ReapiExecutor {
         let Some(connection) = &self.connection else {
             return compile_locally(out_pretty, CompileLocallyReason::Misconfigured);
         };
-        if !self.lookup_pause.may_look_up() {
+        if !self.lookup_pause.may_call() {
             return compile_locally(out_pretty, CompileLocallyReason::ActionCacheLookupsPaused);
         }
         let deadline = Instant::now() + self.ready_wait;
@@ -188,12 +188,12 @@ impl ReapiExecutor {
         };
         let cached = match apis.action_cache.get_action_result(&action_digest).await {
             Ok(cached) => {
-                self.lookup_pause.lookup_succeeded();
+                self.lookup_pause.call_succeeded();
                 cached
             }
             Err(e) => {
                 warn!("[{}]: Compiling locally: {:#}", out_pretty, e);
-                if let Some(pause) = self.lookup_pause.lookup_failed() {
+                if let Some(pause) = self.lookup_pause.call_failed() {
                     warn!(
                         "REAPI: action cache lookups are failing; compiling locally for {pause:?}"
                     );
@@ -336,7 +336,7 @@ mod test {
     use crate::dist;
     use crate::mock_command::{MockChild, MockCommandCreator, exit_status};
     use crate::reapi::fake::FakeServer;
-    use crate::reapi::lookup_pause::FAILURES_TO_PAUSE;
+    use crate::reapi::pause::FAILURES_TO_PAUSE;
     use crate::reapi::proto::build::bazel::remote::execution::v2 as remexec;
     use crate::reapi::remote_compile::test::{fake_sysroot, inline_output, worker_result};
     use crate::reapi::{PathMapper, ToolchainKey};
