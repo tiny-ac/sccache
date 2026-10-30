@@ -27,7 +27,9 @@ use crate::compiler::nvcc::Nvcc;
 use crate::compiler::nvcc::NvccHostCompiler;
 use crate::compiler::nvhpc::Nvhpc;
 use crate::compiler::ptxas::Ptxas;
-use crate::compiler::remote::{DistInputOptions, DistJob, LocalCompile, RemoteExecutor, RemoteJob};
+use crate::compiler::remote::{
+    DistInputOptions, DistJob, LocalCompile, LocalCompileChanges, RemoteExecutor, RemoteJob,
+};
 use crate::compiler::rust::{Rust, RustupProxy};
 use crate::compiler::tasking_vx::TaskingVX;
 #[cfg(feature = "dist-client")]
@@ -96,6 +98,9 @@ where
     fn get_arguments(&self) -> Vec<OsString>;
     fn get_env_vars(&self) -> Vec<(OsString, OsString)>;
     fn get_cwd(&self) -> PathBuf;
+
+    /// Fails when the command runs several processes, which one argument list can't reach.
+    fn append_arguments(&mut self, args: &[OsString]) -> Result<()>;
 }
 
 #[derive(Debug)]
@@ -137,6 +142,9 @@ where
     fn get_cwd(&self) -> PathBuf {
         self.cmd.get_cwd()
     }
+    fn append_arguments(&mut self, args: &[OsString]) -> Result<()> {
+        self.cmd.append_arguments(args)
+    }
 
     async fn execute(
         &self,
@@ -153,6 +161,7 @@ pub trait CompileCommandImpl: Send + Sync + 'static {
     fn get_arguments(&self) -> Vec<OsString>;
     fn get_env_vars(&self) -> Vec<(OsString, OsString)>;
     fn get_cwd(&self) -> PathBuf;
+    fn append_arguments(&mut self, args: &[OsString]) -> Result<()>;
 
     async fn execute<T>(
         &self,
@@ -192,6 +201,10 @@ impl CompileCommandImpl for SingleCompileCommand {
     }
     fn get_cwd(&self) -> PathBuf {
         self.cwd.clone()
+    }
+    fn append_arguments(&mut self, args: &[OsString]) -> Result<()> {
+        self.arguments.extend_from_slice(args);
+        Ok(())
     }
 
     async fn execute<T>(
@@ -626,6 +639,31 @@ where
                 weak_toolchain_key,
             }) => (key, compilation, weak_toolchain_key),
         };
+        let (compilation, local_compile_changes) = match &executor {
+            // sccache-dist compiles get no changes, so they skip the blocking thread.
+            Some(executor) if !may_dist => {
+                let executor = executor.clone();
+                tokio::task::spawn_blocking(move || {
+                    let changes = executor.local_compile_changes(&*compilation);
+                    (compilation, changes)
+                })
+                .await?
+            }
+            _ => (compilation, LocalCompileChanges::default()),
+        };
+        // The executor's arguments change the local compile's outputs, so they go into the
+        // hash key.
+        let key = if local_compile_changes.args.is_empty() {
+            key
+        } else {
+            let mut m = Digest::new();
+            m.update(key.as_bytes());
+            for arg in &local_compile_changes.args {
+                m.update(arg.hashed_as.as_encoded_bytes());
+                m.update(b"\0");
+            }
+            m.finish()
+        };
         debug!("[{}]: Hash key: {}", out_pretty, key);
         // If `ForceRecache` is enabled, we won't check the cache.
         let start = Instant::now();
@@ -787,6 +825,7 @@ where
                     compilation,
                     weak_toolchain_key,
                     out_pretty.clone(),
+                    local_compile_changes,
                 )
                 .await?;
                 let duration_compilation = start.elapsed();
@@ -890,6 +929,7 @@ async fn remote_or_local_compile<T>(
     compilation: Box<dyn Compilation<T>>,
     weak_toolchain_key: String,
     out_pretty: String,
+    local_compile_changes: LocalCompileChanges,
 ) -> Result<(Cacheable, DistType, process::Output)>
 where
     T: CommandCreatorSync,
@@ -897,13 +937,22 @@ where
     let rewrite_includes_only =
         dist_input_options.is_some_and(|options| options.rewrite_includes_only);
     let mut path_transformer = dist::PathTransformer::new();
-    let (compile_cmd, dist_compile_cmd, cacheable) = compilation
+    let (mut compile_cmd, dist_compile_cmd, cacheable) = compilation
         .generate_compile_commands(&mut path_transformer, rewrite_includes_only)
         .context("Failed to generate compile commands")?;
+    if !local_compile_changes.args.is_empty() {
+        let args: Vec<OsString> = local_compile_changes
+            .args
+            .into_iter()
+            .map(|arg| arg.arg)
+            .collect();
+        compile_cmd.append_arguments(&args)?;
+    }
     let local_compile = LocalCompile {
         service,
         creator: &creator,
         command: compile_cmd,
+        stdout_stderr_mapper: local_compile_changes.stdout_stderr_mapper,
     };
 
     let Some(executor) = executor else {
@@ -3731,6 +3780,208 @@ LLVM version: 6.0",
             error.downcast_ref::<HttpClientError>().is_some(),
             "expected an HttpClientError, got {error:#}"
         );
+    }
+
+    /// Compiles locally, appending `arg` and hashing `hashed_as` instead. Maps `remapped/` in
+    /// stdout and stderr to `/local/remapped/`; mapping twice adds `/local` again, so a hit
+    /// that maps cached output again fails its test.
+    struct LocalCompileChangesExecutor {
+        arg: OsString,
+        hashed_as: OsString,
+    }
+
+    #[async_trait]
+    impl<T: CommandCreatorSync> RemoteExecutor<T> for LocalCompileChangesExecutor {
+        fn dist_input_options(&self) -> Option<DistInputOptions> {
+            None
+        }
+
+        fn local_compile_changes(&self, _: &dyn Compilation<T>) -> LocalCompileChanges {
+            LocalCompileChanges {
+                args: vec![crate::compiler::remote::LocalArg {
+                    arg: self.arg.clone(),
+                    hashed_as: self.hashed_as.clone(),
+                }],
+                stdout_stderr_mapper: Some(Box::new(|text| {
+                    String::from_utf8_lossy(text)
+                        .replace("remapped/", "/local/remapped/")
+                        .into_bytes()
+                })),
+            }
+        }
+
+        async fn compile(
+            &self,
+            _: RemoteJob<T>,
+            local_compile: LocalCompile<'_, T>,
+        ) -> Result<(DistType, process::Output)> {
+            Ok((DistType::NoDist, local_compile.run().await?))
+        }
+    }
+
+    type MockCreator = Arc<std::sync::Mutex<MockCommandCreator>>;
+
+    /// A gcc compile of `foo.c` with a disk cache, run through a
+    /// `LocalCompileChangesExecutor`.
+    struct LocalCompileChangesFixture {
+        f: TestFixture,
+        creator: MockCreator,
+        runtime: Runtime,
+        storage: Arc<DiskCache>,
+        service: server::SccacheService<MockCreator>,
+        hasher: Box<dyn CompilerHasher<MockCreator>>,
+        arguments: Vec<OsString>,
+    }
+
+    impl LocalCompileChangesFixture {
+        fn new() -> Self {
+            drop(env_logger::try_init());
+            let creator = new_creator();
+            let f = TestFixture::new();
+            let gcc = f.mk_bin("gcc").unwrap();
+            let runtime = Runtime::new().unwrap();
+            let pool = runtime.handle().clone();
+            let storage = Arc::new(DiskCache::new(
+                f.tempdir.path().join("cache"),
+                u64::MAX,
+                &pool,
+                PreprocessorCacheModeConfig::default(),
+                CacheMode::ReadWrite,
+                vec![],
+            ));
+            std::fs::write(f.tempdir.path().join("foo.c"), "whatever").unwrap();
+            let service = server::SccacheService::mock_with_storage(storage.clone(), pool.clone());
+            next_command(
+                &creator,
+                Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
+            );
+            next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
+            let c = get_compiler_info(
+                creator.clone(),
+                &gcc,
+                f.tempdir.path(),
+                &[],
+                &[],
+                &pool,
+                None,
+            )
+            .wait()
+            .unwrap()
+            .0;
+            let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
+            let hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
+                CompilerArguments::Ok(h) => h,
+                o => panic!("Bad result from parse_arguments: {:?}", o),
+            };
+            LocalCompileChangesFixture {
+                f,
+                creator,
+                runtime,
+                storage,
+                service,
+                hasher,
+                arguments,
+            }
+        }
+
+        /// Compiles, appending `arg` and hashing `hashed_as`, and returns whether it was a hit
+        /// and the output. A miss checks that the compiler got `arg` last and exits with
+        /// `exit_code`, writing `remapped/` paths to stdout and stderr.
+        fn compile(
+            &mut self,
+            arg: &str,
+            hashed_as: &str,
+            exit_code: i32,
+        ) -> (bool, process::Output) {
+            next_command(
+                &self.creator,
+                Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+            );
+            let obj = self.f.tempdir.path().join("foo.o");
+            let expected_arg = OsString::from(arg);
+            next_command_calls(&self.creator, move |args| {
+                assert!(
+                    args.ends_with(std::slice::from_ref(&expected_arg)),
+                    "{args:?}"
+                );
+                File::create(&obj)?.write_all(b"file contents")?;
+                Ok(MockChild::new(
+                    exit_status(exit_code),
+                    "out remapped/foo.c",
+                    "in remapped/foo.c",
+                ))
+            });
+            let executor: Arc<dyn RemoteExecutor<_>> = Arc::new(LocalCompileChangesExecutor {
+                arg: arg.into(),
+                hashed_as: hashed_as.into(),
+            });
+            let pool = self.runtime.handle().clone();
+            let result = self.runtime.block_on(self.hasher.get_cached_or_compile(
+                &self.service,
+                Some(executor),
+                self.creator.clone(),
+                self.storage.clone(),
+                self.arguments.clone(),
+                self.f.tempdir.path().to_path_buf(),
+                vec![],
+                CacheControl::Default,
+                pool,
+            ));
+            match result {
+                Ok((CompileResult::CacheMiss(_, _, _, write), output)) => {
+                    write.wait().unwrap();
+                    (false, output)
+                }
+                Ok((CompileResult::CacheHit(_), output)) => {
+                    // The compile a hit didn't run is still queued.
+                    self.creator.lock().unwrap().children.pop();
+                    (true, output)
+                }
+                Ok((other, _)) => panic!("Unexpected compile result: {other:?}"),
+                Err(error) => match error.downcast::<ProcessError>() {
+                    Ok(ProcessError(output)) => (false, output),
+                    Err(error) => panic!("Unexpected error: {error:#}"),
+                },
+            }
+        }
+    }
+
+    #[test]
+    fn test_executor_args_reach_the_local_compile() {
+        let mut fixture = LocalCompileChangesFixture::new();
+        let (hit, output) = fixture.compile("-DONE", "-DONE", 0);
+        assert!(!hit);
+        assert!(output.status.success());
+    }
+
+    #[test]
+    fn test_executor_args_go_into_the_hash_key_as_hashed() {
+        let mut fixture = LocalCompileChangesFixture::new();
+        assert!(!fixture.compile("-DONE", "-DONE", 0).0);
+        assert!(fixture.compile("-DTWO", "-DONE", 0).0, "hashed the same");
+        assert!(
+            !fixture.compile("-DONE", "-DTWO", 0).0,
+            "hashed differently"
+        );
+    }
+
+    #[test]
+    fn test_executor_mapper_maps_a_miss_and_a_hit_once() {
+        let mut fixture = LocalCompileChangesFixture::new();
+        for expect_hit in [false, true] {
+            let (hit, output) = fixture.compile("-DONE", "-DONE", 0);
+            assert_eq!(expect_hit, hit);
+            assert_eq!(b"out /local/remapped/foo.c".as_slice(), output.stdout);
+            assert_eq!(b"in /local/remapped/foo.c".as_slice(), output.stderr);
+        }
+    }
+
+    #[test]
+    fn test_executor_mapper_maps_a_failed_compile() {
+        let mut fixture = LocalCompileChangesFixture::new();
+        let (_, output) = fixture.compile("-DONE", "-DONE", 1);
+        assert!(!output.status.success());
+        assert_eq!(b"in /local/remapped/foo.c".as_slice(), output.stderr);
     }
 }
 

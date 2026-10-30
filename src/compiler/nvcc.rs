@@ -524,6 +524,9 @@ impl CompileCommandImpl for NvccCompileCommand {
     fn get_cwd(&self) -> PathBuf {
         self.cwd.clone()
     }
+    fn append_arguments(&mut self, _args: &[OsString]) -> Result<()> {
+        bail!("failed to append arguments: an nvcc compile runs several commands")
+    }
 
     async fn execute<T>(
         &self,
