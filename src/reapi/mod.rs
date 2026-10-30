@@ -26,5 +26,5 @@ mod mapping;
 pub(crate) mod proto;
 
 pub(crate) use mapping::{
-    CompileLocallyReason, NotEligible, PathMapper, ReapiCompile, lexically_normalize,
+    ActionEnv, CompileLocallyReason, NotEligible, PathMapper, ReapiCompile, lexically_normalize,
 };
