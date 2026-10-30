@@ -16,6 +16,7 @@
 //! and execution.
 
 mod action_cache;
+mod auth_token;
 mod cas;
 mod client;
 mod connection;

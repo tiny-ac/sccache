@@ -786,7 +786,8 @@ pub struct ReapiConfig {
     pub endpoint: String,
     #[serde(default)]
     pub instance_name: String,
-    /// A file holding the bearer token sent with every request.
+    /// A file holding the bearer token sent with every request, read again every 10 seconds at
+    /// most.
     pub auth_token_file: Option<PathBuf>,
     /// A file holding the PEM certificates that TLS trusts instead of the system's root
     /// certificates.

@@ -54,8 +54,9 @@ token = "secrettoken"
 # grpc://host:port, or grpcs://host:port for TLS (required)
 endpoint = "grpcs://remote.example.com:443"
 instance_name = ""
-# a file holding the bearer token sent with every request, read when sccache
-# starts
+# a file holding the bearer token sent with every request; sccache reads it
+# again every 10 seconds at most, and uses the token there if it changed; write
+# a new token to another file, then rename it over this one
 auth_token_file = "/home/user/.config/sccache/reapi-token"
 # a file holding the PEM certificates that a grpcs:// endpoint's certificate must
 # chain to, instead of the system's root certificates; read when sccache starts
