@@ -22,9 +22,13 @@ use super::proto::google::bytestream::{
     QueryWriteStatusRequest, QueryWriteStatusResponse, ReadRequest, ReadResponse, WriteRequest,
     WriteResponse,
 };
+use super::proto::google::rpc;
 use futures::Stream;
 use remexec::action_cache_server::{ActionCache, ActionCacheServer};
 use remexec::capabilities_server::{Capabilities, CapabilitiesServer};
+use remexec::content_addressable_storage_server::{
+    ContentAddressableStorage, ContentAddressableStorageServer,
+};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -53,6 +57,12 @@ pub(crate) struct FakeServer {
     /// Answers GetCapabilities with this code.
     pub(crate) capabilities_error: Mutex<Option<tonic::Code>>,
     pub(crate) capabilities_calls: AtomicUsize,
+    /// Advertised as `max_batch_total_size_bytes`, and BatchUpdateBlobs refuses larger
+    /// batches; 0 for no limit.
+    pub(crate) max_batch_bytes: i64,
+    pub(crate) find_missing_blobs_calls: AtomicUsize,
+    pub(crate) batch_update_blobs_calls: AtomicUsize,
+    pub(crate) batched_blob_count: AtomicUsize,
     pub(crate) blobs: Mutex<HashMap<(String, i64), Vec<u8>>>,
     pub(crate) action_results: Mutex<HashMap<(String, i64), remexec::ActionResult>>,
 }
@@ -71,6 +81,14 @@ impl FakeServer {
             .unwrap()
             .insert((digest.hash.clone(), digest.size_bytes), data.to_vec());
         digest
+    }
+
+    pub(crate) fn has_blob(&self, data: &[u8]) -> bool {
+        let digest = digest::of_bytes(data);
+        self.blobs
+            .lock()
+            .unwrap()
+            .contains_key(&(digest.hash, digest.size_bytes))
     }
 
     pub(crate) fn insert_action_result(
@@ -101,6 +119,7 @@ impl FakeServer {
         let addr = listener.local_addr().unwrap();
         let routes = Routes {
             capabilities: CapabilitiesServer::from_arc(self.clone()),
+            cas: ContentAddressableStorageServer::from_arc(self.clone()),
             bytestream: ByteStreamServer::from_arc(self.clone()),
             action_cache: ActionCacheServer::from_arc(self.clone()),
         };
@@ -148,6 +167,7 @@ impl FakeServer {
 #[derive(Clone)]
 struct Routes {
     capabilities: CapabilitiesServer<FakeServer>,
+    cas: ContentAddressableStorageServer<FakeServer>,
     bytestream: ByteStreamServer<FakeServer>,
     action_cache: ActionCacheServer<FakeServer>,
 }
@@ -165,6 +185,8 @@ impl tower_service::Service<http::Request<tonic::body::Body>> for Routes {
         let path = request.uri().path();
         if path.starts_with("/build.bazel.remote.execution.v2.Capabilities/") {
             self.capabilities.call(request)
+        } else if path.starts_with("/build.bazel.remote.execution.v2.ContentAddressableStorage/") {
+            self.cas.call(request)
         } else if path.starts_with("/google.bytestream.ByteStream/") {
             self.bytestream.call(request)
         } else if path.starts_with("/build.bazel.remote.execution.v2.ActionCache/") {
@@ -194,10 +216,129 @@ impl Capabilities for FakeServer {
         Ok(Response::new(remexec::ServerCapabilities {
             cache_capabilities: (!self.without_caching).then(|| remexec::CacheCapabilities {
                 supported_compressors,
+                max_batch_total_size_bytes: self.max_batch_bytes,
                 ..Default::default()
             }),
             ..Default::default()
         }))
+    }
+}
+
+#[tonic::async_trait]
+impl ContentAddressableStorage for FakeServer {
+    async fn find_missing_blobs(
+        &self,
+        request: Request<remexec::FindMissingBlobsRequest>,
+    ) -> RpcResult<remexec::FindMissingBlobsResponse> {
+        self.find_missing_blobs_calls.fetch_add(1, Ordering::SeqCst);
+        let request = request.into_inner();
+        if request.instance_name != self.instance_name {
+            return Err(Status::invalid_argument(request.instance_name));
+        }
+        let blobs = self.blobs.lock().unwrap();
+        let missing_blob_digests = request
+            .blob_digests
+            .into_iter()
+            .filter(|digest| !blobs.contains_key(&(digest.hash.clone(), digest.size_bytes)))
+            .collect();
+        Ok(Response::new(remexec::FindMissingBlobsResponse {
+            missing_blob_digests,
+        }))
+    }
+
+    async fn batch_update_blobs(
+        &self,
+        request: Request<remexec::BatchUpdateBlobsRequest>,
+    ) -> RpcResult<remexec::BatchUpdateBlobsResponse> {
+        self.batch_update_blobs_calls.fetch_add(1, Ordering::SeqCst);
+        let request = request.into_inner();
+        if request.instance_name != self.instance_name {
+            return Err(Status::invalid_argument(request.instance_name));
+        }
+        self.batched_blob_count
+            .fetch_add(request.requests.len(), Ordering::SeqCst);
+        let total_bytes: usize = request.requests.iter().map(|r| r.data.len()).sum();
+        if self.max_batch_bytes > 0 && total_bytes as i64 > self.max_batch_bytes {
+            return Err(Status::invalid_argument("batch too large"));
+        }
+        let responses = request
+            .requests
+            .into_iter()
+            .map(|request| {
+                let digest = request.digest.unwrap_or_default();
+                let status = if digest::of_bytes(&request.data) == digest {
+                    self.blobs
+                        .lock()
+                        .unwrap()
+                        .insert((digest.hash.clone(), digest.size_bytes), request.data);
+                    None
+                } else {
+                    Some(rpc::Status {
+                        code: tonic::Code::InvalidArgument as i32,
+                        message: "digest mismatch".to_owned(),
+                        details: vec![],
+                    })
+                };
+                remexec::batch_update_blobs_response::Response {
+                    digest: Some(digest),
+                    status,
+                }
+            })
+            .collect();
+        Ok(Response::new(remexec::BatchUpdateBlobsResponse {
+            responses,
+        }))
+    }
+
+    async fn batch_read_blobs(
+        &self,
+        _: Request<remexec::BatchReadBlobsRequest>,
+    ) -> RpcResult<remexec::BatchReadBlobsResponse> {
+        Err(Status::unimplemented("BatchReadBlobs"))
+    }
+
+    type GetTreeStream =
+        Pin<Box<dyn Stream<Item = std::result::Result<remexec::GetTreeResponse, Status>> + Send>>;
+
+    async fn get_tree(
+        &self,
+        _: Request<remexec::GetTreeRequest>,
+    ) -> RpcResult<Self::GetTreeStream> {
+        Err(Status::unimplemented("GetTree"))
+    }
+
+    async fn split_blob(
+        &self,
+        _: Request<remexec::SplitBlobRequest>,
+    ) -> RpcResult<remexec::SplitBlobResponse> {
+        Err(Status::unimplemented("SplitBlob"))
+    }
+
+    async fn splice_blob(
+        &self,
+        _: Request<remexec::SpliceBlobRequest>,
+    ) -> RpcResult<remexec::SpliceBlobResponse> {
+        Err(Status::unimplemented("SpliceBlob"))
+    }
+
+    type GetChunkMappingStream = Pin<
+        Box<
+            dyn Stream<Item = std::result::Result<remexec::GetChunkMappingResponse, Status>> + Send,
+        >,
+    >;
+
+    async fn get_chunk_mapping(
+        &self,
+        _: Request<remexec::GetChunkMappingRequest>,
+    ) -> RpcResult<Self::GetChunkMappingStream> {
+        Err(Status::unimplemented("GetChunkMapping"))
+    }
+
+    async fn register_chunk_mapping(
+        &self,
+        _: Request<Streaming<remexec::RegisterChunkMappingRequest>>,
+    ) -> RpcResult<remexec::RegisterChunkMappingResponse> {
+        Err(Status::unimplemented("RegisterChunkMapping"))
     }
 }
 
