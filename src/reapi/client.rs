@@ -31,6 +31,8 @@ const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE_RETRIES: u32 = 3;
 
 const REQUIRED_API_MAJOR_VERSION: i32 = 2;
+/// v2.1 added `Command.output_paths`, the only output field sccache's commands set.
+const MIN_API_MINOR_VERSION: i32 = 1;
 
 #[derive(Clone, Default)]
 pub(crate) struct ConnectOptions {
@@ -76,7 +78,7 @@ pub(crate) async fn with_timeout<T>(
     }
 }
 
-/// Error for a REAPI server that lacks REAPI v2, SHA-256 digests or caching.
+/// Error for a REAPI server that lacks REAPI v2.1, SHA-256 digests or caching.
 #[derive(Debug)]
 pub(crate) struct IncompatibleServer(String);
 
@@ -96,7 +98,7 @@ pub(crate) struct Client {
 }
 
 impl Client {
-    /// Fails with [`IncompatibleServer`] if the server lacks REAPI v2, SHA-256 digests or
+    /// Fails with [`IncompatibleServer`] if the server lacks REAPI v2.1, SHA-256 digests or
     /// caching.
     pub(crate) async fn connect(options: &ConnectOptions) -> Result<Self> {
         let endpoint = parse_endpoint(&options.endpoint)?;
@@ -261,7 +263,7 @@ fn parse_endpoint(endpoint: &str) -> Result<ParsedEndpoint> {
     })
 }
 
-/// Fails with [`IncompatibleServer`] if the server doesn't support REAPI v2. A server
+/// Fails with [`IncompatibleServer`] if the server doesn't support REAPI v2.1. A server
 /// that reports no versions passes.
 fn check_api_version(capabilities: &remexec::ServerCapabilities) -> Result<()> {
     let lowest_major = capabilities
@@ -282,6 +284,16 @@ fn check_api_version(capabilities: &remexec::ServerCapabilities) -> Result<()> {
             "the REAPI server supports API {} to {}; sccache needs v{REQUIRED_API_MAJOR_VERSION}",
             format_major(lowest_major),
             format_major(highest_major),
+        ))));
+    }
+    if let Some(highest) = &capabilities.high_api_version
+        && highest.major == REQUIRED_API_MAJOR_VERSION
+        && highest.minor < MIN_API_MINOR_VERSION
+    {
+        return Err(Error::new(IncompatibleServer(format!(
+            "the REAPI server supports API up to v{}.{}; sccache needs \
+             v{REQUIRED_API_MAJOR_VERSION}.{MIN_API_MINOR_VERSION}",
+            highest.major, highest.minor
         ))));
     }
     Ok(())
@@ -359,9 +371,10 @@ mod test {
         }
     }
 
-    fn api_version(major: i32) -> Option<SemVer> {
+    fn api_version(major: i32, minor: i32) -> Option<SemVer> {
         Some(SemVer {
             major,
+            minor,
             ..Default::default()
         })
     }
@@ -374,8 +387,8 @@ mod test {
                     supported_compressors: vec![remexec::compressor::Value::Zstd as i32],
                     ..Default::default()
                 }),
-                low_api_version: api_version(2),
-                high_api_version: api_version(2),
+                low_api_version: api_version(2, 0),
+                high_api_version: api_version(2, 3),
                 ..Default::default()
             },
             ..Default::default()
@@ -451,8 +464,8 @@ mod test {
         let endpoint = serve_fake(FakeCapabilities {
             capabilities: remexec::ServerCapabilities {
                 cache_capabilities: Some(Default::default()),
-                low_api_version: api_version(major),
-                high_api_version: api_version(major),
+                low_api_version: api_version(major, 0),
+                high_api_version: api_version(major, 0),
                 ..Default::default()
             },
             ..Default::default()
@@ -464,6 +477,40 @@ mod test {
             .unwrap();
         assert!(e.to_string().contains(expected_range), "{e}");
         assert!(e.is::<IncompatibleServer>(), "{e}");
+    }
+
+    /// A server whose newest API version is v2.`highest_minor`.
+    async fn serve_v2(highest_minor: i32) -> String {
+        serve_fake(FakeCapabilities {
+            capabilities: remexec::ServerCapabilities {
+                cache_capabilities: Some(Default::default()),
+                low_api_version: api_version(2, 0),
+                high_api_version: api_version(2, highest_minor),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_server_with_api_v2_0_only_is_refused() {
+        let endpoint = serve_v2(0).await;
+        let e = Client::connect(&connect_options(&endpoint))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            e.to_string().contains("up to v2.0; sccache needs v2.1"),
+            "{e}"
+        );
+        assert!(e.is::<IncompatibleServer>(), "{e}");
+    }
+
+    #[tokio::test]
+    async fn test_server_with_api_v2_1_is_accepted() {
+        let endpoint = serve_v2(1).await;
+        Client::connect(&connect_options(&endpoint)).await.unwrap();
     }
 
     #[tokio::test]
@@ -526,9 +573,9 @@ mod test {
         let endpoint = serve_fake(FakeCapabilities {
             capabilities: remexec::ServerCapabilities {
                 cache_capabilities: Some(Default::default()),
-                deprecated_api_version: api_version(2),
-                low_api_version: api_version(3),
-                high_api_version: api_version(3),
+                deprecated_api_version: api_version(2, 0),
+                low_api_version: api_version(3, 0),
+                high_api_version: api_version(3, 0),
                 ..Default::default()
             },
             ..Default::default()
