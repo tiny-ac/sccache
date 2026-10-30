@@ -785,6 +785,9 @@ pub struct ReapiConfig {
     pub instance_name: String,
     /// A file holding the bearer token sent with every request.
     pub auth_token_file: Option<PathBuf>,
+    /// How long a compile waits for the connection to the server before compiling locally.
+    #[serde(default)]
+    pub ready_wait_secs: u64,
 }
 
 impl Default for DistConfig {
@@ -2765,6 +2768,7 @@ token = "secrettoken"
 endpoint = "grpc://farm:8980"
 instance_name = "main"
 auth_token_file = "/token"
+ready_wait_secs = 5
 
 [cache.azure]
 container = "azurecontainer"
@@ -2947,6 +2951,7 @@ key_prefix = "cosprefix"
                     endpoint: "grpc://farm:8980".to_owned(),
                     instance_name: "main".to_owned(),
                     auth_token_file: Some(PathBuf::from("/token")),
+                    ready_wait_secs: 5,
                 }),
             },
             server_startup_timeout_ms: Some(10000),
@@ -3490,6 +3495,7 @@ endpoint = "grpcs://farm.example.com:443"
             endpoint: "grpcs://farm.example.com:443".to_owned(),
             instance_name: String::new(),
             auth_token_file: None,
+            ready_wait_secs: 0,
         }),
         config.dist.reapi
     );
