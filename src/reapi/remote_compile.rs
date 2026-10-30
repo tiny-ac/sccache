@@ -19,6 +19,8 @@ use super::input_root::InputRootFile;
 use super::mapping::{BUILD_ROOT_DIR, ReapiCompile, TOOLCHAIN_DIR};
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use crate::errors::*;
+use memchr::memmem;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 /// Starts the stderr line where the worker reports the worker root.
@@ -179,6 +181,57 @@ pub(super) fn toolchain_files(
     Ok(files)
 }
 
+/// Writes to `inner` and records whether the bytes written contain the worker root, even
+/// split across writes. The worker root doesn't exist on the client machine, so an output
+/// that contains it can't be used there.
+struct WorkerRootScanner<W> {
+    inner: W,
+    finder: memmem::Finder<'static>,
+    /// The last `worker_root.len() - 1` bytes written, where a worker root split across
+    /// writes would start.
+    tail: Vec<u8>,
+    contains_worker_root: bool,
+}
+
+impl<W: Write> WorkerRootScanner<W> {
+    fn new(inner: W, worker_root: &str) -> Self {
+        WorkerRootScanner {
+            inner,
+            finder: memmem::Finder::new(worker_root.as_bytes()).into_owned(),
+            tail: vec![],
+            contains_worker_root: false,
+        }
+    }
+}
+
+impl<W: Write> Write for WorkerRootScanner<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        let written = &buf[..n];
+        if !self.contains_worker_root {
+            let tail_len = self.finder.needle().len().saturating_sub(1);
+            // A worker root that starts in the tail ends in this write's first `tail_len`
+            // bytes.
+            self.tail
+                .extend_from_slice(&written[..written.len().min(tail_len)]);
+            self.contains_worker_root =
+                self.finder.find(&self.tail).is_some() || self.finder.find(written).is_some();
+            if written.len() >= tail_len {
+                self.tail.clear();
+                self.tail
+                    .extend_from_slice(&written[written.len() - tail_len..]);
+            } else {
+                self.tail.drain(..self.tail.len().saturating_sub(tail_len));
+            }
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -297,6 +350,23 @@ mod test {
     #[test]
     fn test_sh_quote() {
         assert_eq!(r"'it'\''s'", sh_quote("it's"));
+    }
+
+    #[test]
+    fn test_a_worker_root_split_across_writes_is_found() {
+        let contains_worker_root = |writes: &[&[u8]]| {
+            let mut scanner = WorkerRootScanner::new(vec![], "/w/1");
+            for write in writes {
+                scanner.write_all(write).unwrap();
+            }
+            assert_eq!(writes.concat(), scanner.inner);
+            scanner.contains_worker_root
+        };
+        assert!(contains_worker_root(&[b"in /", b"w", b"/1/src"]));
+        assert!(contains_worker_root(&[b"x/w/1"]));
+        assert!(contains_worker_root(&[b"/", b"w", b"/", b"1"]));
+        assert!(contains_worker_root(&[b"a/w", b"/1"]));
+        assert!(!contains_worker_root(&[b"in /w", b"/2/1"]));
     }
 
     /// A sysroot in `dir` with rustc, its libraries, a sanitizer runtime, and std and
