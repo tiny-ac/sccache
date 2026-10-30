@@ -1115,6 +1115,15 @@ pub enum DistType {
     Ok(dist::ServerId),
     /// Distributed compile failed.
     Error,
+    /// A REAPI build's outcome.
+    Reapi(ReapiOutcome),
+}
+
+/// What happened to a compile in a REAPI build.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReapiOutcome {
+    /// Compiled locally, for the reason given.
+    CompiledLocally(String),
 }
 
 /// Specifics about cache misses.

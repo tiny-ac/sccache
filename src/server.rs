@@ -19,8 +19,8 @@ use crate::compiler::DistExecutor;
 use crate::compiler::PreprocessorCacheEntry;
 use crate::compiler::{
     CacheControl, CompileResult, Compiler, CompilerArguments, CompilerHasher, CompilerKind,
-    CompilerProxy, DistType, Language, MissType, NO_CRATE_TYPE_PASSED, RemoteExecutor,
-    get_compiler_info,
+    CompilerProxy, DistType, Language, MissType, NO_CRATE_TYPE_PASSED, ReapiOutcome,
+    RemoteExecutor, get_compiler_info,
 };
 #[cfg(feature = "dist-client")]
 use crate::config;
@@ -1665,15 +1665,7 @@ where
                         }
                     }
 
-                    match dist_type {
-                        DistType::NoDist => {}
-                        DistType::Ok(id) => {
-                            let server = id.addr().to_string();
-                            let server_count = stats.dist_compiles.entry(server).or_insert(0);
-                            *server_count += 1;
-                        }
-                        DistType::Error => stats.dist_errors += 1,
-                    }
+                    stats.count_dist_type(dist_type);
 
                     // Make sure the write guard has been dropped ASAP.
                     drop(stats);
@@ -1860,6 +1852,23 @@ pub struct ServerStats {
     pub dist_errors: u64,
     /// Multi-level cache statistics (if multi-level caching is enabled)
     pub multi_level: Option<crate::cache::multilevel::MultiLevelStats>,
+    /// REAPI statistics, `None` until a REAPI build counts a compile.
+    pub reapi: Option<ReapiStats>,
+}
+
+/// Statistics of the compiles in a REAPI build.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ReapiStats {
+    /// Compilations that ran locally, by reason.
+    pub local_compilations: HashMap<String, usize>,
+}
+
+impl std::ops::AddAssign for ReapiStats {
+    fn add_assign(&mut self, rhs: ReapiStats) {
+        for (k, v) in rhs.local_compilations {
+            *self.local_compilations.entry(k).or_default() += v;
+        }
+    }
 }
 
 impl std::ops::AddAssign for ServerStats {
@@ -1890,6 +1899,14 @@ impl std::ops::AddAssign for ServerStats {
             *self.dist_compiles.entry(k).or_default() += v;
         }
         self.dist_errors += rhs.dist_errors;
+        self.reapi = match (self.reapi.take(), rhs.reapi) {
+            (Some(mut a), Some(b)) => {
+                a += b;
+                Some(a)
+            }
+            (a, None) => a,
+            (None, b) => b,
+        };
         self.multi_level = match (self.multi_level.take(), rhs.multi_level) {
             (Some(mut a), Some(b)) => {
                 a += b;
@@ -1949,6 +1966,7 @@ impl Default for ServerStats {
             dist_compiles: HashMap::new(),
             dist_errors: u64::default(),
             multi_level: None,
+            reapi: None,
         }
     }
 }
@@ -1966,6 +1984,26 @@ impl ServerStatsWriter for StdoutServerStatsWriter {
 }
 
 impl ServerStats {
+    fn count_dist_type(&mut self, dist_type: DistType) {
+        match dist_type {
+            DistType::NoDist => {}
+            DistType::Ok(id) => {
+                let server = id.addr().to_string();
+                let server_count = self.dist_compiles.entry(server).or_insert(0);
+                *server_count += 1;
+            }
+            DistType::Error => self.dist_errors += 1,
+            DistType::Reapi(ReapiOutcome::CompiledLocally(reason)) => {
+                *self
+                    .reapi
+                    .get_or_insert_default()
+                    .local_compilations
+                    .entry(reason)
+                    .or_default() += 1;
+            }
+        }
+    }
+
     fn record_not_cacheable(&mut self, why: &str, extra_info: Option<&str>) {
         self.requests_not_cacheable += 1;
         let reason = match (why, extra_info) {
@@ -2133,6 +2171,24 @@ impl ServerStats {
                     reason,
                     count,
                     name_width = name_width - 2,
+                    stat_width = stat_width,
+                ));
+            }
+        }
+        if let Some(reapi) = self
+            .reapi
+            .as_ref()
+            .filter(|reapi| !reapi.local_compilations.is_empty())
+        {
+            writer.write("\nREAPI local compilations:");
+            let mut counts: Vec<_> = reapi.local_compilations.iter().collect();
+            counts.sort_by(sort_func);
+            for (reason, count) in counts {
+                writer.write(&format!(
+                    "{:<name_width$} {:>stat_width$}",
+                    reason,
+                    count,
+                    name_width = name_width,
                     stat_width = stat_width,
                 ));
             }
@@ -2632,6 +2688,36 @@ mod tests {
         let status = runtime.block_on(container.get_status());
 
         assert!(matches!(status, DistInfo::Disabled(_)));
+    }
+
+    #[test]
+    fn test_reapi_stats_merge_and_print() {
+        let count = |n| {
+            let mut stats = ServerStats::default();
+            for _ in 0..n {
+                stats.count_dist_type(DistType::Reapi(ReapiOutcome::CompiledLocally(
+                    "staticlib crate type".to_owned(),
+                )));
+            }
+            stats
+        };
+        let mut stats = ServerStats::default();
+        stats += count(1);
+        stats += count(2);
+        stats += ServerStats::default();
+        let mut writer = StringWriter::new();
+        stats.print(&mut writer, false);
+        let output = writer.get_output();
+        assert!(
+            output.contains("REAPI local compilations:"),
+            "missing from:\n{output}"
+        );
+        assert!(
+            output
+                .lines()
+                .any(|l| l.starts_with("staticlib crate type") && l.ends_with(" 3")),
+            "missing from:\n{output}"
+        );
     }
 
     #[test]
