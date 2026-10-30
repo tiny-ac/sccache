@@ -660,6 +660,7 @@ fn read_connect_options(config: &ReapiConfig) -> Result<ConnectOptions> {
         endpoint: config.endpoint.clone(),
         instance_name: config.instance_name.clone(),
         auth_token,
+        headers: config.headers.clone(),
         tls_ca_certificates,
         tls_client_identity,
     };

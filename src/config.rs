@@ -807,6 +807,9 @@ pub struct ReapiConfig {
     /// Platform properties set on every action, such as `OSFamily`. A name can't repeat.
     #[serde(default)]
     pub platform: BTreeMap<String, String>,
+    /// Headers sent with every request, such as a proxy's API key.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
     /// What a compile that misses the action cache does.
     #[serde(default)]
     pub on_miss: ReapiOnMiss,
@@ -2814,6 +2817,9 @@ queue_timeout_secs = 120
 [dist.reapi.platform]
 OSFamily = "linux"
 
+[dist.reapi.headers]
+x-api-key = "key"
+
 [cache.azure]
 container = "azurecontainer"
 key_prefix = "azureprefix"
@@ -3001,6 +3007,7 @@ key_prefix = "cosprefix"
                     ready_wait_secs: 5,
                     salt: "1".to_owned(),
                     platform: [("OSFamily".to_owned(), "linux".to_owned())].into(),
+                    headers: [("x-api-key".to_owned(), "key".to_owned())].into(),
                     on_miss: ReapiOnMiss::Local,
                     queue_timeout_secs: Some(120),
                 }),
@@ -3552,6 +3559,7 @@ endpoint = "grpcs://farm.example.com:443"
             ready_wait_secs: 0,
             salt: String::new(),
             platform: BTreeMap::new(),
+            headers: BTreeMap::new(),
             on_miss: ReapiOnMiss::Execute,
             queue_timeout_secs: None,
         }),
