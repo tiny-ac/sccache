@@ -22,7 +22,7 @@ use super::digest::DigestCache;
 use super::lookup_pause::LookupPause;
 use super::mapping::{CompileLocallyReason, ReapiCompile};
 use super::remote_compile::{
-    ActionOptions, action_digest, digest_input_root_files, materialize, materialize_failure_reason,
+    ActionOptions, action_blobs, digest_input_root_files, materialize, materialize_failure_reason,
 };
 use super::toolchains::{ToolchainFiles, Toolchains};
 use crate::compiler::{
@@ -171,8 +171,8 @@ impl ReapiExecutor {
         let action_options = self.action_options.clone();
         let digested = tokio::task::spawn_blocking(move || {
             let files = digest_input_root_files(&reapi_compile, &digest_cache)?;
-            let digest = action_digest(&reapi_compile, &files, &toolchain, &action_options)?;
-            Ok::<_, Error>((reapi_compile, digest))
+            let action = action_blobs(&reapi_compile, &files, &toolchain, &action_options)?;
+            Ok::<_, Error>((reapi_compile, action.action_digest))
         })
         .await;
         let (reapi_compile, action_digest) = match digested.map_err(Error::from).flatten() {
@@ -478,13 +478,14 @@ mod test {
                 &digest_cache,
             )
             .unwrap();
-            let action_digest = action_digest(
+            let action_digest = action_blobs(
                 &compile,
                 &files,
                 &toolchain,
                 &ActionOptions::new(&self.config),
             )
-            .unwrap();
+            .unwrap()
+            .action_digest;
             let rlib_path = compile
                 .path_mapper
                 .to_input_root(&compile.outputs[0])
