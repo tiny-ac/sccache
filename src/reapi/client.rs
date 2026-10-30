@@ -283,6 +283,11 @@ pub(super) fn status_error(status: tonic::Status) -> Error {
     })
 }
 
+/// The code of the REAPI call that failed with `e`, if `e` is one.
+pub(super) fn rpc_code(e: &Error) -> Option<tonic::Code> {
+    e.downcast_ref::<RpcError>().map(|e| e.code)
+}
+
 /// `error` with each mention of `host` replaced, since rustls names the expected host when the
 /// server's certificate doesn't match it.
 fn without_host(error: Error, host: Option<&str>) -> Error {
@@ -714,10 +719,7 @@ mod test {
         assert!(status.to_string().contains("reapi.example.com"));
         let e = status_error(status);
         assert_eq!("Unavailable: transport error", e.to_string());
-        assert_eq!(
-            Some(tonic::Code::Unavailable),
-            e.downcast_ref::<RpcError>().map(|e| e.code)
-        );
+        assert_eq!(Some(tonic::Code::Unavailable), rpc_code(&e));
     }
 
     #[test]
