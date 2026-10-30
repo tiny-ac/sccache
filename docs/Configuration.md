@@ -60,6 +60,10 @@ auth_token_file = "/home/user/.config/sccache/reapi-token"
 # a file holding the PEM certificates that a grpcs:// endpoint's certificate must
 # chain to, instead of the system's root certificates; read when sccache starts
 tls_ca_file = "/etc/ssl/certs/farm-ca.pem"
+# files holding the PEM certificate and key sent to a grpcs:// server that asks
+# for a client certificate (mTLS), both or neither; read when sccache starts
+tls_client_certificate_file = "/home/user/.config/sccache/reapi-client.pem"
+tls_client_key_file = "/home/user/.config/sccache/reapi-client.key"
 # how long a compile waits for the connection to the server and the hashing of
 # its toolchain, up to 3600; a compile that finds either not ready by then runs
 # locally. 0, the default, doesn't wait

@@ -791,6 +791,11 @@ pub struct ReapiConfig {
     /// A file holding the PEM certificates that TLS trusts instead of the system's root
     /// certificates.
     pub tls_ca_file: Option<PathBuf>,
+    /// A file holding the PEM certificate sent to a server that asks for a client
+    /// certificate. Needs `tls_client_key_file`.
+    pub tls_client_certificate_file: Option<PathBuf>,
+    /// A file holding the PEM key of `tls_client_certificate_file`.
+    pub tls_client_key_file: Option<PathBuf>,
     /// How long a compile waits for the connection to the server and the hashing of its
     /// toolchain before compiling locally.
     #[serde(default)]
@@ -2916,6 +2921,8 @@ endpoint = "grpc://farm:8980"
 instance_name = "main"
 auth_token_file = "/token"
 tls_ca_file = "/ca.pem"
+tls_client_certificate_file = "/client.pem"
+tls_client_key_file = "/client.key"
 ready_wait_secs = 5
 salt = "1"
 on_miss = "local"
@@ -3106,6 +3113,8 @@ key_prefix = "cosprefix"
                     instance_name: "main".to_owned(),
                     auth_token_file: Some(PathBuf::from("/token")),
                     tls_ca_file: Some(PathBuf::from("/ca.pem")),
+                    tls_client_certificate_file: Some(PathBuf::from("/client.pem")),
+                    tls_client_key_file: Some(PathBuf::from("/client.key")),
                     ready_wait_secs: 5,
                     salt: "1".to_owned(),
                     platform: [("OSFamily".to_owned(), "linux".to_owned())].into(),
@@ -3658,6 +3667,8 @@ endpoint = "grpcs://farm.example.com:443"
             instance_name: String::new(),
             auth_token_file: None,
             tls_ca_file: None,
+            tls_client_certificate_file: None,
+            tls_client_key_file: None,
             ready_wait_secs: 0,
             salt: String::new(),
             platform: BTreeMap::new(),
