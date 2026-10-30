@@ -39,6 +39,12 @@ pub use crate::compiler::compiler::*;
 pub use crate::compiler::preprocessor_cache::PreprocessorCacheEntry;
 #[cfg(feature = "dist-client")]
 pub(crate) use crate::compiler::remote::DistExecutor;
+#[cfg(all(test, feature = "reapi"))]
+pub(crate) use crate::compiler::remote::LocalArg;
 pub use crate::compiler::remote::RemoteExecutor;
+#[cfg(feature = "reapi")]
+pub(crate) use crate::compiler::remote::{
+    DistInputOptions, LocalCompile, LocalCompileChanges, RemoteJob,
+};
 pub(crate) use crate::compiler::rust::NO_CRATE_TYPE_PASSED;
 pub use crate::compiler::rust::is_rmeta_artifact_notification;

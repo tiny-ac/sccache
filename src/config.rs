@@ -1439,7 +1439,9 @@ impl Config {
             // can't leave the client mode enabled alongside logging.
             && std::env::var_os(crate::LOGGING_ENV).is_none()
             // Client-side mode is also not compatible with distributed compilation.
-            && dist.scheduler_url.is_none();
+            && dist.scheduler_url.is_none()
+            // Nor with REAPI, whose executor runs in the server.
+            && !(cfg!(feature = "reapi") && dist.reapi.is_some());
 
         let (caches, fallback_cache) = conf_caches.clone().into_fallback();
         Ok(Self {
@@ -3624,6 +3626,36 @@ enpoint = "x"
     );
     let e = config.unwrap_err();
     assert!(e.to_string().contains("enpoint"), "{e}");
+}
+
+#[cfg(feature = "reapi")]
+#[test]
+fn test_reapi_turns_client_side_mode_off() {
+    let client_side_mode = |reapi: Option<ReapiConfig>| {
+        let env_conf = EnvConfig {
+            cache: Default::default(),
+            basedirs: None,
+            dist_cache_dir: None,
+            client_side_mode: Some(true),
+        };
+        let file_conf = FileConfig {
+            dist: DistConfig {
+                reapi,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        Config::from_env_and_file_configs(env_conf, file_conf)
+            .unwrap()
+            .client_side_mode
+    };
+    let reapi = toml::from_str("endpoint = \"grpc://farm:8980\"").unwrap();
+    assert!(!client_side_mode(Some(reapi)));
+    // SCCACHE_LOG also turns client-side mode off.
+    assert_eq!(
+        std::env::var_os(crate::LOGGING_ENV).is_none(),
+        client_side_mode(None)
+    );
 }
 
 #[test]

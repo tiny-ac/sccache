@@ -48,11 +48,11 @@ token = "secrettoken"
 
 # Experimental, needs sccache built with the reapi feature: a Remote
 # Execution API (REAPI) server for Rust compiles. Setting it turns
-# sccache-dist off, even with scheduler_url set. The server isn't contacted yet:
-# Rust compiles run locally with the arguments a REAPI worker uses, with a
-# copy of the Rust sysroot under <cache_dir>/reapi-sysroot-copies (never
-# removed), and --show-stats lists, by reason, the ones a REAPI server
-# couldn't run.
+# sccache-dist (even with scheduler_url set) and client-side mode off. The
+# server isn't contacted yet: Rust compiles run locally with the arguments a
+# REAPI worker uses, with a copy of the Rust sysroot under
+# <cache_dir>/reapi-sysroot-copies (never removed), and --show-stats lists,
+# by reason, the ones a REAPI server couldn't run.
 #[dist.reapi]
 # grpc://host:port, or grpcs://host:port for TLS (required)
 endpoint = "grpcs://remote.example.com:443"

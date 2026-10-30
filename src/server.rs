@@ -149,6 +149,25 @@ pub struct DistClientContainer {
     // The actual dist client state
     #[cfg(feature = "dist-client")]
     state: futures::lock::Mutex<DistClientState>,
+    /// Set when `[dist.reapi]` is configured, which turns sccache-dist off.
+    #[cfg(feature = "reapi")]
+    reapi: Option<Arc<crate::reapi::ReapiExecutor>>,
+}
+
+#[cfg(feature = "reapi")]
+fn reapi_executor(config: &Config) -> Option<Arc<crate::reapi::ReapiExecutor>> {
+    config
+        .dist
+        .reapi
+        .as_ref()
+        .map(|_| Arc::new(crate::reapi::ReapiExecutor::new(&config.dist.cache_dir)))
+}
+
+#[cfg(not(feature = "reapi"))]
+fn warn_if_reapi_configured(config: &Config) {
+    if config.dist.reapi.is_some() {
+        warn!("[dist.reapi] configured but the reapi feature is disabled, ignoring it");
+    }
 }
 
 #[cfg(feature = "dist-client")]
@@ -180,16 +199,24 @@ pub enum DistClientState {
 impl DistClientContainer {
     #[cfg(not(feature = "dist-client"))]
     fn new(config: &Config, _: &tokio::runtime::Handle) -> Self {
+        #[cfg(not(feature = "reapi"))]
+        warn_if_reapi_configured(config);
         if config.dist.scheduler_url.is_some() {
             warn!(
                 "Scheduler address configured but dist feature disabled, disabling distributed sccache"
             )
         }
-        Self {}
+        Self {
+            #[cfg(feature = "reapi")]
+            reapi: reapi_executor(config),
+        }
     }
 
     pub fn new_disabled() -> Self {
-        Self {}
+        Self {
+            #[cfg(feature = "reapi")]
+            reapi: None,
+        }
     }
 
     #[cfg(feature = "dist-client")]
@@ -210,6 +237,10 @@ impl DistClientContainer {
     async fn get_executor<C: CommandCreatorSync>(
         &self,
     ) -> Result<Option<Arc<dyn RemoteExecutor<C>>>> {
+        #[cfg(feature = "reapi")]
+        if let Some(reapi) = &self.reapi {
+            return Ok(Some(reapi.clone()));
+        }
         Ok(None)
     }
 }
@@ -217,9 +248,21 @@ impl DistClientContainer {
 #[cfg(feature = "dist-client")]
 impl DistClientContainer {
     fn new(config: &Config, pool: &tokio::runtime::Handle) -> Self {
+        #[cfg(feature = "reapi")]
+        let reapi = reapi_executor(config);
+        #[cfg(feature = "reapi")]
+        let uses_reapi = reapi.is_some();
+        #[cfg(not(feature = "reapi"))]
+        let uses_reapi = {
+            warn_if_reapi_configured(config);
+            false
+        };
+        if uses_reapi && config.dist.scheduler_url.is_some() {
+            warn!("[dist.reapi] configured, ignoring scheduler_url");
+        }
         let config = DistClientConfig {
             pool: pool.clone(),
-            scheduler_url: config.dist.scheduler_url.clone(),
+            scheduler_url: config.dist.scheduler_url.clone().filter(|_| !uses_reapi),
             auth: config.dist.auth.clone(),
             cache_dir: config.dist.cache_dir.clone(),
             toolchain_cache_size: config.dist.toolchain_cache_size,
@@ -230,6 +273,8 @@ impl DistClientContainer {
         let state = pool.block_on(state);
         Self {
             state: futures::lock::Mutex::new(state),
+            #[cfg(feature = "reapi")]
+            reapi,
         }
     }
 
@@ -237,12 +282,16 @@ impl DistClientContainer {
     pub fn new_with_state(state: DistClientState) -> Self {
         Self {
             state: futures::lock::Mutex::new(state),
+            #[cfg(feature = "reapi")]
+            reapi: None,
         }
     }
 
     pub fn new_disabled() -> Self {
         Self {
             state: futures::lock::Mutex::new(DistClientState::Disabled),
+            #[cfg(feature = "reapi")]
+            reapi: None,
         }
     }
 
@@ -323,6 +372,10 @@ impl DistClientContainer {
     async fn get_executor<C: CommandCreatorSync>(
         &self,
     ) -> Result<Option<Arc<dyn RemoteExecutor<C>>>> {
+        #[cfg(feature = "reapi")]
+        if let Some(reapi) = &self.reapi {
+            return Ok(Some(reapi.clone()));
+        }
         let client = self.get_client().await?;
         Ok(client.map(|client| Arc::new(DistExecutor::new(client)) as Arc<dyn RemoteExecutor<C>>))
     }
@@ -2688,6 +2741,47 @@ mod tests {
         let status = runtime.block_on(container.get_status());
 
         assert!(matches!(status, DistInfo::Disabled(_)));
+    }
+
+    #[cfg(feature = "reapi")]
+    fn reapi_config(cache_dir: &std::path::Path) -> Config {
+        Config {
+            dist: crate::config::DistConfig {
+                cache_dir: cache_dir.to_owned(),
+                reapi: Some(toml::from_str("endpoint = \"grpc://127.0.0.1:1\"").unwrap()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "reapi")]
+    #[test]
+    fn test_reapi_config_sets_the_executor() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let dist_client = DistClientContainer::new(&reapi_config(dir.path()), runtime.handle());
+        let executor = runtime
+            .block_on(dist_client.get_executor::<ProcessCommandCreator>())
+            .unwrap()
+            .expect("an executor");
+        assert!(executor.dist_input_options().is_none());
+    }
+
+    #[cfg(all(feature = "reapi", feature = "dist-client"))]
+    #[test]
+    fn test_reapi_turns_sccache_dist_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = reapi_config(dir.path());
+        config.dist.scheduler_url = Some(config::HTTPUrl::from_url(
+            "http://127.0.0.1:1".parse().unwrap(),
+        ));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let dist_client = DistClientContainer::new(&config, runtime.handle());
+        assert!(matches!(
+            runtime.block_on(dist_client.get_status()),
+            DistInfo::Disabled(_)
+        ));
     }
 
     #[test]
