@@ -158,6 +158,8 @@ chrono = "0.4.42"
 divan = { package = "codspeed-divan-compat", version = "4" }
 filetime = "0.2"
 predicates = "=3.1.0"
+# For the REAPI tests' TLS server, which needs a process-wide crypto provider.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 serial_test = "3.1"
 temp-env = "0.3.6"
 test-case = "3.3.1"

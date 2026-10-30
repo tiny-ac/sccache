@@ -57,6 +57,9 @@ instance_name = ""
 # a file holding the bearer token sent with every request, read when sccache
 # starts
 auth_token_file = "/home/user/.config/sccache/reapi-token"
+# a file holding the PEM certificates that a grpcs:// endpoint's certificate must
+# chain to, instead of the system's root certificates; read when sccache starts
+tls_ca_file = "/etc/ssl/certs/farm-ca.pem"
 # how long a compile waits for the connection to the server and the hashing of
 # its toolchain, up to 3600; a compile that finds either not ready by then runs
 # locally. 0, the default, doesn't wait

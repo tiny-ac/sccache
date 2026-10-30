@@ -44,6 +44,7 @@ use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tonic::transport::Certificate;
 
 /// Directory under the dist cache dir for the sysroot copies local compiles use.
 const SYSROOT_COPIES_DIR: &str = "reapi-sysroot-copies";
@@ -622,8 +623,8 @@ fn compile_locally<T>(
     Err(reason)
 }
 
-/// Reads the auth token file and checks the options for connecting to `config`'s server,
-/// without connecting.
+/// Reads the auth token and TLS files and checks the options for connecting to `config`'s
+/// server, without connecting.
 fn read_connect_options(config: &ReapiConfig) -> Result<ConnectOptions> {
     let auth_token = config
         .auth_token_file
@@ -637,13 +638,33 @@ fn read_connect_options(config: &ReapiConfig) -> Result<ConnectOptions> {
             })
         })
         .transpose()?;
+    let tls_ca_certificates = config
+        .tls_ca_file
+        .as_deref()
+        .map(read_certificates)
+        .transpose()?;
     let options = ConnectOptions {
         endpoint: config.endpoint.clone(),
         instance_name: config.instance_name.clone(),
         auth_token,
+        tls_ca_certificates,
     };
     check_connect_options(&options)?;
     Ok(options)
+}
+
+/// The PEM certificates in `file`. Fails if it holds none, since TLS would then trust no
+/// server.
+fn read_certificates(file: &Path) -> Result<Certificate> {
+    let pem = std::fs::read(file)
+        .with_context(|| format!("failed to read the REAPI TLS CA file {}", file.display()))?;
+    if !String::from_utf8_lossy(&pem).contains("-----BEGIN CERTIFICATE-----") {
+        bail!(
+            "the REAPI TLS CA file {} holds no PEM certificate",
+            file.display()
+        );
+    }
+    Ok(Certificate::from_pem(pem))
 }
 
 #[async_trait]
@@ -1650,6 +1671,32 @@ mod test {
         assert_eq!(b"out".as_slice(), output.stdout);
         let (dist_type, _) = compile(Eligibility::Ineligible, configure);
         assert_eq!(compiled_locally("staticlib crate type"), dist_type);
+    }
+
+    /// A config for a `grpcs://` server whose TLS CA file holds `pem`.
+    fn read_connect_options_with_tls_ca(pem: &[u8]) -> Result<ConnectOptions> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ca.pem"), pem).unwrap();
+        read_connect_options(&ReapiConfig {
+            endpoint: "grpcs://farm:443".to_owned(),
+            tls_ca_file: Some(dir.path().join("ca.pem")),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn test_a_tls_ca_file_without_a_certificate_is_refused() {
+        let e = read_connect_options_with_tls_ca(b"not a certificate\n")
+            .err()
+            .unwrap();
+        assert!(e.to_string().contains("holds no PEM certificate"), "{e}");
+    }
+
+    #[test]
+    fn test_a_tls_ca_file_with_a_certificate_is_read() {
+        let options =
+            read_connect_options_with_tls_ca(include_bytes!("../../tests/reapi-tls/ca.pem"));
+        assert!(options.unwrap().tls_ca_certificates.is_some());
     }
 
     #[test]

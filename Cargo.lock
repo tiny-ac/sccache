@@ -3782,6 +3782,7 @@ dependencies = [
  "regex",
  "reqwest 0.13.4",
  "rouille",
+ "rustls",
  "semver",
  "serde",
  "serde_json",

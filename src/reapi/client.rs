@@ -20,7 +20,7 @@ use std::time::Duration;
 use tonic::metadata::AsciiMetadataValue;
 use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(super) const RPC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -57,11 +57,13 @@ const DEFAULT_MAX_BATCH_BYTES: usize = 2 * 1024 * 1024;
 #[derive(Clone, Default)]
 pub(crate) struct ConnectOptions {
     /// `grpc://host:port`, or `grpcs://host:port` for TLS verified against the system's
-    /// root certificates.
+    /// root certificates, or against `tls_ca_certificates` when set.
     pub(crate) endpoint: String,
     pub(crate) instance_name: String,
     /// Sent as a bearer token with every request. Surrounding whitespace is ignored.
     pub(crate) auth_token: Option<String>,
+    /// PEM certificates that TLS trusts instead of the system's root certificates.
+    pub(crate) tls_ca_certificates: Option<Certificate>,
 }
 
 pub(crate) type AuthChannel = InterceptedService<Channel, AuthInterceptor>;
@@ -162,22 +164,13 @@ impl Client {
     /// Fails with [`IncompatibleServer`] if the server lacks REAPI v2.1, SHA-256 digests or
     /// caching.
     pub(crate) async fn connect(options: &ConnectOptions) -> Result<Self> {
-        let endpoint = parse_endpoint(&options.endpoint)?;
-        let mut channel_builder = Endpoint::from_shared(endpoint.http_url)
-            .context("the REAPI endpoint is not valid")?
+        let (channel_builder, tls_domain) = channel_endpoint(options, true)?;
+        let channel_builder = channel_builder
             .connect_timeout(CONNECT_TIMEOUT)
             .tcp_keepalive(Some(TCP_KEEPALIVE_IDLE))
             .tcp_keepalive_interval(Some(TCP_KEEPALIVE_INTERVAL))
             .tcp_keepalive_retries(Some(TCP_KEEPALIVE_RETRIES));
-        if let Some(tls_domain) = &endpoint.tls_domain {
-            channel_builder = channel_builder
-                .tls_config(
-                    ClientTlsConfig::new()
-                        .with_native_roots()
-                        .domain_name(tls_domain),
-                )
-                .context("failed to configure TLS for the REAPI server")?;
-        } else if options.auth_token.is_some() {
+        if tls_domain.is_none() && options.auth_token.is_some() {
             warn!("REAPI: sending the auth token without TLS");
         }
         let auth_header = auth_header(options.auth_token.as_deref())?;
@@ -188,7 +181,7 @@ impl Client {
                 channel_builder
                     .connect()
                     .await
-                    .map_err(|e| without_host(e.into(), endpoint.tls_domain.as_deref()))
+                    .map_err(|e| without_host(e.into(), tls_domain.as_deref()))
             },
         )
         .await?;
@@ -285,12 +278,42 @@ impl Client {
     }
 }
 
-/// Fails if `options` has an invalid endpoint or auth token, without connecting.
+/// Fails if `options` has an invalid endpoint, auth token or TLS file, without connecting.
+/// The system's root certificates aren't loaded: a store that is missing or slow to read is a
+/// reason to retry the connection, not an invalid config.
 pub(super) fn check_connect_options(options: &ConnectOptions) -> Result<()> {
-    let endpoint = parse_endpoint(&options.endpoint)?;
-    Endpoint::from_shared(endpoint.http_url).context("the REAPI endpoint is not valid")?;
+    channel_endpoint(options, false)?;
     auth_header(options.auth_token.as_deref())?;
     Ok(())
+}
+
+/// The tonic endpoint for `options`, with TLS set up for `grpcs://`, and the host name TLS
+/// verifies. Without `system_roots`, TLS trusts only `tls_ca_certificates`.
+fn channel_endpoint(
+    options: &ConnectOptions,
+    system_roots: bool,
+) -> Result<(Endpoint, Option<String>)> {
+    let parsed = parse_endpoint(&options.endpoint)?;
+    let mut channel_builder =
+        Endpoint::from_shared(parsed.http_url).context("the REAPI endpoint is not valid")?;
+    match &parsed.tls_domain {
+        Some(tls_domain) => {
+            let tls_config = ClientTlsConfig::new().domain_name(tls_domain);
+            let tls_config = match &options.tls_ca_certificates {
+                Some(certificates) => tls_config.ca_certificate(certificates.clone()),
+                None if system_roots => tls_config.with_native_roots(),
+                None => tls_config,
+            };
+            channel_builder = channel_builder
+                .tls_config(tls_config)
+                .context("failed to configure TLS for the REAPI server")?;
+        }
+        None if options.tls_ca_certificates.is_some() => {
+            bail!("the REAPI endpoint must start with grpcs:// to use tls_ca_file")
+        }
+        None => {}
+    }
+    Ok((channel_builder, parsed.tls_domain))
 }
 
 /// The bearer `authorization` header for `auth_token`, if any.
@@ -448,6 +471,7 @@ mod test {
     use test_case::test_case;
     use tokio::net::TcpListener;
     use tonic::transport::server::TcpIncoming;
+    use tonic::transport::{Identity, ServerTlsConfig};
 
     /// Answers GetCapabilities with `capabilities` and records each request's instance name and
     /// `authorization` header.
@@ -502,6 +526,42 @@ mod test {
                 .serve_with_incoming(CapabilitiesServer::new(fake), TcpIncoming::from(listener)),
         );
         format!("grpc://{addr}")
+    }
+
+    /// `tests/reapi-tls`, whose files `generate.sh` there writes.
+    fn tls_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/reapi-tls")
+    }
+
+    fn tls_file(name: &str) -> Vec<u8> {
+        std::fs::read(tls_dir().join(name)).unwrap()
+    }
+
+    /// Runs `f` with the system's root certificates replaced by the certificates in `file`.
+    fn with_system_roots<T>(file: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        // rustls-native-certs reads this file instead of the system's store.
+        temp_env::with_var("SSL_CERT_FILE", Some(file), f)
+    }
+
+    /// Serves `fake` over TLS, with a certificate for 127.0.0.1 that the test CA signed, and
+    /// returns its `grpcs://` endpoint.
+    async fn serve_fake_over_tls(fake: FakeCapabilities) -> String {
+        // tonic's server uses rustls' process-wide provider, which rustls can't pick itself
+        // when both ring and aws-lc-rs are built.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tls_config = ServerTlsConfig::new().identity(Identity::from_pem(
+            tls_file("server.pem"),
+            tls_file("server.key"),
+        ));
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .tls_config(tls_config)
+                .unwrap()
+                .serve_with_incoming(CapabilitiesServer::new(fake), TcpIncoming::from(listener)),
+        );
+        format!("grpcs://{addr}")
     }
 
     fn connect_options(endpoint: &str) -> ConnectOptions {
@@ -630,6 +690,87 @@ mod test {
         assert!(e.is_err());
         // The auth token never reached the plain-text server.
         assert!(authorization_headers.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_grpcs_trusts_the_configured_ca() {
+        let fake = FakeCapabilities::default();
+        let authorization_headers = fake.authorization_headers.clone();
+        let endpoint = serve_fake_over_tls(fake).await;
+        Client::connect(&ConnectOptions {
+            auth_token: Some("secret".to_owned()),
+            tls_ca_certificates: Some(Certificate::from_pem(tls_file("ca.pem"))),
+            ..connect_options(&endpoint)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            vec![Some("Bearer secret".to_owned())],
+            *authorization_headers.lock().unwrap()
+        );
+    }
+
+    #[test_case("ca.pem", None, true ; "system roots that trust the server")]
+    #[test_case("other-ca.pem", None, false ; "system roots that dont")]
+    #[test_case("ca.pem", Some("other-ca.pem"), false ; "a ca file replaces the system roots")]
+    #[test_case("other-ca.pem", Some("ca.pem"), true ; "a ca file that trusts the server")]
+    #[serial_test::serial(reqwest_tls_env)]
+    fn test_grpcs_trusts_the_ca_file_or_else_the_system_roots(
+        system_roots: &str,
+        tls_ca_file: Option<&str>,
+        connects: bool,
+    ) {
+        with_system_roots(&tls_dir().join(system_roots), || {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let endpoint = serve_fake_over_tls(FakeCapabilities::default()).await;
+                let connected = Client::connect(&ConnectOptions {
+                    tls_ca_certificates: tls_ca_file
+                        .map(|file| Certificate::from_pem(tls_file(file))),
+                    ..connect_options(&endpoint)
+                })
+                .await
+                .is_ok();
+                assert_eq!(connects, connected);
+            });
+        });
+    }
+
+    #[tokio::test]
+    async fn test_a_certificate_for_another_host_is_refused_without_naming_the_host() {
+        // The server's certificate is only for 127.0.0.1.
+        let endpoint = serve_fake_over_tls(FakeCapabilities::default())
+            .await
+            .replace("127.0.0.1", "localhost");
+        let e = Client::connect(&ConnectOptions {
+            tls_ca_certificates: Some(Certificate::from_pem(tls_file("ca.pem"))),
+            ..connect_options(&endpoint)
+        })
+        .await
+        .err()
+        .unwrap();
+        let e = format!("{e:#}");
+        assert!(
+            e.contains("<REAPI server>") && !e.contains("localhost"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(reqwest_tls_env)]
+    fn test_options_are_checked_without_the_system_roots() {
+        with_system_roots(&tls_dir().join("missing.pem"), || {
+            check_connect_options(&connect_options("grpcs://farm:443")).unwrap();
+        });
+    }
+
+    #[test]
+    fn test_tls_ca_file_needs_grpcs() {
+        let e = check_connect_options(&ConnectOptions {
+            tls_ca_certificates: Some(Certificate::from_pem(tls_file("ca.pem"))),
+            ..connect_options("grpc://farm:8980")
+        })
+        .unwrap_err();
+        assert!(format!("{e}").contains("grpcs://"), "{e}");
     }
 
     #[tokio::test]
