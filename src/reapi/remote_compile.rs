@@ -1236,6 +1236,33 @@ pub(super) mod test {
         assert!(output.stderr.is_empty());
     }
 
+    #[test_case(
+        remexec::ActionResult {
+            stderr_raw: vec![],
+            stderr_digest: Some(remexec::Digest { hash: "0".repeat(64), size_bytes: 2 << 30 }),
+            ..rlib_and_rmeta_result()
+        } ;
+        "2 GiB stderr"
+    )]
+    #[test_case(
+        worker_result(vec![
+            remexec::OutputFile {
+                digest: Some(remexec::Digest { hash: "0".repeat(64), size_bytes: 5 << 30 }),
+                ..cas_output(RLIB, b"")
+            },
+            cas_output(RMETA, b"rmeta"),
+        ]) ;
+        "5 GiB rlib"
+    )]
+    #[tokio::test]
+    async fn test_an_oversized_output_fails_without_a_download(result: remexec::ActionResult) {
+        let dir = tempfile::tempdir().unwrap();
+        let e = materialize_in(dir.path(), &[b"rlib", b"rmeta"], result)
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("is larger than"), "{e:#}");
+    }
+
     #[tokio::test]
     async fn test_a_failed_compile_returns_its_exit_code() {
         let dir = tempfile::tempdir().unwrap();
