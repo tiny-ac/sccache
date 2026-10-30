@@ -28,6 +28,7 @@ mod mapping;
 pub(crate) mod proto;
 mod remote_compile;
 mod sysroot;
+mod toolchains;
 
 pub(crate) use executor::ReapiExecutor;
 pub(crate) use mapping::{
