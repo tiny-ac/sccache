@@ -80,8 +80,37 @@ pub(crate) struct FakeServer {
     pub(crate) without_matching_worker: bool,
     /// Finishes each Execute with an operation error.
     pub(crate) fail_operations: bool,
+    /// Breaks this many Execute and WaitExecution streams, after a first, unfinished
+    /// operation unless `break_before_operation`.
+    pub(crate) streams_to_break: AtomicUsize,
+    pub(crate) stream_break: StreamBreak,
+    pub(crate) break_before_operation: bool,
+    /// Keeps the operations of broken streams for WaitExecution, which otherwise answers
+    /// NOT_FOUND, as a server that lost them.
+    pub(crate) keep_operations: bool,
+    /// Forgets every blob when it breaks a stream.
+    pub(crate) forget_blobs_on_break: bool,
+    /// Refuses this many Execute calls with UNAVAILABLE, as when every worker is busy.
+    pub(crate) executes_to_refuse: AtomicUsize,
+    pub(crate) wait_executions_to_refuse: AtomicUsize,
+    pub(crate) wait_execution_calls: AtomicUsize,
+    pub(crate) operations: Mutex<HashMap<String, Operation>>,
     pub(crate) blobs: Mutex<HashMap<(String, i64), Vec<u8>>>,
     pub(crate) action_results: Mutex<HashMap<(String, i64), remexec::ActionResult>>,
+}
+
+/// How the fake server breaks a stream.
+#[derive(Clone, Copy)]
+pub(crate) enum StreamBreak {
+    Status(tonic::Code),
+    /// Ends the stream without finishing the operation.
+    End,
+}
+
+impl Default for StreamBreak {
+    fn default() -> Self {
+        StreamBreak::Status(tonic::Code::Unavailable)
+    }
 }
 
 /// A ByteStream resource name's blob.
@@ -592,6 +621,42 @@ fn operation_stream(operations: Vec<std::result::Result<Operation, Status>>) -> 
     Box::pin(futures::stream::iter(operations))
 }
 
+/// Takes one from `counter` if it isn't 0.
+fn take_one(counter: &AtomicUsize) -> bool {
+    counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok()
+}
+
+impl FakeServer {
+    /// A stream that sends `operation`, or breaks per the switches.
+    fn finishing_stream(&self, operation: Operation) -> OperationStream {
+        if !take_one(&self.streams_to_break) {
+            return operation_stream(vec![Ok(operation)]);
+        }
+        if self.forget_blobs_on_break {
+            self.blobs.lock().unwrap().clear();
+        }
+        let mut stream = vec![];
+        if !self.break_before_operation {
+            stream.push(Ok(Operation {
+                name: operation.name.clone(),
+                ..Default::default()
+            }));
+        }
+        if let StreamBreak::Status(code) = self.stream_break {
+            stream.push(Err(Status::new(code, "stream broken")));
+        }
+        if self.keep_operations {
+            self.operations
+                .lock()
+                .unwrap()
+                .insert(operation.name.clone(), operation);
+        }
+        operation_stream(stream)
+    }
+}
+
 #[tonic::async_trait]
 impl Execution for FakeServer {
     type ExecuteStream = OperationStream;
@@ -601,6 +666,9 @@ impl Execution for FakeServer {
         request: Request<remexec::ExecuteRequest>,
     ) -> RpcResult<Self::ExecuteStream> {
         self.execute_calls.fetch_add(1, Ordering::SeqCst);
+        if take_one(&self.executes_to_refuse) {
+            return Err(Status::unavailable("every worker is busy"));
+        }
         let request = request.into_inner();
         if request.instance_name != self.instance_name {
             return Err(Status::invalid_argument(request.instance_name));
@@ -654,17 +722,26 @@ impl Execution for FakeServer {
                 }
             }
         };
-        Ok(Response::new(operation_stream(vec![Ok(
-            response_operation(response),
-        )])))
+        Ok(Response::new(
+            self.finishing_stream(response_operation(response)),
+        ))
     }
 
     type WaitExecutionStream = OperationStream;
 
     async fn wait_execution(
         &self,
-        _: Request<remexec::WaitExecutionRequest>,
+        request: Request<remexec::WaitExecutionRequest>,
     ) -> RpcResult<Self::WaitExecutionStream> {
-        Err(Status::unimplemented("WaitExecution"))
+        self.wait_execution_calls.fetch_add(1, Ordering::SeqCst);
+        if take_one(&self.wait_executions_to_refuse) {
+            return Err(Status::unavailable("try again"));
+        }
+        let name = request.into_inner().name;
+        let operation = self.operations.lock().unwrap().remove(&name);
+        match operation {
+            Some(operation) => Ok(Response::new(self.finishing_stream(operation))),
+            None => Err(Status::not_found("no operation")),
+        }
     }
 }
