@@ -1647,6 +1647,9 @@ impl<C: CompileCommandImpl> CompileCommandImpl for WithResponseFile<C> {
     fn get_cwd(&self) -> PathBuf {
         self.inner.get_cwd()
     }
+    fn append_arguments(&mut self, args: &[OsString]) -> Result<()> {
+        self.inner.append_arguments(args)
+    }
 
     async fn execute<T>(
         &self,
