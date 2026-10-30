@@ -15,8 +15,8 @@
 //! Executes actions on a REAPI server's workers.
 
 use super::client::{
-    Client, MAX_ACTION_RESULT_RESPONSE_BYTES, RPC_TIMEOUT, ReapiChannel, RpcError, loggable,
-    rpc_code, with_timeout,
+    Client, MAX_ACTION_RESULT_RESPONSE_BYTES, RPC_TIMEOUT, ReapiChannel, RpcError, action_request,
+    loggable, rpc_code, with_timeout,
 };
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use super::proto::google::longrunning::{Operation, operation};
@@ -70,6 +70,7 @@ impl std::error::Error for MissingActionBlobs {}
 pub(crate) struct Execution {
     instance_name: String,
     execution_client: ExecutionClient<ReapiChannel>,
+    request_metadata: remexec::RequestMetadata,
 }
 
 impl Execution {
@@ -78,6 +79,7 @@ impl Execution {
             instance_name: client.instance_name().to_owned(),
             execution_client: ExecutionClient::new(client.channel())
                 .max_decoding_message_size(MAX_ACTION_RESULT_RESPONSE_BYTES),
+            request_metadata: client.request_metadata().clone(),
         }
     }
 
@@ -85,10 +87,12 @@ impl Execution {
     /// `skip_cache_lookup`. Reattaches after a broken stream. Fails with
     /// [`MissingActionBlobs`] when the CAS is missing blobs the action needs, and with
     /// [`QueuedTooLong`] when the server reports the action queued for longer than
-    /// `queue_timeout`. The caller bounds how long it takes otherwise.
+    /// `queue_timeout`. The caller bounds how long it takes otherwise. `action_mnemonic` goes
+    /// in the calls' `RequestMetadata`.
     pub(crate) async fn execute_action(
         &self,
         action_digest: &remexec::Digest,
+        action_mnemonic: &str,
         skip_cache_lookup: bool,
         queue_timeout: Duration,
     ) -> Result<remexec::ExecuteResponse> {
@@ -103,15 +107,22 @@ impl Execution {
         let mut queue_deadline: Option<tokio::time::Instant> = None;
         loop {
             let stream = match operation_name.clone() {
-                Some(name) => match self.wait_execution_stream(name).await {
+                Some(name) => match self
+                    .wait_execution_stream(name, action_digest, action_mnemonic)
+                    .await
+                {
                     // The server lost the operation.
                     Err(e) if rpc_code(&e) == Some(tonic::Code::NotFound) => {
                         operation_name = None;
-                        self.execute_stream(action_digest, skip_cache_lookup).await
+                        self.execute_stream(action_digest, action_mnemonic, skip_cache_lookup)
+                            .await
                     }
                     waited => waited,
                 },
-                None => self.execute_stream(action_digest, skip_cache_lookup).await,
+                None => {
+                    self.execute_stream(action_digest, action_mnemonic, skip_cache_lookup)
+                        .await
+                }
             };
             let last_error = match stream {
                 Ok(mut stream) => loop {
@@ -180,6 +191,7 @@ impl Execution {
     async fn execute_stream(
         &self,
         action_digest: &remexec::Digest,
+        action_mnemonic: &str,
         skip_cache_lookup: bool,
     ) -> Result<tonic::Streaming<Operation>> {
         let request = remexec::ExecuteRequest {
@@ -192,6 +204,12 @@ impl Execution {
             ..Default::default()
         };
         with_timeout("the Execute call", RPC_TIMEOUT, async {
+            let request = action_request(
+                request,
+                &self.request_metadata,
+                action_digest,
+                action_mnemonic,
+            );
             match self.execution_client.clone().execute(request).await {
                 Ok(response) => Ok(response.into_inner()),
                 Err(status) => Err(execution_status_error(status)),
@@ -200,8 +218,18 @@ impl Execution {
         .await
     }
 
-    async fn wait_execution_stream(&self, name: String) -> Result<tonic::Streaming<Operation>> {
-        let request = remexec::WaitExecutionRequest { name };
+    async fn wait_execution_stream(
+        &self,
+        name: String,
+        action_digest: &remexec::Digest,
+        action_mnemonic: &str,
+    ) -> Result<tonic::Streaming<Operation>> {
+        let request = action_request(
+            remexec::WaitExecutionRequest { name },
+            &self.request_metadata,
+            action_digest,
+            action_mnemonic,
+        );
         with_timeout("the WaitExecution call", RPC_TIMEOUT, async {
             match self.execution_client.clone().wait_execution(request).await {
                 Ok(response) => Ok(response.into_inner()),
@@ -312,6 +340,7 @@ fn execute_response(result: Option<operation::Result>) -> Result<remexec::Execut
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::reapi::client::RUSTC_MNEMONIC;
     use crate::reapi::digest;
     use crate::reapi::fake::{FakeServer, StreamBreak};
     use std::sync::atomic::Ordering;
@@ -346,7 +375,12 @@ mod test {
         let server = Arc::new(server);
         let execution = Execution::new(&server.serve_and_connect().await);
         execution
-            .execute_action(&insert_action(&server), false, QUEUE_TIMEOUT)
+            .execute_action(
+                &insert_action(&server),
+                RUSTC_MNEMONIC,
+                false,
+                QUEUE_TIMEOUT,
+            )
             .await
     }
 
@@ -404,18 +438,18 @@ mod test {
         let execution = Execution::new(&server.serve_and_connect().await);
         let action_digest = insert_action(&server);
         let response = execution
-            .execute_action(&action_digest, false, QUEUE_TIMEOUT)
+            .execute_action(&action_digest, RUSTC_MNEMONIC, false, QUEUE_TIMEOUT)
             .await
             .unwrap();
         assert!(!response.cached_result);
         assert_eq!("out", response.result.unwrap().output_files[0].path);
         let response = execution
-            .execute_action(&action_digest, false, QUEUE_TIMEOUT)
+            .execute_action(&action_digest, RUSTC_MNEMONIC, false, QUEUE_TIMEOUT)
             .await
             .unwrap();
         assert!(response.cached_result);
         execution
-            .execute_action(&action_digest, true, QUEUE_TIMEOUT)
+            .execute_action(&action_digest, RUSTC_MNEMONIC, true, QUEUE_TIMEOUT)
             .await
             .unwrap();
         assert_eq!(2, server.actions_run.load(Ordering::SeqCst));
@@ -432,7 +466,7 @@ mod test {
         };
         server.insert_action_result(&action_digest, result.clone());
         let response = execution
-            .execute_action(&action_digest, false, QUEUE_TIMEOUT)
+            .execute_action(&action_digest, RUSTC_MNEMONIC, false, QUEUE_TIMEOUT)
             .await
             .unwrap();
         assert_eq!(Some(result), response.result);
@@ -443,7 +477,12 @@ mod test {
         let server = Arc::new(FakeServer::default());
         let execution = Execution::new(&server.serve_and_connect().await);
         let e = execution
-            .execute_action(&digest::of_bytes(b"no such action"), false, QUEUE_TIMEOUT)
+            .execute_action(
+                &digest::of_bytes(b"no such action"),
+                RUSTC_MNEMONIC,
+                false,
+                QUEUE_TIMEOUT,
+            )
             .await
             .unwrap_err();
         assert!(e.is::<MissingActionBlobs>(), "{e:#}");
@@ -491,13 +530,20 @@ mod test {
             ..writing_server()
         });
         let execution = Execution::new(&server.serve_and_connect().await);
+        let action_digest = insert_action(&server);
         let response = execution
-            .execute_action(&insert_action(&server), false, QUEUE_TIMEOUT)
+            .execute_action(&action_digest, RUSTC_MNEMONIC, false, QUEUE_TIMEOUT)
             .await
             .unwrap();
         assert_eq!("out", response.result.unwrap().output_files[0].path);
-        assert_eq!(1, server.execute_calls.load(Ordering::SeqCst));
-        assert_eq!(1, server.wait_execution_calls.load(Ordering::SeqCst));
+        let request_metadata = FakeServer::request_metadata_for(Some(&action_digest));
+        assert_eq!(
+            vec![
+                ("Execute", request_metadata.clone()),
+                ("WaitExecution", request_metadata)
+            ],
+            *server.request_metadata.lock().unwrap()
+        );
     }
 
     #[tokio::test]
@@ -508,7 +554,12 @@ mod test {
         });
         let execution = Execution::new(&server.serve_and_connect().await);
         execution
-            .execute_action(&insert_action(&server), false, QUEUE_TIMEOUT)
+            .execute_action(
+                &insert_action(&server),
+                RUSTC_MNEMONIC,
+                false,
+                QUEUE_TIMEOUT,
+            )
             .await
             .unwrap();
         assert_eq!(1, server.wait_execution_calls.load(Ordering::SeqCst));
@@ -539,7 +590,12 @@ mod test {
         });
         let execution = Execution::new(&server.serve_and_connect().await);
         let e = execution
-            .execute_action(&insert_action(&server), false, QUEUE_TIMEOUT)
+            .execute_action(
+                &insert_action(&server),
+                RUSTC_MNEMONIC,
+                false,
+                QUEUE_TIMEOUT,
+            )
             .await
             .unwrap_err();
         assert_eq!(Some(tonic::Code::PermissionDenied), rpc_code(&e));
@@ -603,7 +659,12 @@ mod test {
         });
         let execution = Execution::new(&server.serve_and_connect().await);
         execution
-            .execute_action(&insert_action(&server), false, QUEUE_TIMEOUT)
+            .execute_action(
+                &insert_action(&server),
+                RUSTC_MNEMONIC,
+                false,
+                QUEUE_TIMEOUT,
+            )
             .await
             .unwrap();
         assert_eq!(2, server.execute_calls.load(Ordering::SeqCst));
@@ -619,7 +680,12 @@ mod test {
         });
         let execution = Execution::new(&server.serve_and_connect().await);
         let e = execution
-            .execute_action(&insert_action(&server), false, QUEUE_TIMEOUT)
+            .execute_action(
+                &insert_action(&server),
+                RUSTC_MNEMONIC,
+                false,
+                QUEUE_TIMEOUT,
+            )
             .await
             .unwrap_err();
         assert!(e.is::<MissingActionBlobs>(), "{e:#}");
