@@ -14,7 +14,7 @@
 
 //! An in-memory REAPI server for tests.
 
-use super::client::{Client, ConnectOptions};
+use super::client::{Client, ConnectOptions, REQUEST_METADATA_HEADER, RUSTC_MNEMONIC};
 use super::digest;
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use super::proto::google::bytestream::byte_stream_server::{ByteStream, ByteStreamServer};
@@ -46,6 +46,9 @@ use tonic::transport::server::TcpIncoming;
 use tonic::{Request, Response, Status, Streaming};
 
 type RpcResult<T> = std::result::Result<Response<T>, Status>;
+
+/// The tool invocation ID of the [`Client`]s `serve_and_connect` returns.
+const TOOL_INVOCATION_ID: &str = "the invocation";
 
 /// A REAPI server that keeps blobs and action results in memory.
 #[derive(Default)]
@@ -130,6 +133,9 @@ pub(crate) struct FakeServer {
     pub(crate) operations: Mutex<HashMap<String, Operation>>,
     pub(crate) blobs: Mutex<HashMap<(String, i64), Vec<u8>>>,
     pub(crate) action_results: Mutex<HashMap<(String, i64), remexec::ActionResult>>,
+    /// The `RequestMetadata` of each FindMissingBlobs, GetActionResult, Execute and
+    /// WaitExecution call, after the method's name.
+    pub(crate) request_metadata: Mutex<Vec<(&'static str, remexec::RequestMetadata)>>,
 }
 
 /// How the fake server breaks a stream.
@@ -181,15 +187,51 @@ impl FakeServer {
         );
     }
 
-    /// Serves on a new local port and returns a [`Client`] connected with `instance_name`.
+    /// Serves on a new local port and returns a [`Client`] connected with `instance_name` and
+    /// the tool invocation ID `TOOL_INVOCATION_ID`.
     pub(crate) async fn serve_and_connect(self: &Arc<Self>) -> Client {
         Client::connect(&ConnectOptions {
             endpoint: self.serve().await,
             instance_name: self.instance_name.clone(),
+            tool_invocation_id: TOOL_INVOCATION_ID.to_owned(),
             ..Default::default()
         })
         .await
         .unwrap()
+    }
+
+    /// The `RequestMetadata` that a [`Client`] from `serve_and_connect` sends, with the ID of
+    /// `action_digest` for a call about one compile's action.
+    pub(crate) fn request_metadata_for(
+        action_digest: Option<&remexec::Digest>,
+    ) -> remexec::RequestMetadata {
+        remexec::RequestMetadata {
+            tool_details: Some(remexec::ToolDetails {
+                tool_name: "sccache".to_owned(),
+                tool_version: env!("CARGO_PKG_VERSION").to_owned(),
+            }),
+            tool_invocation_id: TOOL_INVOCATION_ID.to_owned(),
+            action_id: action_digest.map_or_else(String::new, |digest| digest.hash.clone()),
+            action_mnemonic: if action_digest.is_some() {
+                RUSTC_MNEMONIC
+            } else {
+                ""
+            }
+            .to_owned(),
+            ..Default::default()
+        }
+    }
+
+    fn record_request_metadata<T>(&self, method: &'static str, request: &Request<T>) {
+        let request_metadata = request
+            .metadata()
+            .get_bin(REQUEST_METADATA_HEADER)
+            .map(|value| remexec::RequestMetadata::decode(value.to_bytes().unwrap()).unwrap())
+            .unwrap_or_default();
+        self.request_metadata
+            .lock()
+            .unwrap()
+            .push((method, request_metadata));
     }
 
     /// Serves on a new local port and returns its `grpc://` endpoint.
@@ -336,6 +378,7 @@ impl ContentAddressableStorage for FakeServer {
         &self,
         request: Request<remexec::FindMissingBlobsRequest>,
     ) -> RpcResult<remexec::FindMissingBlobsResponse> {
+        self.record_request_metadata("FindMissingBlobs", &request);
         self.find_missing_blobs_calls.fetch_add(1, Ordering::SeqCst);
         if self.take_busy_answer("FindMissingBlobs") {
             return Err(Status::unavailable("busy"));
@@ -472,6 +515,7 @@ impl ActionCache for FakeServer {
         &self,
         request: Request<remexec::GetActionResultRequest>,
     ) -> RpcResult<remexec::ActionResult> {
+        self.record_request_metadata("GetActionResult", &request);
         if let Some(code) = *self.lookup_error.lock().unwrap() {
             return Err(Status::new(code, "lookup_error"));
         }
@@ -828,6 +872,7 @@ impl Execution for FakeServer {
         &self,
         request: Request<remexec::ExecuteRequest>,
     ) -> RpcResult<Self::ExecuteStream> {
+        self.record_request_metadata("Execute", &request);
         self.execute_calls.fetch_add(1, Ordering::SeqCst);
         if take_one(&self.executes_to_refuse) {
             return Err(Status::unavailable("every worker is busy"));
@@ -929,6 +974,7 @@ impl Execution for FakeServer {
         &self,
         request: Request<remexec::WaitExecutionRequest>,
     ) -> RpcResult<Self::WaitExecutionStream> {
+        self.record_request_metadata("WaitExecution", &request);
         self.wait_execution_calls.fetch_add(1, Ordering::SeqCst);
         if take_one(&self.wait_executions_to_refuse) {
             return Err(Status::unavailable("try again"));

@@ -18,7 +18,10 @@
 //! local compiles by reason.
 
 use super::cas::UnreadableBlob;
-use super::client::{ConnectOptions, RPC_TIMEOUT, check_connect_options, loggable, rpc_code};
+use super::client::{
+    ConnectOptions, RPC_TIMEOUT, RUSTC_MNEMONIC, RUSTC_VERSION_MNEMONIC, check_connect_options,
+    loggable, rpc_code,
+};
 use super::connection::{Connection, ServerApis};
 use super::digest::DigestCache;
 use super::execution::{Execution, MissingActionBlobs, QueuedTooLong};
@@ -316,6 +319,7 @@ impl ReapiExecutor {
                 &apis,
                 execution,
                 &action,
+                RUSTC_MNEMONIC,
                 skip_cache_lookup,
                 self.queue_timeout,
                 out_pretty,
@@ -448,6 +452,7 @@ impl ReapiExecutor {
             apis,
             execution,
             &action,
+            RUSTC_VERSION_MNEMONIC,
             false,
             self.queue_timeout,
             out_pretty,
@@ -540,6 +545,7 @@ async fn upload_and_execute(
     apis: &ServerApis,
     execution: &Execution,
     action: &ActionBlobs,
+    action_mnemonic: &str,
     skip_cache_lookup: bool,
     queue_timeout: Duration,
     out_pretty: &str,
@@ -548,7 +554,12 @@ async fn upload_and_execute(
     let execute = || async {
         tokio::time::timeout_at(
             deadline,
-            execution.execute_action(&action.action_digest, skip_cache_lookup, queue_timeout),
+            execution.execute_action(
+                &action.action_digest,
+                action_mnemonic,
+                skip_cache_lookup,
+                queue_timeout,
+            ),
         )
         .await
         .unwrap_or_else(|_| bail!("the execution timed out after {EXECUTE_TIMEOUT:?}"))
@@ -661,6 +672,7 @@ fn read_connect_options(config: &ReapiConfig) -> Result<ConnectOptions> {
         instance_name: config.instance_name.clone(),
         auth_token,
         headers: config.headers.clone(),
+        tool_invocation_id: uuid::Uuid::new_v4().to_string(),
         tls_ca_certificates,
         tls_client_identity,
     };
@@ -1175,6 +1187,15 @@ mod test {
         assert_eq!(DistType::Reapi(ReapiOutcome::ActionCacheHit), dist_type);
         // rustc -vV, then the compile.
         assert_eq!(2, fixture.server.actions_run.load(Ordering::SeqCst));
+        let execute_mnemonics: Vec<_> = (fixture.server.request_metadata.lock().unwrap())
+            .iter()
+            .filter(|(method, _)| *method == "Execute")
+            .map(|(_, request_metadata)| request_metadata.action_mnemonic.clone())
+            .collect();
+        assert_eq!(
+            vec![RUSTC_VERSION_MNEMONIC, RUSTC_MNEMONIC],
+            execute_mnemonics
+        );
     }
 
     #[test]
@@ -1701,6 +1722,14 @@ mod test {
             tls_ca_file: Some(dir.path().join("ca.pem")),
             ..Default::default()
         })
+    }
+
+    #[test]
+    fn test_each_executor_has_its_own_tool_invocation_id() {
+        let config = config("grpc://farm:8980".to_owned(), 0);
+        let first = read_connect_options(&config).unwrap().tool_invocation_id;
+        let second = read_connect_options(&config).unwrap().tool_invocation_id;
+        assert!(!first.is_empty() && first != second, "{first} {second}");
     }
 
     #[test]

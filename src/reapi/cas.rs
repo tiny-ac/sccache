@@ -701,6 +701,10 @@ mod test {
         assert_eq!(1, server.batch_update_blobs_calls.load(Ordering::SeqCst));
         // "new" is uploaded once.
         assert_eq!(1, server.batched_blob_count.load(Ordering::SeqCst));
+        assert_eq!(
+            vec![("FindMissingBlobs", FakeServer::request_metadata_for(None))],
+            *server.request_metadata.lock().unwrap()
+        );
     }
 
     #[tokio::test]
