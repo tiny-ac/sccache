@@ -18,7 +18,7 @@
 use super::cas::Cas;
 use super::digest::{self, DigestCache};
 use super::input_root::InputRootFile;
-use super::mapping::{BUILD_ROOT_DIR, ReapiCompile, TOOLCHAIN_DIR};
+use super::mapping::{BUILD_ROOT_DIR, CompileLocallyReason, ReapiCompile, TOOLCHAIN_DIR};
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use crate::errors::*;
 use crate::mock_command::exit_status;
@@ -120,8 +120,25 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// Error for a toolchain that compiles can't use until it changes.
+#[derive(Debug)]
+pub(super) struct UnusableToolchain(pub(super) CompileLocallyReason);
+
+impl std::fmt::Display for UnusableToolchain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for UnusableToolchain {}
+
+fn unusable(reason: CompileLocallyReason, detail: String) -> Error {
+    Error::new(UnusableToolchain(reason)).context(detail)
+}
+
 /// rustc, its shared libraries, and `target_triple`'s std and bundled linker from
 /// `sysroot`, as input root files under [`TOOLCHAIN_DIR`] paired with their local paths.
+/// Fails with [`UnusableToolchain`] if one is missing or has a non-UTF-8 path.
 pub(super) fn toolchain_files(
     sysroot: &Path,
     target_triple: &str,
@@ -133,7 +150,12 @@ pub(super) fn toolchain_files(
             .strip_prefix(sysroot)
             .with_context(|| format!("{} outside {}", local_path.display(), sysroot.display()))?
             .to_str()
-            .with_context(|| format!("non-UTF-8 toolchain path {}", local_path.display()))?
+            .ok_or_else(|| {
+                unusable(
+                    CompileLocallyReason::NonUtf8ToolchainPath,
+                    format!("non-UTF-8 toolchain path {}", local_path.display()),
+                )
+            })?
             .to_owned();
         // A symlink becomes a file with its destination's contents, which the CAS stores once.
         let digest = digest_cache.digest_and_pin(&local_path)?;
@@ -145,13 +167,22 @@ pub(super) fn toolchain_files(
         files.push((file, local_path));
         Ok(())
     };
+    let missing = |what: &str| {
+        unusable(
+            CompileLocallyReason::MissingRustcOrStd,
+            format!("no {what} in {}", sysroot.display()),
+        )
+    };
     let rustc = sysroot.join("bin/rustc");
     if !rustc.is_file() {
-        bail!("no rustc in {}", sysroot.display());
+        return Err(missing("rustc"));
     }
     add(rustc, true)?;
     // rustc's own shared libraries; the sanitizer runtimes next to them aren't needed to compile.
     let lib_dir = sysroot.join("lib");
+    if !lib_dir.is_dir() {
+        return Err(missing("lib"));
+    }
     let listing_context = || format!("failed to list {}", lib_dir.display());
     for entry in std::fs::read_dir(&lib_dir).with_context(listing_context)? {
         let path = entry.with_context(listing_context)?.path();
@@ -166,7 +197,7 @@ pub(super) fn toolchain_files(
     let target_triple_dir = sysroot.join("lib/rustlib").join(target_triple);
     let std_dir = target_triple_dir.join("lib");
     if !std_dir.is_dir() {
-        bail!("{} has no std for {target_triple}", sysroot.display());
+        return Err(missing(&format!("std for {target_triple}")));
     }
     for entry in walkdir::WalkDir::new(&std_dir).follow_links(true) {
         let entry = entry?;
@@ -524,7 +555,7 @@ fn exit_status_from_code(exit_code: u8) -> process::ExitStatus {
 }
 
 #[cfg(test)]
-mod test {
+pub(super) mod test {
     use super::*;
     use crate::reapi::fake::FakeServer;
     use crate::reapi::{ActionEnv, PathMapper, ToolchainKey};
@@ -943,7 +974,7 @@ mod test {
 
     /// A sysroot in `dir` with rustc, its libraries, a sanitizer runtime, and std and
     /// rust-lld for x86_64-unknown-linux-gnu.
-    fn fake_sysroot(dir: &Path) -> PathBuf {
+    pub(in crate::reapi) fn fake_sysroot(dir: &Path) -> PathBuf {
         let sysroot = dir.join("sysroot");
         for path in [
             "bin/rustc",
@@ -1013,7 +1044,14 @@ mod test {
         let sysroot = fake_sysroot(dir.path());
         let digest_cache = DigestCache::load(dir.path().join("digests"));
         let e = toolchain_files(&sysroot, "aarch64-apple-darwin", &digest_cache).unwrap_err();
-        assert!(e.to_string().contains("has no std"), "{e:#}");
+        assert!(
+            e.to_string().contains("no std for aarch64-apple-darwin"),
+            "{e:#}"
+        );
+        assert!(matches!(
+            e.downcast_ref(),
+            Some(UnusableToolchain(CompileLocallyReason::MissingRustcOrStd))
+        ));
     }
 
     #[test]
@@ -1024,5 +1062,9 @@ mod test {
         let digest_cache = DigestCache::load(dir.path().join("digests"));
         let e = toolchain_files(&sysroot, "x86_64-unknown-linux-gnu", &digest_cache).unwrap_err();
         assert!(e.to_string().contains("no rustc"), "{e:#}");
+        assert!(matches!(
+            e.downcast_ref(),
+            Some(UnusableToolchain(CompileLocallyReason::MissingRustcOrStd))
+        ));
     }
 }

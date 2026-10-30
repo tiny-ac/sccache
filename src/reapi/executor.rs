@@ -18,7 +18,9 @@
 
 use super::client::{ConnectOptions, check_connect_options};
 use super::connection::{Connection, ServerApis};
+use super::digest::DigestCache;
 use super::mapping::{CompileLocallyReason, ReapiCompile};
+use super::toolchains::{ToolchainFiles, Toolchains};
 use crate::compiler::{
     Compilation, DistInputOptions, DistType, LocalCompile, LocalCompileChanges, ReapiOutcome,
     RemoteExecutor, RemoteJob,
@@ -34,6 +36,8 @@ use std::time::{Duration, Instant};
 
 /// Directory under the dist cache dir for the sysroot copies local compiles use.
 const SYSROOT_COPIES_DIR: &str = "reapi-sysroot-copies";
+/// File under the dist cache dir that keeps toolchain file digests across restarts.
+const DIGEST_CACHE_FILE: &str = "reapi-digests.json";
 /// Caps `ready_wait_secs`, since `Instant::now() + ready_wait` panics on overflow.
 const MAX_READY_WAIT: Duration = Duration::from_secs(3600);
 
@@ -41,8 +45,16 @@ const MAX_READY_WAIT: Duration = Duration::from_secs(3600);
 pub struct ReapiExecutor {
     /// `None` when `[dist.reapi]` is misconfigured.
     connection: Option<Arc<Connection>>,
+    toolchains: Arc<Toolchains>,
     ready_wait: Duration,
     sysroot_copies_dir: PathBuf,
+}
+
+/// What a lookup in the action cache needs.
+struct Lookup {
+    reapi_compile: ReapiCompile,
+    apis: Arc<ServerApis>,
+    toolchain: ToolchainFiles,
 }
 
 impl ReapiExecutor {
@@ -65,17 +77,18 @@ impl ReapiExecutor {
         }
         ReapiExecutor {
             connection,
+            toolchains: Toolchains::new(DigestCache::load(dist_cache_dir.join(DIGEST_CACHE_FILE))),
             ready_wait,
             sysroot_copies_dir: dist_cache_dir.join(SYSROOT_COPIES_DIR),
         }
     }
 
-    /// `compilation` mapped for REAPI and the server's APIs, or why it compiles locally.
-    async fn map_and_connect<T: CommandCreatorSync>(
+    /// What looking `compilation` up needs, or why it compiles locally.
+    async fn prepare_lookup<T: CommandCreatorSync>(
         &self,
         compilation: Box<dyn Compilation<T>>,
         out_pretty: &str,
-    ) -> std::result::Result<(ReapiCompile, Arc<ServerApis>), CompileLocallyReason> {
+    ) -> std::result::Result<Lookup, CompileLocallyReason> {
         let mapped = tokio::task::spawn_blocking(move || compilation.map_for_reapi()).await;
         let reapi_compile = match mapped {
             Ok(Ok(reapi_compile)) => reapi_compile,
@@ -104,11 +117,17 @@ impl ReapiExecutor {
         let Some(connection) = &self.connection else {
             return Err(CompileLocallyReason::Misconfigured);
         };
-        match connection
-            .server_apis(Instant::now() + self.ready_wait)
-            .await
-        {
-            Ok(apis) => Ok((reapi_compile, apis)),
+        let deadline = Instant::now() + self.ready_wait;
+        let ready = tokio::try_join!(
+            connection.server_apis(deadline),
+            self.toolchains.files(&reapi_compile.toolchain, deadline)
+        );
+        match ready {
+            Ok((apis, toolchain)) => Ok(Lookup {
+                reapi_compile,
+                apis,
+                toolchain,
+            }),
             Err(reason) => {
                 debug!("[{}]: Compiling locally: {}", out_pretty, reason);
                 Err(reason)
@@ -163,7 +182,7 @@ impl<T: CommandCreatorSync> RemoteExecutor<T> for ReapiExecutor {
             out_pretty,
             ..
         } = job;
-        let dist_type = match self.map_and_connect(compilation, &out_pretty).await {
+        let dist_type = match self.prepare_lookup(compilation, &out_pretty).await {
             Ok(_) => DistType::NoDist,
             // The stats count reasons by their text, as they do non-cacheable ones.
             Err(reason) => DistType::Reapi(ReapiOutcome::CompiledLocally(reason.to_string())),
@@ -179,6 +198,7 @@ mod test {
     use crate::dist;
     use crate::mock_command::{MockChild, MockCommandCreator, exit_status};
     use crate::reapi::fake::FakeServer;
+    use crate::reapi::remote_compile::test::fake_sysroot;
     use crate::reapi::{PathMapper, ToolchainKey};
     use crate::server::SccacheService;
     use crate::test::utils::{new_creator, next_command};
@@ -194,8 +214,12 @@ mod test {
         Panics,
     }
 
-    /// A compile whose local compile gets `--sysroot=<sysroot_copies_dir>`.
-    struct FakeCompilation(Eligibility);
+    /// A compile with the toolchain at `sysroot`, whose local compile gets
+    /// `--sysroot=<sysroot_copies_dir>`.
+    struct FakeCompilation {
+        eligibility: Eligibility,
+        sysroot: PathBuf,
+    }
 
     impl Compilation<Creator> for FakeCompilation {
         fn generate_compile_commands(
@@ -211,7 +235,7 @@ mod test {
         }
 
         fn map_for_reapi(&self) -> std::result::Result<ReapiCompile, crate::reapi::NotEligible> {
-            match self.0 {
+            match self.eligibility {
                 Eligibility::Eligible => {}
                 Eligibility::Ineligible => return Err(CompileLocallyReason::Staticlib.into()),
                 Eligibility::Panics => panic!("map_for_reapi"),
@@ -222,7 +246,7 @@ mod test {
                 mapped_crate_root: None,
                 toolchain: ToolchainKey::new(
                     "abc123".to_owned(),
-                    "/toolchain".into(),
+                    self.sysroot.clone(),
                     "x86_64-unknown-linux-gnu".to_owned(),
                 ),
                 env: Default::default(),
@@ -269,7 +293,7 @@ mod test {
     }
 
     /// Compiles through an executor for a fake server, waiting 10s for it, with the config
-    /// changed by `configure`, which gets a temp dir.
+    /// changed by `configure`, which gets a temp dir holding the toolchain at `sysroot`.
     fn compile(
         eligibility: Eligibility,
         configure: impl FnOnce(&mut ReapiConfig, &Path),
@@ -278,8 +302,9 @@ mod test {
         let server = Arc::new(FakeServer::default());
         let mut config = config(runtime.block_on(server.serve()), 10);
         let cache_dir = tempfile::tempdir().unwrap();
+        let sysroot = fake_sysroot(cache_dir.path());
         configure(&mut config, cache_dir.path());
-        let executor = ReapiExecutor::new(&config, "/cache".as_ref());
+        let executor = ReapiExecutor::new(&config, &cache_dir.path().join("dist"));
         let storage = Arc::new(crate::cache::disk::DiskCache::new(
             cache_dir.path(),
             0,
@@ -305,7 +330,10 @@ mod test {
             stdout_stderr_mapper: None,
         };
         let job = RemoteJob {
-            compilation: Box::new(FakeCompilation(eligibility)),
+            compilation: Box::new(FakeCompilation {
+                eligibility,
+                sysroot,
+            }),
             out_pretty: "lib.rs".to_owned(),
             dist_job: None,
         };
@@ -326,10 +354,21 @@ mod test {
     }
 
     #[test]
-    fn test_an_eligible_compile_runs_locally_without_a_reason_once_connected() {
+    fn test_an_eligible_compile_runs_locally_without_a_reason_once_ready() {
         let (dist_type, output) = compile(Eligibility::Eligible, |_, _| {});
         assert_eq!(DistType::NoDist, dist_type);
         assert_eq!(b"err".as_slice(), output.stderr);
+    }
+
+    #[test]
+    fn test_an_eligible_compile_with_a_toolchain_without_std_runs_locally() {
+        let (dist_type, _) = compile(Eligibility::Eligible, |_, dir| {
+            std::fs::remove_dir_all(dir.join("sysroot/lib/rustlib")).unwrap();
+        });
+        assert_eq!(
+            compiled_locally("toolchain without rustc or std"),
+            dist_type
+        );
     }
 
     #[test]
@@ -384,7 +423,10 @@ mod test {
             ReapiExecutor::new(&config("grpc://farm:8980".to_owned(), 0), "/cache".as_ref());
         let changes = RemoteExecutor::<Creator>::local_compile_changes(
             &executor,
-            &FakeCompilation(Eligibility::Eligible),
+            &FakeCompilation {
+                eligibility: Eligibility::Eligible,
+                sysroot: "/toolchain".into(),
+            },
         );
         let mut expected = OsString::from("--sysroot=");
         expected.push(Path::new("/cache").join("reapi-sysroot-copies"));
