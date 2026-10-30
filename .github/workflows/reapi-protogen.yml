@@ -1,0 +1,40 @@
+name: REAPI protogen
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/reapi-protogen.yml'
+      - 'scripts/reapi-protogen/**'
+      - 'src/reapi/proto/**'
+  push:
+    paths:
+      - '.github/workflows/reapi-protogen.yml'
+      - 'scripts/reapi-protogen/**'
+      - 'src/reapi/proto/**'
+
+permissions:
+  contents: read # to fetch code (actions/checkout)
+
+jobs:
+  reapi_protogen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v5
+
+      - name: Install rust
+        uses: ./.github/actions/rust-toolchain
+        with:
+          components: clippy rustfmt
+
+      - name: Check the generator's format and lints
+        run: |
+          cargo fmt --check --manifest-path scripts/reapi-protogen/Cargo.toml
+          cargo clippy --locked --manifest-path scripts/reapi-protogen/Cargo.toml -- -D warnings
+
+      - name: Check the generated REAPI code is up to date
+        run: |
+          scripts/reapi-protogen/generate.sh
+          git add --intent-to-add src/reapi/proto
+          git diff --exit-code src/reapi/proto
