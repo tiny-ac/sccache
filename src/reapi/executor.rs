@@ -44,7 +44,7 @@ use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tonic::transport::Certificate;
+use tonic::transport::{Certificate, Identity};
 
 /// Directory under the dist cache dir for the sysroot copies local compiles use.
 const SYSROOT_COPIES_DIR: &str = "reapi-sysroot-copies";
@@ -643,11 +643,25 @@ fn read_connect_options(config: &ReapiConfig) -> Result<ConnectOptions> {
         .as_deref()
         .map(read_certificates)
         .transpose()?;
+    let tls_client_identity = match (
+        &config.tls_client_certificate_file,
+        &config.tls_client_key_file,
+    ) {
+        (Some(cert_file), Some(key_file)) => Some(Identity::from_pem(
+            read_tls_file(cert_file, "client certificate")?,
+            read_tls_file(key_file, "client key")?,
+        )),
+        (None, None) => None,
+        _ => bail!(
+            "[dist.reapi] needs both tls_client_certificate_file and tls_client_key_file, or neither"
+        ),
+    };
     let options = ConnectOptions {
         endpoint: config.endpoint.clone(),
         instance_name: config.instance_name.clone(),
         auth_token,
         tls_ca_certificates,
+        tls_client_identity,
     };
     check_connect_options(&options)?;
     Ok(options)
@@ -656,8 +670,7 @@ fn read_connect_options(config: &ReapiConfig) -> Result<ConnectOptions> {
 /// The PEM certificates in `file`. Fails if it holds none, since TLS would then trust no
 /// server.
 fn read_certificates(file: &Path) -> Result<Certificate> {
-    let pem = std::fs::read(file)
-        .with_context(|| format!("failed to read the REAPI TLS CA file {}", file.display()))?;
+    let pem = read_tls_file(file, "CA file")?;
     if !String::from_utf8_lossy(&pem).contains("-----BEGIN CERTIFICATE-----") {
         bail!(
             "the REAPI TLS CA file {} holds no PEM certificate",
@@ -665,6 +678,11 @@ fn read_certificates(file: &Path) -> Result<Certificate> {
         );
     }
     Ok(Certificate::from_pem(pem))
+}
+
+fn read_tls_file(file: &Path, what: &str) -> Result<Vec<u8>> {
+    std::fs::read(file)
+        .with_context(|| format!("failed to read the REAPI TLS {what} {}", file.display()))
 }
 
 #[async_trait]
@@ -1697,6 +1715,24 @@ mod test {
         let options =
             read_connect_options_with_tls_ca(include_bytes!("../../tests/reapi-tls/ca.pem"));
         assert!(options.unwrap().tls_ca_certificates.is_some());
+    }
+
+    #[test_case::test_case(Some("client.pem"), None ; "certificate without a key")]
+    #[test_case::test_case(None, Some("client.key") ; "key without a certificate")]
+    #[test_case::test_case(Some("client.pem"), Some("client.key") ; "both")]
+    fn test_a_client_certificate_needs_its_key(cert: Option<&str>, key: Option<&str>) {
+        let tls_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/reapi-tls");
+        let options = read_connect_options(&ReapiConfig {
+            endpoint: "grpcs://farm:443".to_owned(),
+            tls_client_certificate_file: cert.map(|cert| tls_dir.join(cert)),
+            tls_client_key_file: key.map(|key| tls_dir.join(key)),
+            ..Default::default()
+        });
+        let both = cert.is_some() && key.is_some();
+        match options {
+            Ok(options) => assert!(both && options.tls_client_identity.is_some()),
+            Err(e) => assert!(!both && e.to_string().contains("or neither"), "{e}"),
+        }
     }
 
     #[test]
