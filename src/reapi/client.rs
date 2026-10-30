@@ -15,9 +15,11 @@
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use crate::errors::*;
 use remexec::capabilities_client::CapabilitiesClient;
+use std::collections::BTreeMap;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
-use tonic::metadata::AsciiMetadataValue;
+use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue};
 use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
@@ -62,29 +64,29 @@ pub(crate) struct ConnectOptions {
     pub(crate) instance_name: String,
     /// Sent as a bearer token with every request. Surrounding whitespace is ignored.
     pub(crate) auth_token: Option<String>,
+    /// Sent with every request.
+    pub(crate) headers: BTreeMap<String, String>,
     /// PEM certificates that TLS trusts instead of the system's root certificates.
     pub(crate) tls_ca_certificates: Option<Certificate>,
     /// The PEM certificate and key TLS sends to a server that asks for a client certificate.
     pub(crate) tls_client_identity: Option<Identity>,
 }
 
-pub(crate) type AuthChannel = InterceptedService<Channel, AuthInterceptor>;
+pub(crate) type ReapiChannel = InterceptedService<Channel, HeadersInterceptor>;
 
-/// Adds `auth_header`, when set, to every request.
+/// Adds `headers` to every request.
 #[derive(Clone)]
-pub(crate) struct AuthInterceptor {
-    auth_header: Option<AsciiMetadataValue>,
+pub(crate) struct HeadersInterceptor {
+    headers: Arc<[(AsciiMetadataKey, AsciiMetadataValue)]>,
 }
 
-impl Interceptor for AuthInterceptor {
+impl Interceptor for HeadersInterceptor {
     fn call(
         &mut self,
         mut request: tonic::Request<()>,
     ) -> std::result::Result<tonic::Request<()>, tonic::Status> {
-        if let Some(auth_header) = &self.auth_header {
-            request
-                .metadata_mut()
-                .insert("authorization", auth_header.clone());
+        for (name, value) in self.headers.iter() {
+            request.metadata_mut().insert(name.clone(), value.clone());
         }
         Ok(request)
     }
@@ -156,7 +158,7 @@ impl std::fmt::Display for CredentialsRefused {
 /// A connection to a REAPI server.
 pub(crate) struct Client {
     instance_name: String,
-    channel: AuthChannel,
+    channel: ReapiChannel,
     max_batch_bytes: usize,
     supports_zstd_bytestream: bool,
     executes_actions: bool,
@@ -172,10 +174,10 @@ impl Client {
             .tcp_keepalive(Some(TCP_KEEPALIVE_IDLE))
             .tcp_keepalive_interval(Some(TCP_KEEPALIVE_INTERVAL))
             .tcp_keepalive_retries(Some(TCP_KEEPALIVE_RETRIES));
-        if tls_domain.is_none() && options.auth_token.is_some() {
-            warn!("REAPI: sending the auth token without TLS");
+        if tls_domain.is_none() && (options.auth_token.is_some() || !options.headers.is_empty()) {
+            warn!("REAPI: sending the auth token or headers without TLS");
         }
-        let auth_header = auth_header(options.auth_token.as_deref())?;
+        let headers = request_headers(options)?.into();
         let channel = with_timeout(
             "failed to connect to the REAPI server",
             CONNECT_TIMEOUT,
@@ -187,7 +189,7 @@ impl Client {
             },
         )
         .await?;
-        let channel = InterceptedService::new(channel, AuthInterceptor { auth_header });
+        let channel = InterceptedService::new(channel, HeadersInterceptor { headers });
 
         let capabilities = with_timeout(
             "failed to get the REAPI server's capabilities",
@@ -263,7 +265,7 @@ impl Client {
     }
 
     /// A clone of the channel; every clone shares one connection.
-    pub(crate) fn channel(&self) -> AuthChannel {
+    pub(crate) fn channel(&self) -> ReapiChannel {
         self.channel.clone()
     }
 
@@ -280,13 +282,54 @@ impl Client {
     }
 }
 
-/// Fails if `options` has an invalid endpoint, auth token or TLS file, without connecting.
+/// Fails if `options` has an invalid endpoint, auth token, header or TLS file, without
+/// connecting.
 /// The system's root certificates aren't loaded: a store that is missing or slow to read is a
 /// reason to retry the connection, not an invalid config.
 pub(super) fn check_connect_options(options: &ConnectOptions) -> Result<()> {
     channel_endpoint(options, false)?;
-    auth_header(options.auth_token.as_deref())?;
+    request_headers(options)?;
     Ok(())
+}
+
+/// The headers for every request: the bearer token's `authorization`, then `options.headers`.
+/// A header's value is left out of errors, since it may be a credential.
+fn request_headers(
+    options: &ConnectOptions,
+) -> Result<Vec<(AsciiMetadataKey, AsciiMetadataValue)>> {
+    let mut headers = Vec::new();
+    if let Some(auth_header) = auth_header(options.auth_token.as_deref())? {
+        headers.push((AsciiMetadataKey::from_static("authorization"), auth_header));
+    }
+    for (name, value) in &options.headers {
+        let key = AsciiMetadataKey::from_bytes(name.as_bytes())
+            .with_context(|| format!("the REAPI header name {name:?} is not valid"))?;
+        // gRPC and HTTP/2 own these: tonic drops or replaces some, and HTTP/2 refuses
+        // requests that have the others.
+        if key.as_str().starts_with("grpc-")
+            || [
+                "te",
+                "content-type",
+                "user-agent",
+                "connection",
+                "keep-alive",
+                "proxy-connection",
+                "transfer-encoding",
+                "upgrade",
+            ]
+            .contains(&key.as_str())
+        {
+            bail!("the REAPI header {name:?} is reserved for gRPC or HTTP/2");
+        }
+        if headers.iter().any(|(existing, _)| *existing == key) {
+            bail!("the REAPI header {name:?} is set twice, or with auth_token_file");
+        }
+        let value = sensitive_ascii_value(value).with_context(|| {
+            format!("the REAPI header {name:?} has a non-ASCII or control character")
+        })?;
+        headers.push((key, value));
+    }
+    Ok(headers)
 }
 
 /// The tonic endpoint for `options`, with TLS set up for `grpcs://`, and the host name TLS
@@ -326,14 +369,21 @@ fn channel_endpoint(
 fn auth_header(auth_token: Option<&str>) -> Result<Option<AsciiMetadataValue>> {
     match auth_token.map(str::trim) {
         Some("") => bail!("the REAPI auth token is empty"),
-        Some(token) => {
-            let mut header = AsciiMetadataValue::try_from(format!("Bearer {token}"))
-                .context("the REAPI auth token contains a non-ASCII or control character")?;
-            header.set_sensitive(true);
-            Ok(Some(header))
-        }
+        Some(token) => sensitive_ascii_value(&format!("Bearer {token}"))
+            .context("the REAPI auth token contains a non-ASCII or control character")
+            .map(Some),
         None => Ok(None),
     }
+}
+
+/// `value` as a header value that tonic leaves out of logs, or `None` if it has a non-ASCII or
+/// control character. tonic takes bytes above 0x7f, which servers may not.
+fn sensitive_ascii_value(value: &str) -> Option<AsciiMetadataValue> {
+    let mut value = AsciiMetadataValue::try_from(value)
+        .ok()
+        .filter(|_| value.is_ascii())?;
+    value.set_sensitive(true);
+    Some(value)
 }
 
 /// Error for a failed REAPI call. It keeps the status's code and message and drops the
@@ -479,12 +529,13 @@ mod test {
     use tonic::transport::ServerTlsConfig;
     use tonic::transport::server::TcpIncoming;
 
-    /// Answers GetCapabilities with `capabilities` and records each request's instance name and
-    /// `authorization` header.
+    /// Answers GetCapabilities with `capabilities` and records each request's instance name,
+    /// `authorization` header and metadata.
     struct FakeCapabilities {
         capabilities: remexec::ServerCapabilities,
         instance_names: Arc<Mutex<Vec<String>>>,
         authorization_headers: Arc<Mutex<Vec<Option<String>>>>,
+        metadata: Arc<Mutex<Vec<tonic::metadata::MetadataMap>>>,
     }
 
     impl Default for FakeCapabilities {
@@ -496,6 +547,7 @@ mod test {
                 },
                 instance_names: Default::default(),
                 authorization_headers: Default::default(),
+                metadata: Default::default(),
             }
         }
     }
@@ -515,6 +567,10 @@ mod test {
                 .lock()
                 .unwrap()
                 .push(authorization_header);
+            self.metadata
+                .lock()
+                .unwrap()
+                .push(request.metadata().clone());
             self.instance_names
                 .lock()
                 .unwrap()
@@ -832,6 +888,49 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_configured_headers_are_sent_with_the_auth_token() {
+        let fake = FakeCapabilities::default();
+        let metadata = fake.metadata.clone();
+        let endpoint = serve_fake(fake).await;
+        Client::connect(&ConnectOptions {
+            auth_token: Some("secret".to_owned()),
+            headers: [("X-Api-Key".to_owned(), "key".to_owned())].into(),
+            ..connect_options(&endpoint)
+        })
+        .await
+        .unwrap();
+        let metadata = &metadata.lock().unwrap()[0];
+        assert_eq!("key", metadata.get("x-api-key").unwrap());
+        assert_eq!("Bearer secret", metadata.get("authorization").unwrap());
+    }
+
+    #[test_case("x api key", "hidden", "not valid" ; "invalid name")]
+    #[test_case("x-api-key-bin", "hidden", "not valid" ; "binary name")]
+    #[test_case("x-api-key", "sec\nret", "control character" ; "control character in the value")]
+    #[test_case("x-api-key", "hédden", "non-ASCII" ; "non-ascii value")]
+    #[test_case("grpc-timeout", "1S", "reserved" ; "grpc name")]
+    #[test_case("Content-Type", "text/plain", "reserved" ; "content type")]
+    #[test_case("Connection", "close", "reserved" ; "http/2 connection header")]
+    #[test_case("Authorization", "Bearer other", "set twice" ; "authorization with a token")]
+    fn test_a_bad_header_is_refused_without_echoing_its_value(
+        name: &str,
+        value: &str,
+        error: &str,
+    ) {
+        let e = check_connect_options(&ConnectOptions {
+            auth_token: Some("secret".to_owned()),
+            headers: [(name.to_owned(), value.to_owned())].into(),
+            ..connect_options("grpc://farm:8980")
+        })
+        .unwrap_err();
+        let e = format!("{e:#}");
+        assert!(
+            e.contains(error) && !e.contains(value) && !e.contains("secret"),
+            "{e}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_empty_auth_token_is_refused() {
         let e = Client::connect(&ConnectOptions {
             auth_token: Some(" \n".to_owned()),
@@ -1060,16 +1159,30 @@ mod test {
         assert_eq!("asking: timed out after 1ms", e.to_string());
     }
 
+    #[test_case("sec\nret" ; "control character")]
+    #[test_case("sécret" ; "non-ascii")]
     #[tokio::test]
-    async fn test_auth_token_with_a_control_character_is_refused_without_echoing_it() {
+    async fn test_an_invalid_auth_token_is_refused_without_echoing_it(token: &str) {
         let e = Client::connect(&ConnectOptions {
-            auth_token: Some("sec\nret".to_owned()),
+            auth_token: Some(token.to_owned()),
             ..connect_options("grpc://127.0.0.1:1")
         })
         .await
         .err()
         .unwrap();
-        assert!(!format!("{e:#}").contains("sec"), "{e:#}");
+        assert!(!format!("{e:#}").contains("cret"), "{e:#}");
+    }
+
+    #[test]
+    fn test_the_token_and_header_values_are_left_out_of_logs() {
+        let headers = request_headers(&ConnectOptions {
+            auth_token: Some("secret".to_owned()),
+            headers: [("x-api-key".to_owned(), "key".to_owned())].into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(2, headers.len());
+        assert!(headers.iter().all(|(_, value)| value.is_sensitive()));
     }
 
     #[test_case("grpc://farm:8980", "http://farm:8980", None ; "plain text")]
