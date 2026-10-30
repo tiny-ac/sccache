@@ -54,6 +54,7 @@ impl<T: CommandCreatorSync> RemoteExecutor<T> for DistExecutor {
             compilation,
             out_pretty,
             dist_job,
+            ..
         } = job;
         let Some(dist_job) = dist_job else {
             debug!("[{}]: Compiling locally", out_pretty);

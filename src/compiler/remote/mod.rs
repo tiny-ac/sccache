@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::compiler::{Compilation, CompileCommand, DistType};
+use crate::compiler::{CacheControl, Compilation, CompileCommand, DistType};
 use crate::errors::*;
 use crate::mock_command::CommandCreatorSync;
 use crate::server::SccacheService;
@@ -34,6 +34,11 @@ pub struct RemoteJob<T: CommandCreatorSync> {
     /// `None` when `dist_input_options` returns `None` or the compiler can't distribute
     /// this compile.
     pub dist_job: Option<DistJob>,
+    pub cache_control: CacheControl,
+    /// Whether `local_compile_changes` changed the local compile's arguments. sccache caches a
+    /// remote result under the hash key of the changed compile, so an executor uses one only
+    /// when this is true.
+    pub local_compile_changed: bool,
 }
 
 /// A compile to run on an sccache-dist cluster.
@@ -56,6 +61,7 @@ pub struct DistInputOptions {
 pub type StdoutStderrMapper = Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
 
 /// An argument an executor appends to a local compile.
+#[derive(Clone)]
 pub struct LocalArg {
     pub arg: OsString,
     /// `arg` as it goes into the hash key, with a path that doesn't change the outputs

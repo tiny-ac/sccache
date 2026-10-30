@@ -825,6 +825,7 @@ where
                     compilation,
                     weak_toolchain_key,
                     out_pretty.clone(),
+                    cache_control,
                     local_compile_changes,
                 )
                 .await?;
@@ -929,6 +930,7 @@ async fn remote_or_local_compile<T>(
     compilation: Box<dyn Compilation<T>>,
     weak_toolchain_key: String,
     out_pretty: String,
+    cache_control: CacheControl,
     local_compile_changes: LocalCompileChanges,
 ) -> Result<(Cacheable, DistType, process::Output)>
 where
@@ -940,7 +942,8 @@ where
     let (mut compile_cmd, dist_compile_cmd, cacheable) = compilation
         .generate_compile_commands(&mut path_transformer, rewrite_includes_only)
         .context("Failed to generate compile commands")?;
-    if !local_compile_changes.args.is_empty() {
+    let local_compile_changed = !local_compile_changes.args.is_empty();
+    if local_compile_changed {
         let args: Vec<OsString> = local_compile_changes
             .args
             .into_iter()
@@ -974,6 +977,8 @@ where
         compilation,
         out_pretty,
         dist_job,
+        cache_control,
+        local_compile_changed,
     };
     let (dist_type, output) = executor.compile(job, local_compile).await?;
     Ok((cacheable, dist_type, output))
@@ -3801,12 +3806,18 @@ LLVM version: 6.0",
         );
     }
 
-    /// Compiles locally, appending `arg` and hashing `hashed_as` instead. Maps `remapped/` in
-    /// stdout and stderr to `/local/remapped/`; mapping twice adds `/local` again, so a hit
-    /// that maps cached output again fails its test.
+    /// Compiles locally with `arg` appended, or unchanged when `arg` is `None`. Maps
+    /// `remapped/` in stdout and stderr to `/local/remapped/`; mapping twice adds `/local`
+    /// again, so a hit that maps cached output again fails its test.
     struct LocalCompileChangesExecutor {
-        arg: OsString,
-        hashed_as: OsString,
+        arg: Option<crate::compiler::remote::LocalArg>,
+        jobs: Arc<std::sync::Mutex<Vec<SeenJob>>>,
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct SeenJob {
+        cache_control: CacheControl,
+        local_compile_changed: bool,
     }
 
     #[async_trait]
@@ -3817,10 +3828,7 @@ LLVM version: 6.0",
 
         fn local_compile_changes(&self, _: &dyn Compilation<T>) -> LocalCompileChanges {
             LocalCompileChanges {
-                args: vec![crate::compiler::remote::LocalArg {
-                    arg: self.arg.clone(),
-                    hashed_as: self.hashed_as.clone(),
-                }],
+                args: self.arg.clone().into_iter().collect(),
                 stdout_stderr_mapper: Some(Box::new(|text| {
                     String::from_utf8_lossy(text)
                         .replace("remapped/", "/local/remapped/")
@@ -3831,9 +3839,13 @@ LLVM version: 6.0",
 
         async fn compile(
             &self,
-            _: RemoteJob<T>,
+            job: RemoteJob<T>,
             local_compile: LocalCompile<'_, T>,
         ) -> Result<(DistType, process::Output)> {
+            self.jobs.lock().unwrap().push(SeenJob {
+                cache_control: job.cache_control,
+                local_compile_changed: job.local_compile_changed,
+            });
             Ok((DistType::NoDist, local_compile.run().await?))
         }
     }
@@ -3850,6 +3862,8 @@ LLVM version: 6.0",
         service: server::SccacheService<MockCreator>,
         hasher: Box<dyn CompilerHasher<MockCreator>>,
         arguments: Vec<OsString>,
+        cache_control: CacheControl,
+        jobs: Arc<std::sync::Mutex<Vec<SeenJob>>>,
     }
 
     impl LocalCompileChangesFixture {
@@ -3900,6 +3914,8 @@ LLVM version: 6.0",
                 service,
                 hasher,
                 arguments,
+                cache_control: CacheControl::Default,
+                jobs: Default::default(),
             }
         }
 
@@ -3912,17 +3928,32 @@ LLVM version: 6.0",
             hashed_as: &str,
             exit_code: i32,
         ) -> (bool, process::Output) {
+            let arg = crate::compiler::remote::LocalArg {
+                arg: arg.into(),
+                hashed_as: hashed_as.into(),
+            };
+            self.compile_with(Some(arg), exit_code)
+        }
+
+        /// Like `compile`, with `arg` appended unless it's `None`.
+        fn compile_with(
+            &mut self,
+            arg: Option<crate::compiler::remote::LocalArg>,
+            exit_code: i32,
+        ) -> (bool, process::Output) {
             next_command(
                 &self.creator,
                 Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
             );
             let obj = self.f.tempdir.path().join("foo.o");
-            let expected_arg = OsString::from(arg);
+            let expected_arg = arg.as_ref().map(|arg| arg.arg.clone());
             next_command_calls(&self.creator, move |args| {
-                assert!(
-                    args.ends_with(std::slice::from_ref(&expected_arg)),
-                    "{args:?}"
-                );
+                if let Some(expected_arg) = &expected_arg {
+                    assert!(
+                        args.ends_with(std::slice::from_ref(expected_arg)),
+                        "{args:?}"
+                    );
+                }
                 File::create(&obj)?.write_all(b"file contents")?;
                 Ok(MockChild::new(
                     exit_status(exit_code),
@@ -3931,8 +3962,8 @@ LLVM version: 6.0",
                 ))
             });
             let executor: Arc<dyn RemoteExecutor<_>> = Arc::new(LocalCompileChangesExecutor {
-                arg: arg.into(),
-                hashed_as: hashed_as.into(),
+                arg,
+                jobs: self.jobs.clone(),
             });
             let pool = self.runtime.handle().clone();
             let result = self.runtime.block_on(self.hasher.get_cached_or_compile(
@@ -3943,7 +3974,7 @@ LLVM version: 6.0",
                 self.arguments.clone(),
                 self.f.tempdir.path().to_path_buf(),
                 vec![],
-                CacheControl::Default,
+                self.cache_control,
                 pool,
             ));
             match result {
@@ -3993,6 +4024,22 @@ LLVM version: 6.0",
             assert_eq!(b"out /local/remapped/foo.c".as_slice(), output.stdout);
             assert_eq!(b"in /local/remapped/foo.c".as_slice(), output.stderr);
         }
+    }
+
+    #[test]
+    fn test_the_executor_gets_the_cache_control_and_local_compile_changed() {
+        let mut fixture = LocalCompileChangesFixture::new();
+        fixture.cache_control = CacheControl::ForceRecache;
+        fixture.compile("-DONE", "-DONE", 0);
+        fixture.compile_with(None, 0);
+        let seen_job = |local_compile_changed| SeenJob {
+            cache_control: CacheControl::ForceRecache,
+            local_compile_changed,
+        };
+        assert_eq!(
+            vec![seen_job(true), seen_job(false)],
+            *fixture.jobs.lock().unwrap()
+        );
     }
 
     #[test]
