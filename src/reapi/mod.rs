@@ -34,6 +34,7 @@ mod remote_compile;
 mod sysroot;
 mod terminal_output;
 mod toolchains;
+mod worker_toolchains;
 
 pub(crate) use executor::ReapiExecutor;
 pub(crate) use mapping::{
