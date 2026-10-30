@@ -16,6 +16,7 @@
 //! and execution.
 
 mod action_cache;
+mod cas;
 mod client;
 mod digest;
 #[cfg(test)]
