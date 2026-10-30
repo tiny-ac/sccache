@@ -306,7 +306,8 @@ impl Cas {
 
     /// Uploads whichever of `blobs` the CAS doesn't have, in batches, or through ByteStream
     /// if too large for one. A local file that can't be read fails with [`UnreadableBlob`].
-    /// Concurrent calls with the same blob may both upload it.
+    /// A blob that another call uploads while this one waits for an upload permit isn't
+    /// uploaded again.
     pub(crate) async fn ensure_uploaded(&self, blobs: Vec<(remexec::Digest, Blob)>) -> Result<()> {
         let mut seen = HashSet::new();
         let candidates: Vec<(remexec::Digest, Blob)> = blobs
@@ -344,32 +345,57 @@ impl Cas {
             batches.push(batch);
         }
         futures::try_join!(
-            futures::future::try_join_all(
-                batches
-                    .into_iter()
-                    .map(|batch| self.with_upload_permit(self.batch_update_blobs(batch)))
-            ),
-            futures::future::try_join_all(
-                large_blobs
-                    .into_iter()
-                    .map(|(digest, blob)| self.with_upload_permit(self.write_blob(digest, blob)))
-            ),
+            futures::future::try_join_all(batches.into_iter().map(|batch| {
+                self.upload_with_permit(batch, |batch| self.batch_update_blobs(batch))
+            })),
+            futures::future::try_join_all(large_blobs.into_iter().map(|large_blob| {
+                self.upload_with_permit(vec![large_blob], |blobs| async move {
+                    for (digest, blob) in blobs {
+                        self.write_blob(digest, blob).await?;
+                    }
+                    Ok(())
+                })
+            })),
         )?;
-        let mut present_blobs = self.present_blobs.lock().unwrap();
-        if present_blobs.len() + digests.len() > self.max_present_blobs {
-            present_blobs.clear();
-        }
-        present_blobs.extend(digests);
+        self.remember_present(digests);
         Ok(())
     }
 
-    async fn with_upload_permit(&self, upload: impl Future<Output = Result<()>>) -> Result<()> {
+    /// Waits for an upload permit, then uploads with `upload` whichever of `blobs` aren't
+    /// known to be present by then.
+    async fn upload_with_permit<F, U>(
+        &self,
+        blobs: Vec<(remexec::Digest, Blob)>,
+        upload: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(Vec<(remexec::Digest, Blob)>) -> U,
+        U: Future<Output = Result<()>>,
+    {
         let _permit = self
             .upload_permits
             .acquire()
             .await
             .expect("the upload semaphore is never closed");
-        upload.await
+        let blobs: Vec<_> = blobs
+            .into_iter()
+            .filter(|(digest, _)| !self.is_known_present(digest))
+            .collect();
+        if blobs.is_empty() {
+            return Ok(());
+        }
+        let digests: Vec<_> = blobs.iter().map(|(digest, _)| digest.clone()).collect();
+        upload(blobs).await?;
+        self.remember_present(digests);
+        Ok(())
+    }
+
+    fn remember_present(&self, digests: Vec<remexec::Digest>) {
+        let mut present_blobs = self.present_blobs.lock().unwrap();
+        if present_blobs.len() + digests.len() > self.max_present_blobs {
+            present_blobs.clear();
+        }
+        present_blobs.extend(digests);
     }
 
     async fn find_missing(&self, digests: &[remexec::Digest]) -> Result<HashSet<remexec::Digest>> {
@@ -693,6 +719,22 @@ mod test {
         // Adding "b" cleared "a".
         cas.ensure_uploaded(vec![blob(b"a")]).await.unwrap();
         assert_eq!(3, server.find_missing_blobs_calls.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_a_blob_another_call_uploaded_is_not_uploaded_again() {
+        let (mut cas, server) = cas_with_small_batches(FakeServer::default()).await;
+        cas.upload_permits = tokio::sync::Semaphore::new(1);
+        let blobs = vec![blob(b"small"), blob(&incompressible_bytes())];
+        let (first, second) = futures::join!(
+            cas.ensure_uploaded(blobs.clone()),
+            cas.ensure_uploaded(blobs)
+        );
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(1, server.batched_blob_count.load(Ordering::SeqCst));
+        let resource_names = server.bytestream_write_resource_names.lock().unwrap();
+        assert_eq!(1, resource_names.len());
     }
 
     #[tokio::test]
