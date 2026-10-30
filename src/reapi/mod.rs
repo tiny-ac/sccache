@@ -19,6 +19,7 @@ mod action_cache;
 mod cas;
 mod client;
 mod digest;
+mod executor;
 #[cfg(test)]
 mod fake;
 mod input_root;
@@ -27,6 +28,7 @@ pub(crate) mod proto;
 mod remote_compile;
 mod sysroot;
 
+pub(crate) use executor::ReapiExecutor;
 pub(crate) use mapping::{
     ActionEnv, CompileLocallyReason, NotEligible, PathMapper, ReapiCompile, lexically_normalize,
 };
