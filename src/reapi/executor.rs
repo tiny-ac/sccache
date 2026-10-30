@@ -41,6 +41,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -67,6 +68,9 @@ pub struct ReapiExecutor {
     on_miss: ReapiOnMiss,
     is_linux_client: bool,
     rustc_checks: Mutex<HashMap<ToolchainKey, Arc<RustcCheck>>>,
+    /// Set when the server refuses an execution, so misses compile locally until the sccache
+    /// server restarts.
+    executions_refused: AtomicBool,
 }
 
 /// The check, once per toolchain, that the workers run its rustc.
@@ -123,6 +127,7 @@ impl ReapiExecutor {
             on_miss: config.on_miss,
             is_linux_client: cfg!(target_os = "linux"),
             rustc_checks: Default::default(),
+            executions_refused: AtomicBool::new(false),
         }
     }
 
@@ -272,6 +277,9 @@ impl ReapiExecutor {
         let Some(execution) = &apis.execution else {
             return compile_locally(out_pretty, CompileLocallyReason::ExecutionUnsupported);
         };
+        if self.executions_refused.load(Ordering::Relaxed) {
+            return compile_locally(out_pretty, CompileLocallyReason::ExecutionsRefused);
+        }
         let rustc_check = self
             .rustc_checks
             .lock()
@@ -303,6 +311,15 @@ impl ReapiExecutor {
             Ok(response) => {
                 self.execution_pause.call_succeeded();
                 response
+            }
+            Err(CompileLocallyReason::ExecutionsRefused) => {
+                if !self.executions_refused.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        "REAPI: the server refused an execution; compiling misses locally until \
+                         the sccache server restarts"
+                    );
+                }
+                return Err(CompileLocallyReason::ExecutionsRefused);
             }
             // An input that can't be read or hashed says nothing about the server. The rustc
             // check already counted the server's answer, even if its stdout then failed to
@@ -530,6 +547,11 @@ async fn upload_and_execute(
         warn!("[{}]: Compiling locally: {:#}", out_pretty, e);
         match rpc_code(&e) {
             Some(tonic::Code::Unauthenticated) => CompileLocallyReason::CredentialsRefused,
+            // PERMISSION_DENIED on Execute comes from credentials that may look actions up but
+            // not execute them.
+            Some(tonic::Code::PermissionDenied) => CompileLocallyReason::ExecutionsRefused,
+            // Including FAILED_PRECONDITION without missing blobs, which servers also answer
+            // while no worker is available, as when a pool scales up from zero.
             _ => CompileLocallyReason::ExecutionFailed,
         }
     })
@@ -550,6 +572,9 @@ async fn upload(
             }
             match rpc_code(&e) {
                 Some(tonic::Code::Unauthenticated) => CompileLocallyReason::CredentialsRefused,
+                // PERMISSION_DENIED on an upload comes from credentials that may read but not
+                // write.
+                Some(tonic::Code::PermissionDenied) => CompileLocallyReason::ExecutionsRefused,
                 _ => CompileLocallyReason::UploadFailed,
             }
         })
@@ -1142,14 +1167,53 @@ mod test {
         assert_eq!(4, fixture.server.actions_run.load(Ordering::SeqCst));
     }
 
-    #[test]
-    fn test_a_refused_execution_compiles_locally() {
-        let fixture = executing_fixture(FakeServer {
-            execute_error: Some(tonic::Code::FailedPrecondition),
+    #[test_case::test_case(
+        FakeServer {
+            upload_error: Some(tonic::Code::PermissionDenied).into(),
             ..Default::default()
-        });
-        let (dist_type, _) = fixture.compile();
-        assert_eq!(compiled_locally("REAPI execution failed"), dist_type);
+        } ;
+        "upload permission denied"
+    )]
+    #[test_case::test_case(
+        FakeServer {
+            blob_upload_error: Some(tonic::Code::PermissionDenied),
+            ..Default::default()
+        } ;
+        "blob upload permission denied"
+    )]
+    #[test_case::test_case(
+        FakeServer {
+            execute_error: Some(tonic::Code::PermissionDenied),
+            ..Default::default()
+        } ;
+        "execute permission denied"
+    )]
+    fn test_refused_executions_compile_misses_locally_and_keep_looking_up(server: FakeServer) {
+        let fixture = executing_fixture(server);
+        let executor = fixture.executor();
+        assert_eq!(
+            compiled_locally("REAPI server refused executions"),
+            fixture.compile_with(&executor).0
+        );
+        let calls = |server: &FakeServer| {
+            (
+                server.find_missing_blobs_calls.load(Ordering::SeqCst),
+                server.execute_calls.load(Ordering::SeqCst),
+            )
+        };
+        let calls_before = calls(&fixture.server);
+        for _ in 0..=FAILURES_TO_PAUSE {
+            assert_eq!(
+                compiled_locally("REAPI server refused executions"),
+                fixture.compile_with(&executor).0
+            );
+        }
+        assert_eq!(calls_before, calls(&fixture.server));
+        fixture.put_result_in_action_cache(|_| {});
+        assert_eq!(
+            DistType::Reapi(ReapiOutcome::ActionCacheHit),
+            fixture.compile_with(&executor).0
+        );
     }
 
     /// Compiles twice, refused both times, then once more with the server answering and the
@@ -1239,12 +1303,22 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_misses_compile_locally_after_executions_fail() {
-        let fixture = executing_fixture(FakeServer {
+    #[test_case::test_case(
+        FakeServer {
+            fail_operations: true,
+            ..Default::default()
+        } ;
+        "failed operation"
+    )]
+    #[test_case::test_case(
+        FakeServer {
             execute_error: Some(tonic::Code::FailedPrecondition),
             ..Default::default()
-        });
+        } ;
+        "no worker available"
+    )]
+    fn test_misses_compile_locally_after_executions_fail(server: FakeServer) {
+        let fixture = executing_fixture(server);
         let executor = fixture.executor();
         for _ in 0..FAILURES_TO_PAUSE {
             assert_eq!(
