@@ -799,6 +799,19 @@ pub struct ReapiConfig {
     /// Platform properties set on every action, such as `OSFamily`. A name can't repeat.
     #[serde(default)]
     pub platform: BTreeMap<String, String>,
+    /// What a compile that misses the action cache does.
+    #[serde(default)]
+    pub on_miss: ReapiOnMiss,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReapiOnMiss {
+    /// Runs on the server's workers, and the server caches the result.
+    #[default]
+    Execute,
+    /// Compiles locally, and sccache never writes to the server.
+    Local,
 }
 
 impl Default for DistConfig {
@@ -2898,6 +2911,7 @@ instance_name = "main"
 auth_token_file = "/token"
 ready_wait_secs = 5
 salt = "1"
+on_miss = "local"
 
 [dist.reapi.platform]
 OSFamily = "linux"
@@ -3086,6 +3100,7 @@ key_prefix = "cosprefix"
                     ready_wait_secs: 5,
                     salt: "1".to_owned(),
                     platform: [("OSFamily".to_owned(), "linux".to_owned())].into(),
+                    on_miss: ReapiOnMiss::Local,
                 }),
             },
             server_startup_timeout_ms: Some(10000),
@@ -3635,6 +3650,7 @@ endpoint = "grpcs://farm.example.com:443"
             ready_wait_secs: 0,
             salt: String::new(),
             platform: BTreeMap::new(),
+            on_miss: ReapiOnMiss::Execute,
         }),
         config.dist.reapi
     );

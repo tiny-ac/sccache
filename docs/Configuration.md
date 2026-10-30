@@ -64,6 +64,11 @@ ready_wait_secs = 0
 # added to every action, so compiles with different salts don't share action
 # cache entries
 salt = ""
+# what a compile that misses the action cache does: "execute" runs it on the
+# server's workers, and the server caches the result; "local" compiles it
+# locally, and sccache never writes to the server. Execution needs a Linux
+# client
+on_miss = "execute"
 # platform properties set on every action; a name can't repeat
 #[dist.reapi.platform]
 #OSFamily = "linux"

@@ -32,7 +32,7 @@ use std::process;
 use tempfile::{NamedTempFile, TempPath};
 
 /// Starts the stderr line where the worker reports the worker root.
-const WORKER_ROOT_MARKER: &str = "sccache-reapi-pwd:";
+pub(super) const WORKER_ROOT_MARKER: &str = "sccache-reapi-pwd:";
 
 /// The command a worker runs for `compile`, which doesn't depend on the checkout path. A
 /// shell script adds the worker root, known only when the action runs, to path env vars and
@@ -189,7 +189,6 @@ fn build_action(
 /// its input root, its command and itself.
 pub(super) struct ActionBlobs {
     pub(super) action_digest: remexec::Digest,
-    #[cfg_attr(not(test), expect(dead_code, reason = "compiles don't execute yet"))]
     pub(super) blobs: Vec<(remexec::Digest, Blob)>,
 }
 

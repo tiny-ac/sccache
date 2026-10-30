@@ -1914,6 +1914,7 @@ pub struct ServerStats {
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ReapiStats {
     pub action_cache_hits: u64,
+    pub executions: u64,
     /// Compilations that ran locally, by reason.
     pub local_compilations: HashMap<String, usize>,
 }
@@ -1921,6 +1922,7 @@ pub struct ReapiStats {
 impl std::ops::AddAssign for ReapiStats {
     fn add_assign(&mut self, rhs: ReapiStats) {
         self.action_cache_hits += rhs.action_cache_hits;
+        self.executions += rhs.executions;
         for (k, v) in rhs.local_compilations {
             *self.local_compilations.entry(k).or_default() += v;
         }
@@ -2051,6 +2053,9 @@ impl ServerStats {
             DistType::Error => self.dist_errors += 1,
             DistType::Reapi(ReapiOutcome::ActionCacheHit) => {
                 self.reapi.get_or_insert_default().action_cache_hits += 1;
+            }
+            DistType::Reapi(ReapiOutcome::Executed) => {
+                self.reapi.get_or_insert_default().executions += 1;
             }
             DistType::Reapi(ReapiOutcome::CompiledLocally(reason)) => {
                 *self
@@ -2198,6 +2203,7 @@ impl ServerStats {
                 reapi.action_cache_hits,
                 "REAPI action cache hits"
             );
+            set_stat!(stats_vec, reapi.executions, "REAPI executions");
         }
 
         // Add multi-level cache statistics if available
@@ -2803,6 +2809,7 @@ mod tests {
             let mut stats = ServerStats::default();
             for _ in 0..n {
                 stats.count_dist_type(DistType::Reapi(ReapiOutcome::ActionCacheHit));
+                stats.count_dist_type(DistType::Reapi(ReapiOutcome::Executed));
                 stats.count_dist_type(DistType::Reapi(ReapiOutcome::CompiledLocally(
                     "staticlib crate type".to_owned(),
                 )));
@@ -2820,6 +2827,12 @@ mod tests {
             output
                 .lines()
                 .any(|l| l.starts_with("REAPI action cache hits") && l.ends_with(" 3")),
+            "missing from:\n{output}"
+        );
+        assert!(
+            output
+                .lines()
+                .any(|l| l.starts_with("REAPI executions") && l.ends_with(" 3")),
             "missing from:\n{output}"
         );
         assert!(

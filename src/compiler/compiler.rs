@@ -1129,6 +1129,8 @@ pub enum DistType {
 pub enum ReapiOutcome {
     /// Found in the action cache, with its outputs written to their local paths.
     ActionCacheHit,
+    /// Ran on the server's workers, with its outputs written to their local paths.
+    Executed,
     /// Compiled locally, for the reason given.
     CompiledLocally(String),
 }

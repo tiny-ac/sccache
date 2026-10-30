@@ -35,19 +35,15 @@ use tokio::sync::mpsc;
 /// The largest request gRPC servers take by default.
 const GRPC_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 /// Room for each blob's digest and field tags in a batch, which take about 100 bytes.
-#[cfg_attr(not(test), expect(dead_code, reason = "Execute uploads through it"))]
 const BATCH_OVERHEAD_PER_BLOB: usize = 256;
 /// Keeps a FindMissingBlobs request near 1 MiB, at about 100 bytes per digest.
-#[cfg_attr(not(test), expect(dead_code, reason = "Execute uploads through it"))]
 const DIGESTS_PER_FIND_MISSING_REQUEST: usize = 10_000;
 /// Uploads in flight at once, across [`Cas::ensure_uploaded`] calls.
 const UPLOAD_CONCURRENCY: usize = 4;
 /// Bounds `present_blobs`; clearing it costs only a FindMissingBlobs call.
 const MAX_PRESENT_BLOBS: usize = 100_000;
-#[cfg_attr(not(test), expect(dead_code, reason = "Execute uploads through it"))]
 const BYTESTREAM_WRITE_CHUNK_BYTES: usize = 1024 * 1024;
 /// rlib and rmeta files compress well at low levels.
-#[cfg_attr(not(test), expect(dead_code, reason = "Execute uploads through it"))]
 const ZSTD_LEVEL: i32 = 1;
 
 /// Allows for links as slow as 1 MiB/s.
@@ -56,14 +52,12 @@ fn download_timeout(bytes: u64) -> Duration {
 }
 
 /// Allows each of [`UPLOAD_CONCURRENCY`] uploads an equal share of a 1 MiB/s link.
-#[cfg_attr(not(test), expect(dead_code, reason = "Execute uploads through it"))]
 fn upload_timeout(bytes: u64) -> Duration {
     download_timeout(bytes.saturating_mul(UPLOAD_CONCURRENCY as u64))
 }
 
 /// Error for a local file that can't be read to upload it.
 #[derive(Debug)]
-#[cfg_attr(not(test), expect(dead_code, reason = "Execute uploads through it"))]
 pub(crate) struct UnreadableBlob(PathBuf);
 
 impl std::fmt::Display for UnreadableBlob {
@@ -75,14 +69,12 @@ impl std::fmt::Display for UnreadableBlob {
 impl std::error::Error for UnreadableBlob {}
 
 /// A blob to upload.
-#[cfg_attr(not(test), expect(dead_code, reason = "Execute uploads through it"))]
 #[derive(Debug, Clone)]
 pub(crate) enum Blob {
     Bytes(Vec<u8>),
     File(PathBuf),
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "Execute uploads through it"))]
 impl Blob {
     fn read(self) -> Result<Vec<u8>> {
         match self {
@@ -103,7 +95,6 @@ impl Blob {
 }
 
 /// Reads a blob to upload, a chunk at a time.
-#[cfg_attr(not(test), expect(dead_code, reason = "Execute uploads through it"))]
 enum ChunkReader {
     Unopened {
         blob: Blob,
@@ -115,7 +106,6 @@ enum ChunkReader {
     },
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "Execute uploads through it"))]
 impl ChunkReader {
     /// The next chunk to send, and `self` to read the rest from. Blocks.
     fn next_chunk(self) -> Result<(Self, Vec<u8>)> {
@@ -156,7 +146,6 @@ fn zstd_window_log_max(size_bytes: u64) -> u32 {
 }
 
 /// The CAS of the REAPI server behind a [`Client`].
-#[cfg_attr(not(test), expect(dead_code, reason = "Execute uploads through it"))]
 pub(crate) struct Cas {
     instance_name: String,
     cas_client: ContentAddressableStorageClient<AuthChannel>,
@@ -297,8 +286,12 @@ impl Cas {
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "Execute uploads through it"))]
 impl Cas {
+    /// Makes the next uploads look every blob up, after the CAS evicted some.
+    pub(crate) fn forget_present_blobs(&self) {
+        self.present_blobs.lock().unwrap().clear();
+    }
+
     fn is_known_present(&self, digest: &remexec::Digest) -> bool {
         // The CAS always has the empty blob.
         digest.size_bytes == 0 || self.present_blobs.lock().unwrap().contains(digest)
