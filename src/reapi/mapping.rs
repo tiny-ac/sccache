@@ -15,14 +15,17 @@
 //! Local paths mapped into a REAPI input root, so actions don't depend on where the checkout
 //! lives.
 //!
-//! Paths under a compile's cwd keep their relative path in the input root, and paths
-//! under its build root (cargo's target dir) go under [`BUILD_ROOT_DIR`].
+//! Paths under a compile's cwd keep their relative path in the input root, paths under its
+//! build root (cargo's target dir) go under [`BUILD_ROOT_DIR`], and the toolchain goes
+//! under [`TOOLCHAIN_DIR`].
 
 use crate::errors::*;
 use std::path::{Component, Path, PathBuf};
 
 /// The input root's directory for files under the local build root.
-const BUILD_ROOT_DIR: &str = ".sccache-build";
+pub(super) const BUILD_ROOT_DIR: &str = ".sccache-build";
+/// The input root's directory for the toolchain's files.
+pub(super) const TOOLCHAIN_DIR: &str = ".sccache-toolchain";
 
 /// A compile that can run through REAPI, with its paths mapped into the input root.
 #[derive(Debug)]
@@ -151,8 +154,10 @@ impl PathMapper {
             });
         }
         let relative = absolute.strip_prefix(&self.cwd).ok()?.to_str()?;
-        // It would land in the build root's directory in the input root.
-        if Path::new(relative).starts_with(BUILD_ROOT_DIR) {
+        // It would land in the build root's or toolchain's directory in the input root.
+        if Path::new(relative).starts_with(BUILD_ROOT_DIR)
+            || Path::new(relative).starts_with(TOOLCHAIN_DIR)
+        {
             return None;
         }
         Some(if relative.is_empty() {
@@ -216,6 +221,10 @@ mod test {
         assert_eq!(None, mapper.to_input_root(Path::new("/elsewhere/x.rs")));
         assert_eq!(None, mapper.to_input_root(Path::new("../x.rs")));
         assert_eq!(None, mapper.to_input_root(Path::new(".sccache-build/x.rs")));
+        assert_eq!(
+            None,
+            mapper.to_input_root(Path::new(".sccache-toolchain/x.rs"))
+        );
     }
 
     #[cfg(unix)]
