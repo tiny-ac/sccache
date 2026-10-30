@@ -15,7 +15,7 @@
 //! Uploads blobs to a REAPI server's content-addressable storage (CAS), and downloads blobs
 //! from it and checks them against their digests.
 
-use super::client::{AuthChannel, Client, RPC_TIMEOUT, status_error, with_timeout};
+use super::client::{AuthChannel, Client, RPC_TIMEOUT, RpcError, status_error, with_timeout};
 use super::digest;
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use super::proto::google::bytestream::byte_stream_client::ByteStreamClient;
@@ -456,13 +456,16 @@ impl Cas {
         for response in response.responses {
             let digest = response.digest.unwrap_or_default();
             if let Some(status) = response.status.filter(|status| status.code != 0) {
-                bail!(
-                    "{description}: the REAPI server refused blob {}/{}: {:?}: {}",
-                    digest.hash,
-                    digest.size_bytes,
-                    tonic::Code::from(status.code),
-                    status.message
-                );
+                return Err(Error::new(RpcError {
+                    code: tonic::Code::from(status.code),
+                    message: status.message,
+                }))
+                .with_context(|| {
+                    format!(
+                        "{description}: the REAPI server refused blob {}/{}",
+                        digest.hash, digest.size_bytes
+                    )
+                });
             }
             unanswered.remove(&digest);
         }
@@ -626,6 +629,7 @@ impl<W: Write> Write for HashingWriter<W> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::reapi::client::rpc_code;
     use crate::reapi::fake::FakeServer;
     use rand::{RngCore, SeedableRng};
     use std::sync::Arc;
@@ -888,6 +892,7 @@ mod test {
         let wrong = || (digest::of_bytes(b"one"), Blob::Bytes(b"two".to_vec()));
         let e = cas.ensure_uploaded(vec![wrong()]).await.unwrap_err();
         assert!(format!("{e:#}").contains("digest mismatch"), "{e:#}");
+        assert_eq!(Some(tonic::Code::InvalidArgument), rpc_code(&e));
         // The refused blob isn't remembered as present.
         assert!(cas.ensure_uploaded(vec![wrong()]).await.is_err());
         assert_eq!(2, server.find_missing_blobs_calls.load(Ordering::SeqCst));
