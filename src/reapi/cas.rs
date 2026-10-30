@@ -69,7 +69,6 @@ impl std::fmt::Display for UnreadableBlob {
 impl std::error::Error for UnreadableBlob {}
 
 /// A blob to upload.
-#[cfg_attr(not(test), expect(dead_code, reason = "Execute uploads through it"))]
 #[derive(Debug, Clone)]
 pub(crate) enum Blob {
     Bytes(Vec<u8>),
