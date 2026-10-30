@@ -33,7 +33,6 @@ pub(super) struct ServerApis {
     pub(super) cas: Cas,
     pub(super) action_cache: ActionCache,
     /// `None` for a server that doesn't execute actions.
-    #[expect(dead_code, reason = "compiles don't execute yet")]
     pub(super) execution: Option<Execution>,
 }
 

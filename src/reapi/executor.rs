@@ -13,24 +13,28 @@
 // limitations under the License.
 
 //! Looks up the cache misses of a build with `[dist.reapi]` in the REAPI server's action
-//! cache, and runs the ones it doesn't have locally, with the arguments a REAPI worker would
-//! use. The stats count the hits, and the local compiles by reason.
+//! cache, and executes the ones it doesn't have on the server's workers, or locally with the
+//! arguments a REAPI worker would use. The stats count the hits, the executions, and the
+//! local compiles by reason.
 
+use super::cas::UnreadableBlob;
 use super::client::{ConnectOptions, RPC_TIMEOUT, check_connect_options};
 use super::connection::{Connection, ServerApis};
 use super::digest::DigestCache;
+use super::execution::{Execution, MissingActionBlobs};
 use super::mapping::{CompileLocallyReason, ReapiCompile};
 use super::pause::Pause;
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use super::remote_compile::{
-    ActionOptions, action_blobs, digest_input_root_files, materialize, materialize_failure_reason,
+    ActionBlobs, ActionOptions, action_blobs, digest_input_root_files, materialize,
+    materialize_failure_reason,
 };
 use super::toolchains::{ToolchainFiles, Toolchains};
 use crate::compiler::{
     CacheControl, Compilation, DistInputOptions, DistType, LocalCompile, LocalCompileChanges,
     ReapiOutcome, RemoteExecutor, RemoteJob,
 };
-use crate::config::ReapiConfig;
+use crate::config::{ReapiConfig, ReapiOnMiss};
 use crate::errors::*;
 use crate::mock_command::CommandCreatorSync;
 use async_trait::async_trait;
@@ -43,6 +47,8 @@ use std::time::{Duration, Instant};
 const SYSROOT_COPIES_DIR: &str = "reapi-sysroot-copies";
 /// File under the dist cache dir that keeps toolchain file digests across restarts.
 const DIGEST_CACHE_FILE: &str = "reapi-digests.json";
+/// Bounds an execution, with its reattaches and its retry after uploading again.
+const EXECUTE_TIMEOUT: Duration = Duration::from_secs(600);
 /// Caps `ready_wait_secs`, since `Instant::now() + ready_wait` panics on overflow.
 const MAX_READY_WAIT: Duration = Duration::from_secs(3600);
 
@@ -55,10 +61,13 @@ pub struct ReapiExecutor {
     ready_wait: Duration,
     sysroot_copies_dir: PathBuf,
     lookup_pause: Pause,
+    execution_pause: Pause,
     action_options: ActionOptions,
+    on_miss: ReapiOnMiss,
+    is_linux_client: bool,
 }
 
-/// What a lookup in the action cache needs.
+/// What looking a compile up, and executing it on a miss, needs.
 struct Lookup {
     reapi_compile: ReapiCompile,
     apis: Arc<ServerApis>,
@@ -91,7 +100,10 @@ impl ReapiExecutor {
             ready_wait,
             sysroot_copies_dir: dist_cache_dir.join(SYSROOT_COPIES_DIR),
             lookup_pause: Pause::new(RPC_TIMEOUT),
+            execution_pause: Pause::new(EXECUTE_TIMEOUT),
             action_options: ActionOptions::new(config),
+            on_miss: config.on_miss,
+            is_linux_client: cfg!(target_os = "linux"),
         }
     }
 
@@ -157,12 +169,13 @@ impl ReapiExecutor {
         }
     }
 
-    /// Looks `lookup`'s compile up in the action cache and writes its outputs on a hit.
-    async fn look_up(
+    /// Looks `lookup`'s compile up in the action cache and, on a miss, executes it unless
+    /// `on_miss` is local, then writes its outputs.
+    async fn look_up_or_execute(
         &self,
         lookup: Lookup,
         out_pretty: &str,
-    ) -> std::result::Result<process::Output, CompileLocallyReason> {
+    ) -> std::result::Result<(ReapiOutcome, process::Output), CompileLocallyReason> {
         let Lookup {
             reapi_compile,
             apis,
@@ -173,10 +186,10 @@ impl ReapiExecutor {
         let digested = tokio::task::spawn_blocking(move || {
             let files = digest_input_root_files(&reapi_compile, &digest_cache)?;
             let action = action_blobs(&reapi_compile, &files, &toolchain, &action_options)?;
-            Ok::<_, Error>((reapi_compile, action.action_digest))
+            Ok::<_, Error>((reapi_compile, action))
         })
         .await;
-        let (reapi_compile, action_digest) = match digested.map_err(Error::from).flatten() {
+        let (reapi_compile, action) = match digested.map_err(Error::from).flatten() {
             Ok(digested) => digested,
             Err(e) => {
                 warn!(
@@ -186,7 +199,11 @@ impl ReapiExecutor {
                 return Err(CompileLocallyReason::HashingInputsFailed);
             }
         };
-        let cached = match apis.action_cache.get_action_result(&action_digest).await {
+        let cached = match apis
+            .action_cache
+            .get_action_result(&action.action_digest)
+            .await
+        {
             Ok(cached) => {
                 self.lookup_pause.call_succeeded();
                 cached
@@ -201,19 +218,81 @@ impl ReapiExecutor {
                 return Err(CompileLocallyReason::ActionCacheLookupFailed);
             }
         };
-        let result = match cached {
-            Some(result) if result.exit_code == 0 => result,
+        let skip_cache_lookup = match cached {
+            Some(result) if result.exit_code == 0 => {
+                let output = write_outputs(
+                    &apis,
+                    &reapi_compile,
+                    &result,
+                    &action.action_digest,
+                    out_pretty,
+                )
+                .await?;
+                debug!(
+                    "[{}]: REAPI action cache hit {}",
+                    out_pretty, action.action_digest.hash
+                );
+                return Ok((ReapiOutcome::ActionCacheHit, output));
+            }
             // A failed result may come from a worker problem, such as running out of memory, so
-            // it counts as a miss.
-            _ => return compile_locally(out_pretty, CompileLocallyReason::NotInActionCache),
+            // it counts as a miss, and the execution replaces it.
+            Some(_) => true,
+            None => false,
         };
-        let output =
-            write_outputs(&apis, &reapi_compile, &result, &action_digest, out_pretty).await?;
+        if self.on_miss == ReapiOnMiss::Local {
+            return compile_locally(out_pretty, CompileLocallyReason::NotInActionCache);
+        }
+        // The toolchain sent is the client's own, and REAPI workers run Linux.
+        if !self.is_linux_client {
+            return compile_locally(out_pretty, CompileLocallyReason::NonLinuxToolchain);
+        }
+        let Some(execution) = &apis.execution else {
+            return compile_locally(out_pretty, CompileLocallyReason::ExecutionUnsupported);
+        };
+        if !self.execution_pause.may_call() {
+            return compile_locally(out_pretty, CompileLocallyReason::ExecutionsPaused);
+        }
+        let executed =
+            upload_and_execute(&apis, execution, &action, skip_cache_lookup, out_pretty).await;
+        let response = match executed {
+            Ok(response) => {
+                self.execution_pause.call_succeeded();
+                response
+            }
+            // An input that can't be read says nothing about the server.
+            Err(CompileLocallyReason::UnreadableInput) => {
+                return Err(CompileLocallyReason::UnreadableInput);
+            }
+            Err(reason) => {
+                if let Some(pause) = self.execution_pause.call_failed() {
+                    warn!("REAPI: executions are failing; compiling misses locally for {pause:?}");
+                }
+                return Err(reason);
+            }
+        };
+        let result = response.result.unwrap_or_default();
+        // Compiling locally shows the error with local paths.
+        if result.exit_code != 0 {
+            return compile_locally(out_pretty, CompileLocallyReason::CompileFailedOnWorker);
+        }
+        let output = write_outputs(
+            &apis,
+            &reapi_compile,
+            &result,
+            &action.action_digest,
+            out_pretty,
+        )
+        .await?;
         debug!(
-            "[{}]: REAPI action cache hit {}",
-            out_pretty, action_digest.hash
+            "[{}]: REAPI executed {} (cached: {})",
+            out_pretty, action.action_digest.hash, response.cached_result
         );
-        Ok(output)
+        let outcome = if response.cached_result {
+            ReapiOutcome::ActionCacheHit
+        } else {
+            ReapiOutcome::Executed
+        };
+        Ok((outcome, output))
     }
 }
 
@@ -244,6 +323,59 @@ async fn write_outputs(
                 e
             );
             reason
+        })
+}
+
+/// Uploads what `action` needs and executes it, uploading again once if the CAS evicted
+/// blobs since.
+async fn upload_and_execute(
+    apis: &ServerApis,
+    execution: &Execution,
+    action: &ActionBlobs,
+    skip_cache_lookup: bool,
+    out_pretty: &str,
+) -> std::result::Result<remexec::ExecuteResponse, CompileLocallyReason> {
+    let deadline = tokio::time::Instant::now() + EXECUTE_TIMEOUT;
+    let execute = || async {
+        tokio::time::timeout_at(
+            deadline,
+            execution.execute_action(&action.action_digest, skip_cache_lookup),
+        )
+        .await
+        .unwrap_or_else(|_| bail!("the execution timed out after {EXECUTE_TIMEOUT:?}"))
+    };
+    upload(apis, action, out_pretty).await?;
+    let executed = match execute().await {
+        // The CAS may evict blobs after FindMissingBlobs, or after `Cas` last saw them.
+        Err(e) if e.is::<MissingActionBlobs>() => {
+            debug!("[{}]: {:#}; uploading again", out_pretty, e);
+            apis.cas.forget_present_blobs();
+            upload(apis, action, out_pretty).await?;
+            execute().await
+        }
+        executed => executed,
+    };
+    executed.map_err(|e| {
+        warn!("[{}]: Compiling locally: {:#}", out_pretty, e);
+        CompileLocallyReason::ExecutionFailed
+    })
+}
+
+async fn upload(
+    apis: &ServerApis,
+    action: &ActionBlobs,
+    out_pretty: &str,
+) -> std::result::Result<(), CompileLocallyReason> {
+    apis.cas
+        .ensure_uploaded(action.blobs.clone())
+        .await
+        .map_err(|e| {
+            warn!("[{}]: Compiling locally: {:#}", out_pretty, e);
+            if e.is::<UnreadableBlob>() {
+                CompileLocallyReason::UnreadableInput
+            } else {
+                CompileLocallyReason::UploadFailed
+            }
         })
 }
 
@@ -313,11 +445,11 @@ impl<T: CommandCreatorSync> RemoteExecutor<T> for ReapiExecutor {
                     &out_pretty,
                 )
                 .await?;
-            self.look_up(lookup, &out_pretty).await
+            self.look_up_or_execute(lookup, &out_pretty).await
         }
         .await;
         match looked_up {
-            Ok(output) => Ok((DistType::Reapi(ReapiOutcome::ActionCacheHit), output)),
+            Ok((outcome, output)) => Ok((DistType::Reapi(outcome), output)),
             // The stats count reasons by their text, as they do non-cacheable ones.
             Err(reason) => Ok((
                 DistType::Reapi(ReapiOutcome::CompiledLocally(reason.to_string())),
@@ -428,10 +560,12 @@ mod test {
         }
     }
 
+    /// A config whose misses compile locally. The execution tests set `on_miss` to execute.
     fn config(endpoint: String, ready_wait_secs: u64) -> ReapiConfig {
         ReapiConfig {
             endpoint,
             ready_wait_secs,
+            on_miss: ReapiOnMiss::Local,
             ..Default::default()
         }
     }
@@ -450,8 +584,12 @@ mod test {
 
     impl Fixture {
         fn new(eligibility: Eligibility) -> Self {
+            Self::with_server(eligibility, FakeServer::default())
+        }
+
+        fn with_server(eligibility: Eligibility, server: FakeServer) -> Self {
             let runtime = tokio::runtime::Runtime::new().unwrap();
-            let server = Arc::new(FakeServer::default());
+            let server = Arc::new(server);
             let config = config(runtime.block_on(server.serve()), 10);
             let dir = tempfile::tempdir().unwrap();
             fake_sysroot(dir.path());
@@ -507,8 +645,11 @@ mod test {
             self.server.insert_action_result(&action_digest, result);
         }
 
+        /// An executor on a Linux client.
         fn executor(&self) -> ReapiExecutor {
-            ReapiExecutor::new(&self.config, &self.dir.path().join("dist"))
+            let mut executor = ReapiExecutor::new(&self.config, &self.dir.path().join("dist"));
+            executor.is_linux_client = true;
+            executor
         }
 
         /// Runs the compile through a new executor. A local compile writes `out` to stdout and
@@ -568,6 +709,190 @@ mod test {
 
     fn compiled_locally(reason: &str) -> DistType {
         DistType::Reapi(ReapiOutcome::CompiledLocally(reason.to_owned()))
+    }
+
+    /// A fixture whose misses execute on `server`, whose workers write the rlib.
+    fn executing_fixture(server: FakeServer) -> Fixture {
+        let mut fixture = Fixture::with_server(
+            Eligibility::Eligible,
+            FakeServer {
+                executes_actions: true,
+                ..server
+            },
+        );
+        fixture.config.on_miss = ReapiOnMiss::Execute;
+        let compile = fixture.compilation().map_for_reapi().unwrap();
+        let rlib = compile
+            .path_mapper
+            .to_input_root(&compile.outputs[0])
+            .unwrap();
+        fixture
+            .server
+            .worker_outputs
+            .lock()
+            .unwrap()
+            .insert(rlib, b"rlib".to_vec());
+        fixture
+    }
+
+    #[test]
+    fn test_a_miss_executes_and_writes_its_outputs() {
+        let fixture = executing_fixture(FakeServer::default());
+        let (dist_type, output) = fixture.compile();
+        assert_eq!(DistType::Reapi(ReapiOutcome::Executed), dist_type);
+        assert!(output.status.success());
+        let rlib = fixture.dir.path().join("ws").join(RLIB);
+        assert_eq!(b"rlib".as_slice(), std::fs::read(rlib).unwrap());
+        // The execution cached its result.
+        let (dist_type, _) = fixture.compile();
+        assert_eq!(DistType::Reapi(ReapiOutcome::ActionCacheHit), dist_type);
+        assert_eq!(1, fixture.server.actions_run.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_a_miss_with_on_miss_local_writes_nothing_to_the_server() {
+        let mut fixture = executing_fixture(FakeServer::default());
+        fixture.config.on_miss = ReapiOnMiss::Local;
+        let (dist_type, _) = fixture.compile();
+        assert_eq!(compiled_locally("not in the action cache"), dist_type);
+        assert_eq!(
+            0,
+            fixture
+                .server
+                .find_missing_blobs_calls
+                .load(Ordering::SeqCst)
+        );
+        assert_eq!(0, fixture.server.execute_calls.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_a_miss_on_a_server_that_doesnt_execute_compiles_locally() {
+        let mut fixture = Fixture::new(Eligibility::Eligible);
+        fixture.config.on_miss = ReapiOnMiss::Execute;
+        let (dist_type, _) = fixture.compile();
+        assert_eq!(
+            compiled_locally("REAPI server doesn't execute actions"),
+            dist_type
+        );
+    }
+
+    #[test]
+    fn test_a_miss_on_another_os_compiles_locally() {
+        let fixture = executing_fixture(FakeServer::default());
+        let mut executor = fixture.executor();
+        executor.is_linux_client = false;
+        let (dist_type, _) = fixture.compile_with(&executor);
+        assert_eq!(
+            compiled_locally("toolchain that doesn't run on Linux workers"),
+            dist_type
+        );
+        assert_eq!(0, fixture.server.execute_calls.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_a_compile_that_fails_on_a_worker_compiles_locally() {
+        let fixture = executing_fixture(FakeServer {
+            worker_exit_code: 1,
+            ..Default::default()
+        });
+        let (dist_type, output) = fixture.compile();
+        assert_eq!(compiled_locally("compile failed on a worker"), dist_type);
+        assert_eq!(b"out".as_slice(), output.stdout);
+        // The failure wasn't cached.
+        fixture.compile();
+        assert_eq!(2, fixture.server.actions_run.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_a_refused_execution_compiles_locally() {
+        let fixture = executing_fixture(FakeServer {
+            without_matching_worker: true,
+            ..Default::default()
+        });
+        let (dist_type, _) = fixture.compile();
+        assert_eq!(compiled_locally("REAPI execution failed"), dist_type);
+    }
+
+    #[test]
+    fn test_misses_compile_locally_after_executions_fail() {
+        let fixture = executing_fixture(FakeServer {
+            without_matching_worker: true,
+            ..Default::default()
+        });
+        let executor = fixture.executor();
+        for _ in 0..FAILURES_TO_PAUSE {
+            assert_eq!(
+                compiled_locally("REAPI execution failed"),
+                fixture.compile_with(&executor).0
+            );
+        }
+        assert_eq!(
+            compiled_locally("REAPI executions paused after failures"),
+            fixture.compile_with(&executor).0
+        );
+        assert_eq!(
+            FAILURES_TO_PAUSE as usize,
+            fixture.server.execute_calls.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn test_a_failed_upload_compiles_locally() {
+        let fixture = executing_fixture(FakeServer {
+            fail_uploads: true,
+            ..Default::default()
+        });
+        let (dist_type, _) = fixture.compile();
+        assert_eq!(
+            compiled_locally("failed to upload the action's blobs"),
+            dist_type
+        );
+        assert_eq!(0, fixture.server.execute_calls.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_an_input_removed_after_hashing_compiles_locally() {
+        let fixture = executing_fixture(FakeServer::default());
+        *fixture.server.delete_at_find_missing.lock().unwrap() =
+            Some(fixture.dir.path().join("ws/src/lib.rs"));
+        let (dist_type, _) = fixture.compile();
+        assert_eq!(
+            compiled_locally("failed to read an input to upload it"),
+            dist_type
+        );
+    }
+
+    #[test]
+    fn test_an_execution_answered_from_the_action_cache_counts_as_a_hit() {
+        let fixture = executing_fixture(FakeServer {
+            lookups_miss: true,
+            ..Default::default()
+        });
+        fixture.put_result_in_action_cache(|_| {});
+        let (dist_type, _) = fixture.compile();
+        assert_eq!(DistType::Reapi(ReapiOutcome::ActionCacheHit), dist_type);
+        assert_eq!(1, fixture.server.execute_calls.load(Ordering::SeqCst));
+        assert_eq!(0, fixture.server.actions_run.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_blobs_the_cas_evicted_are_uploaded_again() {
+        let fixture = executing_fixture(FakeServer {
+            forget_blobs_at_next_execute: true.into(),
+            ..Default::default()
+        });
+        let (dist_type, _) = fixture.compile();
+        assert_eq!(DistType::Reapi(ReapiOutcome::Executed), dist_type);
+        assert_eq!(2, fixture.server.execute_calls.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_a_failed_cached_result_executes_again() {
+        let fixture = executing_fixture(FakeServer::default());
+        fixture.put_result_in_action_cache(|result| result.exit_code = 1);
+        let (dist_type, _) = fixture.compile();
+        assert_eq!(DistType::Reapi(ReapiOutcome::Executed), dist_type);
+        assert_eq!(1, fixture.server.actions_run.load(Ordering::SeqCst));
     }
 
     #[test]

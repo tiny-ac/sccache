@@ -164,6 +164,13 @@ pub(crate) enum CompileLocallyReason {
     WorkerRootInOutput,
     DownloadingOutputsFailed,
     UnwritableOutputs,
+    ExecutionUnsupported,
+    NonLinuxToolchain,
+    ExecutionsPaused,
+    UnreadableInput,
+    UploadFailed,
+    ExecutionFailed,
+    CompileFailedOnWorker,
 }
 
 impl std::fmt::Display for CompileLocallyReason {
@@ -206,6 +213,13 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::WorkerRootInOutput => "worker root in an output",
             Self::DownloadingOutputsFailed => "failed to download the outputs",
             Self::UnwritableOutputs => "failed to write the outputs",
+            Self::ExecutionUnsupported => "REAPI server doesn't execute actions",
+            Self::NonLinuxToolchain => "toolchain that doesn't run on Linux workers",
+            Self::ExecutionsPaused => "REAPI executions paused after failures",
+            Self::UnreadableInput => "failed to read an input to upload it",
+            Self::UploadFailed => "failed to upload the action's blobs",
+            Self::ExecutionFailed => "REAPI execution failed",
+            Self::CompileFailedOnWorker => "compile failed on a worker",
         })
     }
 }
