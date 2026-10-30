@@ -94,6 +94,12 @@ impl Pause {
         };
         Some(pause)
     }
+
+    /// Ends the current pause, as if its time ran out.
+    #[cfg(test)]
+    pub(super) fn end(&self) {
+        self.state.lock().unwrap().paused_until = Some(Instant::now());
+    }
 }
 
 #[cfg(test)]
@@ -106,10 +112,6 @@ mod test {
 
     fn fail(pause: &Pause, times: u32) -> Option<Duration> {
         (0..times).filter_map(|_| pause.call_failed()).last()
-    }
-
-    fn end_pause(pause: &Pause) {
-        pause.state.lock().unwrap().paused_until = Some(Instant::now());
     }
 
     #[test]
@@ -135,7 +137,7 @@ mod test {
         let pause = pause();
         fail(&pause, FAILURES_TO_PAUSE);
         assert_eq!(None, fail(&pause, FAILURES_TO_PAUSE));
-        end_pause(&pause);
+        pause.end();
         assert_eq!(Some(PAUSE_MIN * 2), fail(&pause, 1));
     }
 
@@ -143,7 +145,7 @@ mod test {
     fn test_one_compile_calls_after_a_pause() {
         let pause = pause();
         fail(&pause, FAILURES_TO_PAUSE);
-        end_pause(&pause);
+        pause.end();
         assert!(pause.may_call());
         assert!(!pause.may_call(), "a second compile called");
         // A probe that never got to its call.
@@ -158,7 +160,7 @@ mod test {
         let pauses: Vec<_> = (0..6)
             .map(|_| {
                 let started = fail(&pause, failures).unwrap();
-                end_pause(&pause);
+                pause.end();
                 // After a pause, the first failure starts the next one.
                 failures = 1;
                 started.as_secs()
