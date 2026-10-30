@@ -37,5 +37,8 @@ mod counted_array;
 pub use crate::compiler::c::CCompilerKind;
 pub use crate::compiler::compiler::*;
 pub use crate::compiler::preprocessor_cache::PreprocessorCacheEntry;
+#[cfg(feature = "dist-client")]
+pub(crate) use crate::compiler::remote::DistExecutor;
+pub use crate::compiler::remote::RemoteExecutor;
 pub(crate) use crate::compiler::rust::NO_CRATE_TYPE_PASSED;
 pub use crate::compiler::rust::is_rmeta_artifact_notification;
