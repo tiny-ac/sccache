@@ -246,10 +246,27 @@ fn auth_header(auth_token: Option<&str>) -> Result<Option<AsciiMetadataValue>> {
     }
 }
 
-/// `status`'s code and message, without its source: a transport error there can name the
-/// REAPI server's host.
+/// Error for a failed REAPI call. It keeps the status's code and message and drops the
+/// source, which can name the REAPI server's host.
+#[derive(Debug)]
+pub(crate) struct RpcError {
+    pub(crate) code: tonic::Code,
+    pub(crate) message: String,
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for RpcError {}
+
 pub(super) fn status_error(status: tonic::Status) -> Error {
-    anyhow!("{:?}: {}", status.code(), status.message())
+    Error::new(RpcError {
+        code: status.code(),
+        message: status.message().to_owned(),
+    })
 }
 
 /// `error` with each mention of `host` replaced, since rustls names the expected host when the
@@ -637,15 +654,17 @@ mod test {
     }
 
     #[test]
-    fn test_status_error_leaves_out_the_source() {
+    fn test_status_error_keeps_the_code_and_leaves_out_the_source() {
         let mut status = tonic::Status::unavailable("transport error");
         status.set_source(std::sync::Arc::new(std::io::Error::other(
             "certificate not valid for name reapi.example.com",
         )));
         assert!(status.to_string().contains("reapi.example.com"));
+        let e = status_error(status);
+        assert_eq!("Unavailable: transport error", e.to_string());
         assert_eq!(
-            "Unavailable: transport error",
-            status_error(status).to_string()
+            Some(tonic::Code::Unavailable),
+            e.downcast_ref::<RpcError>().map(|e| e.code)
         );
     }
 

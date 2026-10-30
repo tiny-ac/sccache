@@ -20,6 +20,8 @@ mod cas;
 mod client;
 mod connection;
 mod digest;
+#[cfg_attr(not(test), expect(dead_code, reason = "compiles don't execute yet"))]
+mod execution;
 mod executor;
 #[cfg(test)]
 mod fake;
