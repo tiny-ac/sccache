@@ -286,8 +286,12 @@ impl Cas {
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "Execute uploads through it"))]
 impl Cas {
+    /// Makes the next uploads look every blob up, after the CAS evicted some.
+    pub(crate) fn forget_present_blobs(&self) {
+        self.present_blobs.lock().unwrap().clear();
+    }
+
     fn is_known_present(&self, digest: &remexec::Digest) -> bool {
         // The CAS always has the empty blob.
         digest.size_bytes == 0 || self.present_blobs.lock().unwrap().contains(digest)

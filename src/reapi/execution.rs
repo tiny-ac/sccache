@@ -255,14 +255,14 @@ mod test {
     use super::*;
     use crate::reapi::digest;
     use crate::reapi::fake::{FakeServer, StreamBreak};
-    use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
     use test_case::test_case;
 
     /// A server whose workers write `out`.
     fn writing_server() -> FakeServer {
         FakeServer {
-            worker_outputs: [("out".to_owned(), b"x".to_vec())].into(),
+            worker_outputs: Mutex::new([("out".to_owned(), b"x".to_vec())].into()),
             ..Default::default()
         }
     }
