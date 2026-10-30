@@ -25,6 +25,7 @@
 use crate::errors::*;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
+use std::time::SystemTime;
 
 /// The input root's directory for files under the local build root.
 pub(super) const BUILD_ROOT_DIR: &str = ".sccache-build";
@@ -40,12 +41,48 @@ pub struct ReapiCompile {
     /// A worker passes it as an absolute path too, since rustc writes the crate root into its
     /// output as it was given.
     pub(crate) mapped_crate_root: Option<String>,
-    pub(crate) target_triple: String,
+    /// The toolchain whose files go into the input root.
+    pub(crate) toolchain: ToolchainKey,
     pub(crate) env: ActionEnv,
     /// Local paths of the files that go into the input root.
     pub(crate) input_root_files: Vec<PathBuf>,
     /// Local paths the compile writes.
     pub(crate) outputs: Vec<PathBuf>,
+}
+
+/// A local toolchain. Two rustcs can report the same commit and still have different files,
+/// so the key includes the sysroot, and the stamps of rustc, its libraries' directory and the
+/// target's std directory, which change when the toolchain is updated in place or gets a
+/// target added.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ToolchainKey {
+    pub(crate) commit_hash: String,
+    pub(crate) sysroot: PathBuf,
+    pub(crate) target_triple: String,
+    stamps: Vec<Option<(u64, SystemTime)>>,
+}
+
+impl ToolchainKey {
+    /// Reads the stamps, so call it from a blocking thread.
+    pub(crate) fn new(commit_hash: String, sysroot: PathBuf, target_triple: String) -> Self {
+        let stamps = [
+            sysroot.join("bin/rustc"),
+            sysroot.join("lib"),
+            sysroot.join("lib/rustlib").join(&target_triple).join("lib"),
+        ]
+        .iter()
+        .map(|path| {
+            let metadata = std::fs::metadata(path).ok()?;
+            Some((metadata.len(), metadata.modified().ok()?))
+        })
+        .collect();
+        ToolchainKey {
+            commit_hash,
+            sysroot,
+            target_triple,
+            stamps,
+        }
+    }
 }
 
 /// The environment a compile's action runs with.
@@ -92,6 +129,7 @@ impl From<CompileLocallyReason> for NotEligible {
 pub(crate) enum CompileLocallyReason {
     NotRust,
     RustcDriver,
+    NoCommitHash,
     WindowsPaths,
     Staticlib,
     UnexpectedCargoLayout,
@@ -119,6 +157,7 @@ impl std::fmt::Display for CompileLocallyReason {
         f.write_str(match self {
             Self::NotRust => "not a Rust compile",
             Self::RustcDriver => "not rustc",
+            Self::NoCommitHash => "rustc without a commit hash",
             Self::WindowsPaths => "Windows paths",
             Self::Staticlib => "staticlib crate type",
             Self::UnexpectedCargoLayout => "unexpected cargo dir layout",
@@ -300,6 +339,30 @@ pub(crate) fn lexically_normalize(path: &Path) -> PathBuf {
 mod test {
     use super::*;
     use test_case::test_case;
+
+    #[test]
+    fn test_a_toolchain_key_changes_with_rustc_and_a_new_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let sysroot = dir.path().to_owned();
+        std::fs::create_dir_all(sysroot.join("bin")).unwrap();
+        std::fs::write(sysroot.join("bin/rustc"), b"rustc 1").unwrap();
+        let key = || {
+            ToolchainKey::new(
+                "abc123".to_owned(),
+                sysroot.clone(),
+                "wasm32-unknown-unknown".to_owned(),
+            )
+        };
+        let original = key();
+        assert_eq!(original, key());
+
+        std::fs::write(sysroot.join("bin/rustc"), b"rustc 1.1").unwrap();
+        let updated = key();
+        assert_ne!(original, updated, "rustc changed");
+
+        std::fs::create_dir_all(sysroot.join("lib/rustlib/wasm32-unknown-unknown/lib")).unwrap();
+        assert_ne!(updated, key(), "target added");
+    }
 
     fn path_mapper() -> PathMapper {
         PathMapper::new("/ws".into(), "/ws/target".into())

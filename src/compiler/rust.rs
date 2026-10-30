@@ -396,6 +396,9 @@ pub struct RustCompilation {
     host: String,
     /// The sysroot for this rustc
     sysroot: PathBuf,
+    /// The `commit-hash` in `rustc -vV`.
+    #[cfg(feature = "reapi")]
+    commit_hash: Option<String>,
     /// The `--print=target-libdir` of this rustc, i.e. `$libdir/rustlib/$target/lib`.
     #[cfg(feature = "dist-client")]
     target_libdir: PathBuf,
@@ -2047,6 +2050,8 @@ where
                 env_deps,
                 host: self.host.clone(),
                 sysroot: self.sysroot.clone(),
+                #[cfg(feature = "reapi")]
+                commit_hash: reapi_mapping::parse_commit_hash(&self.version),
                 #[cfg(feature = "dist-client")]
                 target_libdir: self.target_libdir.clone(),
                 arguments,
@@ -2302,7 +2307,7 @@ mod reapi_mapping {
     use super::*;
     use crate::compiler::remote::{LocalArg, LocalCompileChanges};
     use crate::reapi::{
-        ActionEnv, CompileLocallyReason, NotEligible, PathMapper, ReapiCompile,
+        ActionEnv, CompileLocallyReason, NotEligible, PathMapper, ReapiCompile, ToolchainKey,
         lexically_normalize, sysroot_copy,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2326,7 +2331,22 @@ mod reapi_mapping {
                 anyhow!("{}", compilation.executable.display()),
             ));
         }
-        mapped_compile(compilation, path_mapper(compilation)?)
+        // Without a commit hash, an updated rustc in the same sysroot can't be told apart
+        // from the old one.
+        let Some(commit_hash) = compilation.commit_hash.clone() else {
+            return Err(CompileLocallyReason::NoCommitHash.into());
+        };
+        mapped_compile(compilation, path_mapper(compilation)?, commit_hash)
+    }
+
+    /// The commit hash in `rustc -vV` output, or `None` for a rustc built without git
+    /// information, which prints `unknown`.
+    pub(super) fn parse_commit_hash(version: &str) -> Option<String> {
+        version
+            .lines()
+            .find_map(|line| line.strip_prefix("commit-hash: "))
+            .filter(|hash| *hash != "unknown")
+            .map(str::to_owned)
     }
 
     /// Arguments that make `compilation`'s local compile write the same outputs as a
@@ -2454,6 +2474,7 @@ mod reapi_mapping {
     fn mapped_compile(
         compilation: &RustCompilation,
         path_mapper: PathMapper,
+        commit_hash: String,
     ) -> std::result::Result<ReapiCompile, NotEligible> {
         // A staticlib bundles the object code of every dependency and of std, which the
         // input root doesn't hold.
@@ -2611,7 +2632,7 @@ mod reapi_mapping {
             path_mapper,
             arguments,
             mapped_crate_root,
-            target_triple,
+            toolchain: ToolchainKey::new(commit_hash, compilation.sysroot.clone(), target_triple),
             env,
             input_root_files,
             outputs,
@@ -5330,7 +5351,7 @@ foo.rs:
         use super::*;
         use crate::compiler::remote::LocalCompileChanges;
         use crate::compiler::rust::reapi_mapping::{
-            deps_dir_base, map_for_reapi, reapi_local_compile_changes,
+            deps_dir_base, map_for_reapi, parse_commit_hash, reapi_local_compile_changes,
         };
         use crate::reapi::{CompileLocallyReason, ReapiCompile};
         use std::os::unix::ffi::OsStringExt;
@@ -5374,6 +5395,7 @@ foo.rs:
                 env_deps: vec![],
                 host: HOST.to_owned(),
                 sysroot: "/toolchain".into(),
+                commit_hash: Some("abc123".to_owned()),
                 #[cfg(feature = "dist-client")]
                 target_libdir: format!("/toolchain/lib/rustlib/{HOST}/lib").into(),
                 #[cfg(any(feature = "dist-client", feature = "reapi"))]
@@ -5763,12 +5785,12 @@ foo.rs:
         #[test]
         fn test_passes_the_target_triple() {
             let compile = map_for_reapi(&compilation(&[])).unwrap();
-            assert_eq!(HOST, compile.target_triple);
+            assert_eq!(HOST, compile.toolchain.target_triple);
             assert!(compile.arguments.contains(&format!("--target={HOST}")));
 
             let compile =
                 map_for_reapi(&compilation(&["--target", "aarch64-unknown-linux-gnu"])).unwrap();
-            assert_eq!("aarch64-unknown-linux-gnu", compile.target_triple);
+            assert_eq!("aarch64-unknown-linux-gnu", compile.toolchain.target_triple);
             assert!(!compile.arguments.contains(&format!("--target={HOST}")));
             assert!(
                 compile
@@ -5835,6 +5857,13 @@ foo.rs:
             );
         }
 
+        #[test_case("rustc 1.91.0\ncommit-hash: abc123\nhost: x\n", Some("abc123") ; "release")]
+        #[test_case("rustc 1.91.0-dev\ncommit-hash: unknown\n", None ; "built without git")]
+        #[test_case("rustc 1.91.0\n", None ; "no commit-hash line")]
+        fn test_parse_commit_hash(version: &str, expected: Option<&str>) {
+            assert_eq!(expected.map(str::to_owned), parse_commit_hash(version));
+        }
+
         #[test_case(compilation(&["-C", "target-cpu=x86-64-v3"]) ; "named target cpu")]
         #[test_case(compilation(&["-C", "linker=/usr/bin/clang"]) ; "absolute linker")]
         #[test_case(compilation(&["-C", "link-arg=/opt/lib/crt0.o"]) ; "absolute link arg")]
@@ -5846,6 +5875,11 @@ foo.rs:
             CompileLocallyReason::RustcDriver,
             with(compilation(&[]), |c| c.executable = "/toolchain/bin/clippy-driver".into()) ;
             "clippy driver"
+        )]
+        #[test_case(
+            CompileLocallyReason::NoCommitHash,
+            with(compilation(&[]), |c| c.commit_hash = None) ;
+            "no commit hash"
         )]
         #[test_case(
             CompileLocallyReason::Staticlib,

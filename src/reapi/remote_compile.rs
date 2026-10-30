@@ -527,7 +527,7 @@ fn exit_status_from_code(exit_code: u8) -> process::ExitStatus {
 mod test {
     use super::*;
     use crate::reapi::fake::FakeServer;
-    use crate::reapi::{ActionEnv, PathMapper};
+    use crate::reapi::{ActionEnv, PathMapper, ToolchainKey};
     use std::sync::Arc;
     use test_case::test_case;
 
@@ -540,7 +540,11 @@ mod test {
             path_mapper: PathMapper::new(cwd.into(), format!("{cwd}/target").into()),
             arguments: vec!["--crate-name=foo".to_owned()],
             mapped_crate_root: Some("src/lib.rs".to_owned()),
-            target_triple: "x86_64-unknown-linux-gnu".to_owned(),
+            toolchain: ToolchainKey::new(
+                "abc123".to_owned(),
+                "/toolchain".into(),
+                "x86_64-unknown-linux-gnu".to_owned(),
+            ),
             env: ActionEnv {
                 vars: vec![
                     ("CARGO_PKG_VERSION".to_owned(), "1.0.0".to_owned()),
