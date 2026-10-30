@@ -50,9 +50,9 @@ pub(super) struct Toolchains {
 }
 
 impl Toolchains {
-    pub(super) fn new(digest_cache: DigestCache) -> Arc<Self> {
+    pub(super) fn new(digest_cache: Arc<DigestCache>) -> Arc<Self> {
         Arc::new(Toolchains {
-            digest_cache: Arc::new(digest_cache),
+            digest_cache,
             states: Default::default(),
             hash_attempts_ended: watch::Sender::new(0),
             retry_after: RETRY_AFTER,
@@ -162,7 +162,7 @@ mod test {
 
     fn toolchains(dir: &Path, retry_after: Duration) -> Arc<Toolchains> {
         let digest_cache = DigestCache::load(dir.join("digests.json")).caching_new_files();
-        let toolchains = Toolchains::new(digest_cache);
+        let toolchains = Toolchains::new(Arc::new(digest_cache));
         Arc::new(Toolchains {
             retry_after,
             ..Arc::into_inner(toolchains).unwrap()
