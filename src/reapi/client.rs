@@ -24,6 +24,21 @@ use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(super) const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+/// Tries after the first for a call that a busy or restarting server refused.
+pub(super) const RETRIES: u32 = 2;
+/// The wait before the first retry, doubled before the next. Short in tests.
+const RETRY_BACKOFF: Duration = if cfg!(test) {
+    Duration::from_millis(1)
+} else {
+    Duration::from_millis(200)
+};
+/// A call that took longer to fail isn't tried again: a busy server answers at once, while a
+/// server that can't be reached takes the connect timeout to fail each time. Short in tests.
+const RETRIED_FAILURE_MAX: Duration = if cfg!(test) {
+    Duration::from_millis(200)
+} else {
+    Duration::from_secs(1)
+};
 // TCP keepalive, since grpc-go and grpc-java servers close connections that send
 // HTTP/2 pings more often than every five minutes.
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
@@ -66,6 +81,35 @@ impl Interceptor for AuthInterceptor {
         }
         Ok(request)
     }
+}
+
+/// Runs `call`, and again up to [`RETRIES`] times while it fails within
+/// [`RETRIED_FAILURE_MAX`] with UNAVAILABLE or RESOURCE_EXHAUSTED, which a busy or
+/// restarting server answers.
+pub(super) async fn with_retries<T, F, U>(mut call: F) -> Result<T>
+where
+    F: FnMut() -> U,
+    U: Future<Output = Result<T>>,
+{
+    let mut backoff = RETRY_BACKOFF;
+    for _ in 0..RETRIES {
+        let started = tokio::time::Instant::now();
+        match call().await {
+            Err(e)
+                if started.elapsed() <= RETRIED_FAILURE_MAX
+                    && matches!(
+                        rpc_code(&e),
+                        Some(tonic::Code::Unavailable | tonic::Code::ResourceExhausted)
+                    ) =>
+            {
+                debug!("REAPI: {e:#}; trying again in {backoff:?}");
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+            result => return result,
+        }
+    }
+    call().await
 }
 
 /// Adds `description` to the error if `future` fails or takes longer than `timeout`.
@@ -389,6 +433,7 @@ mod test {
     use super::*;
     use crate::reapi::proto::build::bazel::semver::SemVer;
     use remexec::capabilities_server::{Capabilities, CapabilitiesServer};
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
     use test_case::test_case;
     use tokio::net::TcpListener;
@@ -720,6 +765,55 @@ mod test {
         let e = status_error(status);
         assert_eq!("Unavailable: transport error", e.to_string());
         assert_eq!(Some(tonic::Code::Unavailable), rpc_code(&e));
+    }
+
+    #[test_case(tonic::Code::Unavailable, RETRIES + 1 ; "unavailable")]
+    #[test_case(tonic::Code::ResourceExhausted, RETRIES + 1 ; "resource exhausted")]
+    #[test_case(tonic::Code::Internal, 1 ; "internal")]
+    #[test_case(tonic::Code::NotFound, 1 ; "not found")]
+    #[test_case(tonic::Code::Unauthenticated, 1 ; "unauthenticated")]
+    #[test_case(tonic::Code::PermissionDenied, 1 ; "permission denied")]
+    #[tokio::test]
+    async fn test_only_unavailable_and_resource_exhausted_are_tried_again(
+        code: tonic::Code,
+        tries: u32,
+    ) {
+        let calls = &AtomicU32::new(0);
+        let e = with_retries(|| async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(status_error(tonic::Status::new(code, "no")))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(Some(code), rpc_code(&e));
+        assert_eq!(tries, calls.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_a_slow_failure_is_not_tried_again() {
+        let calls = &AtomicU32::new(0);
+        with_retries(|| async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(RETRIED_FAILURE_MAX + Duration::from_millis(50)).await;
+            Err::<(), _>(status_error(tonic::Status::unavailable("unreachable")))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(1, calls.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_a_call_the_server_answers_on_a_retry_succeeds() {
+        let calls = &AtomicU32::new(0);
+        let answer = with_retries(|| async move {
+            if calls.fetch_add(1, Ordering::SeqCst) < RETRIES {
+                return Err(status_error(tonic::Status::unavailable("busy")));
+            }
+            Ok("answer")
+        })
+        .await
+        .unwrap();
+        assert_eq!("answer", answer);
     }
 
     #[test]
