@@ -15,7 +15,7 @@
 //! A Rust compile's REAPI command and toolchain files, and writing an action result's
 //! output files to their local paths.
 
-use super::cas::Cas;
+use super::cas::{Blob, Cas};
 use super::digest::{self, DigestCache};
 use super::input_root::{InputRoot, InputRootFile};
 use super::mapping::{BUILD_ROOT_DIR, CompileLocallyReason, ReapiCompile, TOOLCHAIN_DIR};
@@ -115,7 +115,7 @@ fn command_output_paths(compile: &ReapiCompile) -> impl Iterator<Item = String> 
 pub(super) fn digest_input_root_files(
     compile: &ReapiCompile,
     digest_cache: &DigestCache,
-) -> Result<Vec<InputRootFile>> {
+) -> Result<Vec<(InputRootFile, PathBuf)>> {
     compile
         .input_root_files
         .iter()
@@ -124,11 +124,12 @@ pub(super) fn digest_input_root_files(
                 .path_mapper
                 .to_input_root(local_path)
                 .with_context(|| format!("{} is outside the input root", local_path.display()))?;
-            Ok(InputRootFile {
+            let file = InputRootFile {
                 path,
                 digest: digest_cache.digest(local_path)?,
                 is_executable: false,
-            })
+            };
+            Ok((file, local_path.clone()))
         })
         .collect()
 }
@@ -184,16 +185,42 @@ fn build_action(
     (command, action)
 }
 
-/// The digest of the action that runs `compile` on `files` and `toolchain`'s files.
-pub(super) fn action_digest(
+/// The digest of an action, and every blob it needs: its input files, the directories of
+/// its input root, its command and itself.
+pub(super) struct ActionBlobs {
+    pub(super) action_digest: remexec::Digest,
+    #[cfg_attr(not(test), expect(dead_code, reason = "compiles don't execute yet"))]
+    pub(super) blobs: Vec<(remexec::Digest, Blob)>,
+}
+
+/// The [`ActionBlobs`] of the action that runs `compile` on `files` and `toolchain`'s files.
+pub(super) fn action_blobs(
     compile: &ReapiCompile,
-    files: &[InputRootFile],
+    files: &[(InputRootFile, PathBuf)],
     toolchain: &[(InputRootFile, PathBuf)],
     options: &ActionOptions,
-) -> Result<remexec::Digest> {
-    let input_root = InputRoot::build(files.iter().chain(toolchain.iter().map(|(file, _)| file)))?;
-    let (_, action) = build_action(compile, input_root.digest, options);
-    Ok(digest::of_bytes(&action.encode_to_vec()))
+) -> Result<ActionBlobs> {
+    let all_files = files.iter().chain(toolchain);
+    let input_root = InputRoot::build(all_files.clone().map(|(file, _)| file))?;
+    let (command, action) = build_action(compile, input_root.digest, options);
+    let command_bytes = command.encode_to_vec();
+    let action_bytes = action.encode_to_vec();
+    let action_digest = digest::of_bytes(&action_bytes);
+    let mut blobs: Vec<(remexec::Digest, Blob)> = all_files
+        .map(|(file, local_path)| (file.digest.clone(), Blob::File(local_path.clone())))
+        .collect();
+    blobs.extend(
+        input_root
+            .directories
+            .into_iter()
+            .map(|(digest, bytes)| (digest, Blob::Bytes(bytes))),
+    );
+    blobs.push((digest::of_bytes(&command_bytes), Blob::Bytes(command_bytes)));
+    blobs.push((action_digest.clone(), Blob::Bytes(action_bytes)));
+    Ok(ActionBlobs {
+        action_digest,
+        blobs,
+    })
 }
 
 fn is_identifier(name: &str) -> bool {
@@ -720,6 +747,16 @@ pub(super) mod test {
         change: fn(&mut ReapiCompile),
         options: &ActionOptions,
     ) -> remexec::Digest {
+        action_blobs_in(dir, lib_rs, sysroot, change, options).action_digest
+    }
+
+    fn action_blobs_in(
+        dir: &Path,
+        lib_rs: &str,
+        sysroot: &Path,
+        change: fn(&mut ReapiCompile),
+        options: &ActionOptions,
+    ) -> ActionBlobs {
         let cwd = dir.join("ws");
         let lib_rs_path = cwd.join("src/lib.rs");
         std::fs::create_dir_all(lib_rs_path.parent().unwrap()).unwrap();
@@ -731,7 +768,44 @@ pub(super) mod test {
         let files = digest_input_root_files(&compile, &digest_cache).unwrap();
         let toolchain =
             toolchain_files(sysroot, "x86_64-unknown-linux-gnu", &digest_cache).unwrap();
-        action_digest(&compile, &files, &toolchain, options).unwrap()
+        action_blobs(&compile, &files, &toolchain, options).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_the_action_blobs_hold_every_blob_the_action_needs() {
+        let dir = tempfile::tempdir().unwrap();
+        let sysroot = fake_sysroot(&dir.path().join("sysroot"));
+        let action_blobs = action_blobs_in(
+            dir.path(),
+            "pub fn f() {}",
+            &sysroot,
+            |_| {},
+            &ActionOptions::default(),
+        );
+        let blobs: std::collections::HashMap<_, _> = action_blobs.blobs.into_iter().collect();
+        let read = |digest: &remexec::Digest| {
+            let bytes = match &blobs[digest] {
+                Blob::Bytes(bytes) => bytes.clone(),
+                Blob::File(path) => std::fs::read(path).unwrap(),
+            };
+            assert_eq!(*digest, digest::of_bytes(&bytes));
+            bytes
+        };
+        let action = remexec::Action::decode(read(&action_blobs.action_digest).as_slice()).unwrap();
+        remexec::Command::decode(read(action.command_digest.as_ref().unwrap()).as_slice()).unwrap();
+        let mut directories = vec![action.input_root_digest.unwrap()];
+        let mut file_names = vec![];
+        while let Some(digest) = directories.pop() {
+            let directory = remexec::Directory::decode(read(&digest).as_slice()).unwrap();
+            for file in directory.files {
+                read(file.digest.as_ref().unwrap());
+                file_names.push(file.name);
+            }
+            directories.extend(directory.directories.into_iter().map(|d| d.digest.unwrap()));
+        }
+        assert!(file_names.contains(&"lib.rs".to_owned()), "{file_names:?}");
+        assert!(file_names.contains(&"rustc".to_owned()), "{file_names:?}");
     }
 
     #[cfg(unix)]
