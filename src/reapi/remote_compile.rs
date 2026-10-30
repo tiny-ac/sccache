@@ -14,8 +14,12 @@
 
 //! A Rust compile's REAPI command and toolchain files.
 
+use super::digest::DigestCache;
+use super::input_root::InputRootFile;
 use super::mapping::{BUILD_ROOT_DIR, ReapiCompile, TOOLCHAIN_DIR};
 use super::proto::build::bazel::remote::execution::v2 as remexec;
+use crate::errors::*;
+use std::path::{Path, PathBuf};
 
 /// Starts the stderr line where the worker reports the worker root.
 const WORKER_ROOT_MARKER: &str = "sccache-reapi-pwd:";
@@ -106,6 +110,73 @@ fn is_identifier(name: &str) -> bool {
 
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// rustc, its shared libraries, and `target_triple`'s std and bundled linker from
+/// `sysroot`, as input root files under [`TOOLCHAIN_DIR`] paired with their local paths.
+pub(super) fn toolchain_files(
+    sysroot: &Path,
+    target_triple: &str,
+    digest_cache: &DigestCache,
+) -> Result<Vec<(InputRootFile, PathBuf)>> {
+    let mut files = vec![];
+    let mut add = |local_path: PathBuf, is_executable: bool| -> Result<()> {
+        let path_in_sysroot = local_path
+            .strip_prefix(sysroot)
+            .with_context(|| format!("{} outside {}", local_path.display(), sysroot.display()))?
+            .to_str()
+            .with_context(|| format!("non-UTF-8 toolchain path {}", local_path.display()))?
+            .to_owned();
+        // A symlink becomes a file with its destination's contents, which the CAS stores once.
+        let digest = digest_cache.digest_and_pin(&local_path)?;
+        let file = InputRootFile {
+            path: format!("{TOOLCHAIN_DIR}/{path_in_sysroot}"),
+            digest,
+            is_executable,
+        };
+        files.push((file, local_path));
+        Ok(())
+    };
+    let rustc = sysroot.join("bin/rustc");
+    if !rustc.is_file() {
+        bail!("no rustc in {}", sysroot.display());
+    }
+    add(rustc, true)?;
+    // rustc's own shared libraries; the sanitizer runtimes next to them aren't needed to compile.
+    let lib_dir = sysroot.join("lib");
+    let listing_context = || format!("failed to list {}", lib_dir.display());
+    for entry in std::fs::read_dir(&lib_dir).with_context(listing_context)? {
+        let path = entry.with_context(listing_context)?.path();
+        let is_rustc_library = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("librustc_driver") || n.starts_with("libLLVM"));
+        if path.is_file() && is_rustc_library {
+            add(path, false)?;
+        }
+    }
+    let target_triple_dir = sysroot.join("lib/rustlib").join(target_triple);
+    let std_dir = target_triple_dir.join("lib");
+    if !std_dir.is_dir() {
+        bail!("{} has no std for {target_triple}", sysroot.display());
+    }
+    for entry in walkdir::WalkDir::new(&std_dir).follow_links(true) {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            add(entry.into_path(), false)?;
+        }
+    }
+    // rust-lld, the default linker for some target triples, such as x86_64-unknown-linux-gnu.
+    let linker_dir = target_triple_dir.join("bin");
+    if linker_dir.is_dir() {
+        for entry in walkdir::WalkDir::new(&linker_dir).follow_links(true) {
+            let entry = entry?;
+            if entry.file_type().is_file() {
+                add(entry.into_path(), true)?;
+            }
+        }
+    }
+    Ok(files)
 }
 
 #[cfg(test)]
@@ -226,5 +297,90 @@ mod test {
     #[test]
     fn test_sh_quote() {
         assert_eq!(r"'it'\''s'", sh_quote("it's"));
+    }
+
+    /// A sysroot in `dir` with rustc, its libraries, a sanitizer runtime, and std and
+    /// rust-lld for x86_64-unknown-linux-gnu.
+    fn fake_sysroot(dir: &Path) -> PathBuf {
+        let sysroot = dir.join("sysroot");
+        for path in [
+            "bin/rustc",
+            "lib/librustc_driver-x.so",
+            "lib/libLLVM.so.1",
+            "lib/librustc-stable_rt.asan.so",
+            "lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd-x.rlib",
+            "lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld",
+        ] {
+            let path = sysroot.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, path.to_str().unwrap()).unwrap();
+        }
+        sysroot
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_toolchain_files_are_rustc_its_libraries_std_and_linker() {
+        let dir = tempfile::tempdir().unwrap();
+        let sysroot = fake_sysroot(dir.path());
+        let target_triple_dir = "lib/rustlib/x86_64-unknown-linux-gnu";
+        // A std file symlinked from outside the sysroot.
+        let linked = dir.path().join("store/libcore-x.rlib");
+        std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+        std::fs::write(&linked, b"core").unwrap();
+        std::os::unix::fs::symlink(
+            &linked,
+            sysroot.join(target_triple_dir).join("lib/libcore-x.rlib"),
+        )
+        .unwrap();
+        let digest_cache = DigestCache::load(dir.path().join("digests"));
+
+        let mut files: Vec<(String, bool)> =
+            toolchain_files(&sysroot, "x86_64-unknown-linux-gnu", &digest_cache)
+                .unwrap()
+                .into_iter()
+                .map(|(file, _)| (file.path, file.is_executable))
+                .collect();
+        files.sort();
+        let expected = [
+            (".sccache-toolchain/bin/rustc".to_owned(), true),
+            (".sccache-toolchain/lib/libLLVM.so.1".to_owned(), false),
+            (
+                ".sccache-toolchain/lib/librustc_driver-x.so".to_owned(),
+                false,
+            ),
+            (
+                format!(".sccache-toolchain/{target_triple_dir}/bin/rust-lld"),
+                true,
+            ),
+            (
+                format!(".sccache-toolchain/{target_triple_dir}/lib/libcore-x.rlib"),
+                false,
+            ),
+            (
+                format!(".sccache-toolchain/{target_triple_dir}/lib/libstd-x.rlib"),
+                false,
+            ),
+        ];
+        assert_eq!(expected.as_slice(), files.as_slice());
+    }
+
+    #[test]
+    fn test_a_sysroot_without_the_targets_std_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let sysroot = fake_sysroot(dir.path());
+        let digest_cache = DigestCache::load(dir.path().join("digests"));
+        let e = toolchain_files(&sysroot, "aarch64-apple-darwin", &digest_cache).unwrap_err();
+        assert!(e.to_string().contains("has no std"), "{e:#}");
+    }
+
+    #[test]
+    fn test_a_sysroot_without_rustc_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let sysroot = fake_sysroot(dir.path());
+        std::fs::remove_file(sysroot.join("bin/rustc")).unwrap();
+        let digest_cache = DigestCache::load(dir.path().join("digests"));
+        let e = toolchain_files(&sysroot, "x86_64-unknown-linux-gnu", &digest_cache).unwrap_err();
+        assert!(e.to_string().contains("no rustc"), "{e:#}");
     }
 }
