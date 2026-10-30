@@ -33,6 +33,8 @@ const TCP_KEEPALIVE_RETRIES: u32 = 3;
 const REQUIRED_API_MAJOR_VERSION: i32 = 2;
 /// v2.1 added `Command.output_paths`, the only output field sccache's commands set.
 const MIN_API_MINOR_VERSION: i32 = 1;
+/// Used when the server doesn't advertise a batch limit.
+const DEFAULT_MAX_BATCH_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Default)]
 pub(crate) struct ConnectOptions {
@@ -104,6 +106,7 @@ impl std::fmt::Display for CredentialsRefused {
 pub(crate) struct Client {
     instance_name: String,
     channel: AuthChannel,
+    max_batch_bytes: usize,
     supports_zstd_bytestream: bool,
 }
 
@@ -187,10 +190,18 @@ impl Client {
         let supports_zstd_bytestream = cache_capabilities
             .supported_compressors
             .contains(&(remexec::compressor::Value::Zstd as i32));
-        info!("REAPI: connected (zstd ByteStream: {supports_zstd_bytestream})");
+        let max_batch_bytes = match usize::try_from(cache_capabilities.max_batch_total_size_bytes) {
+            Ok(max_batch_bytes) if max_batch_bytes > 0 => max_batch_bytes,
+            _ => DEFAULT_MAX_BATCH_BYTES,
+        };
+        info!(
+            "REAPI: connected (zstd ByteStream: {supports_zstd_bytestream}, \
+             max batch: {max_batch_bytes} bytes)"
+        );
         Ok(Client {
             instance_name: options.instance_name.clone(),
             channel,
+            max_batch_bytes,
             supports_zstd_bytestream,
         })
     }
@@ -202,6 +213,10 @@ impl Client {
     /// A clone of the channel; every clone shares one connection.
     pub(crate) fn channel(&self) -> AuthChannel {
         self.channel.clone()
+    }
+
+    pub(crate) fn max_batch_bytes(&self) -> usize {
+        self.max_batch_bytes
     }
 
     pub(crate) fn supports_zstd_bytestream(&self) -> bool {
@@ -414,10 +429,11 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_connect_sends_instance_name_and_detects_zstd() {
+    async fn test_connect_sends_instance_name_and_reads_capabilities() {
         let fake = FakeCapabilities {
             capabilities: remexec::ServerCapabilities {
                 cache_capabilities: Some(remexec::CacheCapabilities {
+                    max_batch_total_size_bytes: 4 * 1024 * 1024,
                     supported_compressors: vec![remexec::compressor::Value::Zstd as i32],
                     ..Default::default()
                 }),
@@ -436,13 +452,15 @@ mod test {
         .await
         .unwrap();
         assert_eq!(vec!["main".to_owned()], *instance_names.lock().unwrap());
+        assert_eq!(4 * 1024 * 1024, client.max_batch_bytes());
         assert!(client.supports_zstd_bytestream());
     }
 
     #[tokio::test]
-    async fn test_server_without_zstd_does_not_support_zstd_bytestream() {
+    async fn test_connect_defaults_what_the_server_doesnt_advertise() {
         let endpoint = serve_fake(FakeCapabilities::default()).await;
         let client = Client::connect(&connect_options(&endpoint)).await.unwrap();
+        assert_eq!(DEFAULT_MAX_BATCH_BYTES, client.max_batch_bytes());
         assert!(!client.supports_zstd_bytestream());
     }
 
