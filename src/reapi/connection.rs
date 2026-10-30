@@ -34,8 +34,8 @@ pub(super) struct ServerApis {
     pub(super) action_cache: ActionCache,
     /// `None` for a server that doesn't execute actions.
     pub(super) execution: Option<Execution>,
-    /// The version of the auth token when sccache connected.
-    token_version: u64,
+    /// The version of the credentials when sccache connected.
+    credentials_version: u64,
 }
 
 enum State {
@@ -44,10 +44,11 @@ enum State {
     Connected(Arc<ServerApis>),
     ConnectFailed {
         retry_at: Instant,
+        reason: CompileLocallyReason,
     },
     /// Compiles run locally until the sccache server restarts, or, for refused credentials,
-    /// until the auth token changes, since retrying with the same server and the same token
-    /// can't succeed.
+    /// until the credentials change, since retrying with the same server and the same
+    /// credentials can't succeed.
     Refused(CompileLocallyReason),
 }
 
@@ -56,8 +57,8 @@ pub(super) struct Connection {
     state: tokio::sync::Mutex<State>,
     failures_in_a_row: AtomicU32,
     attempts_ended: watch::Sender<u64>,
-    /// The version of the auth token the server last refused, on a call or when connecting.
-    refused_token_version: std::sync::Mutex<Option<u64>>,
+    /// The version of the credentials the server last refused, on a call or when connecting.
+    refused_credentials_version: std::sync::Mutex<Option<u64>>,
 }
 
 impl Connection {
@@ -67,7 +68,7 @@ impl Connection {
             state: tokio::sync::Mutex::new(State::NotConnected),
             failures_in_a_row: AtomicU32::new(0),
             attempts_ended: watch::Sender::new(0),
-            refused_token_version: Default::default(),
+            refused_credentials_version: Default::default(),
         })
     }
 
@@ -84,20 +85,29 @@ impl Connection {
         }
         loop {
             {
-                let token_version = self.token_version();
+                let credentials_version = self.credentials_version();
                 let mut state = self.state.lock().await;
                 match &*state {
-                    State::Connected(apis) => return Ok(apis.clone()),
+                    State::Connected(apis) => {
+                        self.renew_helper_headers_in_background();
+                        return Ok(apis.clone());
+                    }
                     State::Refused(CompileLocallyReason::CredentialsRefused)
-                        if *self.refused_token_version.lock().unwrap() != Some(token_version) =>
+                        if *self.refused_credentials_version.lock().unwrap()
+                            != Some(credentials_version) =>
                     {
-                        info!("REAPI: the auth token changed; connecting again");
+                        info!("REAPI: the credentials changed; connecting again");
                         *state = State::Connecting;
                         self.spawn_connect();
                     }
-                    State::Refused(reason) => return Err(*reason),
-                    State::ConnectFailed { retry_at } if Instant::now() < *retry_at => {
-                        return Err(CompileLocallyReason::ConnectFailed);
+                    State::Refused(reason) => {
+                        if *reason == CompileLocallyReason::CredentialsRefused {
+                            self.renew_helper_headers_in_background();
+                        }
+                        return Err(*reason);
+                    }
+                    State::ConnectFailed { retry_at, reason } if Instant::now() < *retry_at => {
+                        return Err(*reason);
                     }
                     State::Connecting => {}
                     State::NotConnected | State::ConnectFailed { .. } => {
@@ -118,34 +128,36 @@ impl Connection {
     }
 
     /// For a server that refused the credentials on a call through `apis`. The first time for
-    /// a token, the next compile connects again, and GetCapabilities decides, as at the first
-    /// connect, since a proxy may refuse a call once. The second time, every compile runs
-    /// locally until the sccache server restarts or the token changes.
+    /// some credentials, the next compile connects again, and GetCapabilities decides, as at
+    /// the first connect, since a proxy may refuse a call once. The second time, every compile
+    /// runs locally until the sccache server restarts or the credentials change.
     pub(super) async fn credentials_refused(&self, apis: &Arc<ServerApis>) {
         let mut state = self.state.lock().await;
         // A call through an earlier connection says nothing about the current one.
         if !matches!(&*state, State::Connected(current) if Arc::ptr_eq(current, apis)) {
             return;
         }
-        let token_version = self.token_version();
-        if apis.token_version != token_version {
-            // The call may have carried the earlier token; the new one gets its own check.
-            info!("REAPI: the server refused the credentials; connecting again with the new token");
+        let credentials_version = self.credentials_version();
+        if apis.credentials_version != credentials_version {
+            // The call may have carried the earlier credentials; the new ones get their own
+            // check.
+            info!("REAPI: the server refused the credentials; connecting again with the new ones");
             *state = State::NotConnected;
             return;
         }
-        let mut refused_token_version = self.refused_token_version.lock().unwrap();
-        if *refused_token_version == Some(token_version) {
+        let mut refused_credentials_version = self.refused_credentials_version.lock().unwrap();
+        if *refused_credentials_version == Some(credentials_version) {
             warn!(
                 "REAPI: the server refused the credentials again; compiling locally until the \
-                 sccache server restarts or the auth token changes"
+                 sccache server restarts or the credentials change"
             );
             *state = State::Refused(CompileLocallyReason::CredentialsRefused);
         } else {
             warn!("REAPI: the server refused the credentials; connecting again to check them");
-            *refused_token_version = Some(token_version);
+            *refused_credentials_version = Some(credentials_version);
             *state = State::NotConnected;
         }
+        self.expire_helper_headers();
     }
 
     fn spawn_connect(self: &Arc<Self>) {
@@ -157,23 +169,47 @@ impl Connection {
                     if e.is_panic() {
                         warn!("REAPI: connecting panicked: {e}");
                     }
-                    this.connect_failed()
+                    this.connect_failed(CompileLocallyReason::ConnectFailed)
                 });
             *this.state.lock().await = state;
             this.attempts_ended.send_modify(|count| *count += 1);
         });
     }
 
-    /// How many times the auth token changed; 0 without one.
-    fn token_version(&self) -> u64 {
-        self.options
-            .auth_token
-            .as_ref()
-            .map_or(0, |auth_token| auth_token.version())
+    /// How many times the auth token or the credential helper's headers changed; 0 without
+    /// either. Only one of them can be configured, so the sum counts the changes of that one.
+    fn credentials_version(&self) -> u64 {
+        let auth_token = self.options.auth_token.as_ref();
+        let credential_helper = self.options.credential_helper.as_ref();
+        auth_token.map_or(0, |auth_token| auth_token.version())
+            + credential_helper.map_or(0, |credential_helper| credential_helper.version())
+    }
+
+    /// Runs the credential helper in the background if its headers are due. While sccache
+    /// isn't connected, `connect` runs it instead.
+    fn renew_helper_headers_in_background(&self) {
+        if let Some(credential_helper) = &self.options.credential_helper {
+            drop(credential_helper.renew_in_background());
+        }
+    }
+
+    /// Makes the credential helper run again before the next connect, since the server
+    /// refused the headers it printed. A connect may have used headers it didn't renew.
+    fn expire_helper_headers(&self) {
+        if let Some(credential_helper) = &self.options.credential_helper {
+            credential_helper.expire();
+        }
     }
 
     async fn connect(self: Arc<Self>) -> State {
-        let token_version = self.token_version();
+        if let Some(credential_helper) = &self.options.credential_helper
+            && let Err(e) = credential_helper.renew().await
+        {
+            let state = self.connect_failed(CompileLocallyReason::CredentialHelperFailed);
+            warn!("REAPI: {e:#}; compiling locally for {:?}", self.backoff());
+            return state;
+        }
+        let credentials_version = self.credentials_version();
         match Client::connect(&self.options).await {
             Ok(client) => {
                 self.failures_in_a_row.store(0, Ordering::Relaxed);
@@ -181,7 +217,7 @@ impl Connection {
                     cas: Cas::new(&client),
                     action_cache: ActionCache::new(&client),
                     execution: client.executes_actions().then(|| Execution::new(&client)),
-                    token_version,
+                    credentials_version,
                 }))
             }
             Err(e) if e.is::<IncompatibleServer>() => {
@@ -191,23 +227,25 @@ impl Connection {
             Err(e) if e.is::<CredentialsRefused>() => {
                 warn!(
                     "REAPI: {e:#}; compiling locally until the sccache server restarts or the \
-                     auth token changes"
+                     credentials change"
                 );
-                *self.refused_token_version.lock().unwrap() = Some(token_version);
+                *self.refused_credentials_version.lock().unwrap() = Some(credentials_version);
+                self.expire_helper_headers();
                 State::Refused(CompileLocallyReason::CredentialsRefused)
             }
             Err(e) => {
-                let state = self.connect_failed();
+                let state = self.connect_failed(CompileLocallyReason::ConnectFailed);
                 warn!("REAPI: {e:#}; compiling locally for {:?}", self.backoff());
                 state
             }
         }
     }
 
-    fn connect_failed(&self) -> State {
+    fn connect_failed(&self, reason: CompileLocallyReason) -> State {
         self.failures_in_a_row.fetch_add(1, Ordering::Relaxed);
         State::ConnectFailed {
             retry_at: Instant::now() + self.backoff(),
+            reason,
         }
     }
 
@@ -225,6 +263,8 @@ mod test {
     use super::*;
     use crate::reapi::auth_token::AuthToken;
     use crate::reapi::auth_token::test::{read_again_now, token_file};
+    #[cfg(unix)]
+    use crate::reapi::credential_helper::test::{runs, script_helper};
     use crate::reapi::fake::FakeServer;
 
     async fn serve(server: FakeServer) -> (Arc<FakeServer>, Arc<Connection>) {
@@ -306,6 +346,7 @@ mod test {
         *server.capabilities_error.lock().unwrap() = None;
         *connection.state.lock().await = State::ConnectFailed {
             retry_at: Instant::now(),
+            reason: CompileLocallyReason::ConnectFailed,
         };
         assert!(connection.server_apis(in_secs(10)).await.is_ok());
         assert_eq!(2, capabilities_calls(&server));
@@ -429,6 +470,51 @@ mod test {
         .expect("the token file wasn't read again");
     }
 
+    #[cfg(unix)]
+    async fn serve_with_helper(
+        server: FakeServer,
+        dir: &std::path::Path,
+        output: &str,
+    ) -> (Arc<FakeServer>, Arc<Connection>) {
+        let server = Arc::new(server);
+        let connection = Connection::new(ConnectOptions {
+            endpoint: server.serve().await,
+            credential_helper: Some(Arc::new(script_helper(dir, output))),
+            ..Default::default()
+        });
+        (server, connection)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_failing_credential_helper_keeps_compiles_local_and_waits_for_the_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, connection) =
+            serve_with_helper(FakeServer::default(), dir.path(), "not json").await;
+        for _ in 0..2 {
+            assert_eq!(
+                Some(CompileLocallyReason::CredentialHelperFailed),
+                connection.server_apis(in_secs(10)).await.err()
+            );
+        }
+        assert_eq!(1, runs(dir.path()));
+        assert_eq!(0, capabilities_calls(&server));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_refused_helper_headers_are_fetched_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (server, connection) =
+            serve_with_helper(FakeServer::default(), dir.path(), r#"{"headers": {}}"#).await;
+        let apis = connection.server_apis(in_secs(10)).await.unwrap();
+        assert_eq!(1, runs(dir.path()));
+        connection.credentials_refused(&apis).await;
+        connection.server_apis(in_secs(10)).await.unwrap();
+        assert_eq!(2, runs(dir.path()));
+        assert_eq!(2, capabilities_calls(&server));
+    }
+
     #[tokio::test]
     async fn test_a_refusal_through_an_earlier_connection_is_ignored() {
         let (server, connection) = serve(FakeServer::default()).await;
@@ -445,7 +531,7 @@ mod test {
         let connection = Connection::new(Default::default());
         let backoffs: Vec<_> = (0..6)
             .map(|_| {
-                connection.connect_failed();
+                connection.connect_failed(CompileLocallyReason::ConnectFailed);
                 connection.backoff().as_secs()
             })
             .collect();

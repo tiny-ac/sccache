@@ -58,6 +58,10 @@ instance_name = ""
 # again every 10 seconds at most, and uses the token there if it changed; write
 # a new token to another file, then rename it over this one
 auth_token_file = "/home/user/.config/sccache/reapi-token"
+# instead of auth_token_file, a Bazel credential helper (an absolute path or a
+# name on PATH) whose headers are sent with every request; sccache runs it again
+# before they expire
+# credential_helper = "/usr/local/bin/farm-credential-helper"
 # a file holding the PEM certificates that a grpcs:// endpoint's certificate must
 # chain to, instead of the system's root certificates; read when sccache starts
 tls_ca_file = "/etc/ssl/certs/farm-ca.pem"

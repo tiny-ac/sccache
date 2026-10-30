@@ -21,9 +21,10 @@ use super::auth_token::{self, AuthToken};
 use super::cas::UnreadableBlob;
 use super::client::{
     ConnectOptions, RPC_TIMEOUT, RUSTC_MNEMONIC, RUSTC_VERSION_MNEMONIC, check_connect_options,
-    loggable, rpc_code,
+    credential_helper_uri, loggable, rpc_code,
 };
 use super::connection::{Connection, ServerApis};
+use super::credential_helper::{self, CredentialHelper};
 use super::digest::DigestCache;
 use super::execution::{Execution, MissingActionBlobs, QueuedTooLong};
 use super::mapping::{CompileLocallyReason, ReapiCompile, ToolchainKey};
@@ -636,14 +637,33 @@ fn compile_locally<T>(
 }
 
 /// Reads the auth token and TLS files and checks the options for connecting to `config`'s
-/// server, without connecting.
+/// server, without connecting or running the credential helper.
 fn read_connect_options(config: &ReapiConfig) -> Result<ConnectOptions> {
+    if config.auth_token_file.is_some() && config.credential_helper.is_some() {
+        bail!("[dist.reapi] can't have both auth_token_file and credential_helper");
+    }
     let auth_token = config
         .auth_token_file
         .clone()
         .map(|file| AuthToken::from_file(file, auth_token::CHECK_INTERVAL))
         .transpose()?
         .map(Arc::new);
+    // The sccache server's cwd and PATH are those of whichever client started it, so a
+    // relative path could name another program from one run to the next.
+    if let Some(program) = &config.credential_helper
+        && program.is_relative()
+        && program.components().count() > 1
+    {
+        bail!("[dist.reapi] credential_helper must be an absolute path or a name on PATH");
+    }
+    let credential_helper = match &config.credential_helper {
+        Some(program) => Some(Arc::new(CredentialHelper::new(
+            program.clone(),
+            credential_helper_uri(&config.endpoint)?,
+            credential_helper::HELPER_TIMEOUT,
+        ))),
+        None => None,
+    };
     let tls_ca_certificates = config
         .tls_ca_file
         .as_deref()
@@ -667,6 +687,7 @@ fn read_connect_options(config: &ReapiConfig) -> Result<ConnectOptions> {
         instance_name: config.instance_name.clone(),
         auth_token,
         headers: config.headers.clone(),
+        credential_helper,
         tool_invocation_id: uuid::Uuid::new_v4().to_string(),
         tls_ca_certificates,
         tls_client_identity,
@@ -1758,6 +1779,36 @@ mod test {
             Ok(options) => assert!(both && options.tls_client_identity.is_some()),
             Err(e) => assert!(!both && e.to_string().contains("or neither"), "{e}"),
         }
+    }
+
+    #[test]
+    fn test_an_auth_token_file_and_a_credential_helper_are_refused_together() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("token"), "secret").unwrap();
+        let config = |auth_token_file| ReapiConfig {
+            endpoint: "grpcs://farm:443".to_owned(),
+            auth_token_file,
+            credential_helper: Some(dir.path().join("helper")),
+            ..Default::default()
+        };
+        let e = read_connect_options(&config(Some(dir.path().join("token"))))
+            .err()
+            .unwrap();
+        assert!(e.to_string().contains("can't have both"), "{e}");
+        let options = read_connect_options(&config(None)).unwrap();
+        assert!(options.credential_helper.is_some());
+    }
+
+    #[test_case::test_case("helper", true ; "a name on PATH")]
+    #[test_case::test_case("/usr/bin/helper", true ; "absolute")]
+    #[test_case::test_case("bin/helper", false ; "relative")]
+    fn test_a_credential_helper_is_a_name_or_an_absolute_path(program: &str, valid: bool) {
+        let options = read_connect_options(&ReapiConfig {
+            endpoint: "grpcs://farm:443".to_owned(),
+            credential_helper: Some(program.into()),
+            ..Default::default()
+        });
+        assert_eq!(valid, options.is_ok());
     }
 
     #[test]

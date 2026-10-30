@@ -20,6 +20,7 @@ mod auth_token;
 mod cas;
 mod client;
 mod connection;
+mod credential_helper;
 mod digest;
 mod execution;
 mod executor;

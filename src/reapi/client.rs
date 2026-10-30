@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::auth_token::AuthToken;
+use super::credential_helper::CredentialHelper;
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use crate::errors::*;
 use prost::Message;
@@ -76,6 +77,9 @@ pub(crate) struct ConnectOptions {
     pub(crate) auth_token: Option<Arc<AuthToken>>,
     /// Sent with every request.
     pub(crate) headers: BTreeMap<String, String>,
+    /// Prints headers that are sent with every request, in place of `headers` of the same
+    /// name.
+    pub(crate) credential_helper: Option<Arc<CredentialHelper>>,
     /// Sent in every request's `RequestMetadata`, so that the server can tell this sccache
     /// server's calls from those of earlier runs and other clients.
     pub(crate) tool_invocation_id: String,
@@ -87,12 +91,13 @@ pub(crate) struct ConnectOptions {
 
 pub(crate) type ReapiChannel = InterceptedService<Channel, HeadersInterceptor>;
 
-/// Adds the auth token and `headers` to every request, and `request_metadata` to a request
-/// that has no `RequestMetadata` of its own.
+/// Adds the auth token, `headers` and the credential helper's headers to every request, and
+/// `request_metadata` to a request that has no `RequestMetadata` of its own.
 #[derive(Clone)]
 pub(crate) struct HeadersInterceptor {
     auth_token: Option<Arc<AuthToken>>,
     headers: Arc<[(AsciiMetadataKey, AsciiMetadataValue)]>,
+    credential_helper: Option<Arc<CredentialHelper>>,
     request_metadata: BinaryMetadataValue,
 }
 
@@ -108,6 +113,16 @@ impl Interceptor for HeadersInterceptor {
         }
         for (name, value) in self.headers.iter() {
             request.metadata_mut().insert(name.clone(), value.clone());
+        }
+        if let Some(credential_helper) = &self.credential_helper {
+            let headers = credential_helper.headers();
+            for (i, (name, value)) in headers.iter().enumerate() {
+                if headers[..i].iter().any(|(earlier, _)| earlier == name) {
+                    request.metadata_mut().append(name.clone(), value.clone());
+                } else {
+                    request.metadata_mut().insert(name.clone(), value.clone());
+                }
+            }
         }
         if !request.metadata().contains_key(REQUEST_METADATA_HEADER) {
             request
@@ -201,7 +216,11 @@ impl Client {
             .tcp_keepalive(Some(TCP_KEEPALIVE_IDLE))
             .tcp_keepalive_interval(Some(TCP_KEEPALIVE_INTERVAL))
             .tcp_keepalive_retries(Some(TCP_KEEPALIVE_RETRIES));
-        if tls_domain.is_none() && (options.auth_token.is_some() || !options.headers.is_empty()) {
+        if tls_domain.is_none()
+            && (options.auth_token.is_some()
+                || !options.headers.is_empty()
+                || options.credential_helper.is_some())
+        {
             warn!("REAPI: sending the auth token or headers without TLS");
         }
         let headers = request_headers(options)?.into();
@@ -229,6 +248,7 @@ impl Client {
             HeadersInterceptor {
                 auth_token: options.auth_token.clone(),
                 headers,
+                credential_helper: options.credential_helper.clone(),
                 request_metadata: BinaryMetadataValue::from_bytes(
                     &request_metadata.encode_to_vec(),
                 ),
@@ -369,25 +389,7 @@ fn request_headers(
 ) -> Result<Vec<(AsciiMetadataKey, AsciiMetadataValue)>> {
     let mut headers = Vec::new();
     for (name, value) in &options.headers {
-        let key = AsciiMetadataKey::from_bytes(name.as_bytes())
-            .with_context(|| format!("the REAPI header name {name:?} is not valid"))?;
-        // gRPC and HTTP/2 own these: tonic drops or replaces some, and HTTP/2 refuses
-        // requests that have the others.
-        if key.as_str().starts_with("grpc-")
-            || [
-                "te",
-                "content-type",
-                "user-agent",
-                "connection",
-                "keep-alive",
-                "proxy-connection",
-                "transfer-encoding",
-                "upgrade",
-            ]
-            .contains(&key.as_str())
-        {
-            bail!("the REAPI header {name:?} is reserved for gRPC or HTTP/2");
-        }
+        let key = header_key(name)?;
         if headers.iter().any(|(existing, _)| *existing == key)
             || (key == "authorization" && options.auth_token.is_some())
         {
@@ -399,6 +401,43 @@ fn request_headers(
         headers.push((key, value));
     }
     Ok(headers)
+}
+
+/// The URI a credential helper gets for `endpoint`: `https://<host>[:<port>]` without port
+/// 443, as gRPC's Java client builds it for Bazel's helpers, which match on the host.
+pub(super) fn credential_helper_uri(endpoint: &str) -> Result<String> {
+    let uri: http::Uri = parse_endpoint(endpoint)?.http_url.parse()?;
+    let authority = uri
+        .authority()
+        .context("the REAPI endpoint has no host")?
+        .as_str();
+    Ok(format!(
+        "https://{}",
+        authority.strip_suffix(":443").unwrap_or(authority)
+    ))
+}
+
+/// `name` as a header name, if it's valid and gRPC or HTTP/2 doesn't own it.
+pub(super) fn header_key(name: &str) -> Result<AsciiMetadataKey> {
+    let key = AsciiMetadataKey::from_bytes(name.as_bytes())
+        .with_context(|| format!("the REAPI header name {name:?} is not valid"))?;
+    // tonic drops or replaces some, and HTTP/2 refuses requests that have the others.
+    if key.as_str().starts_with("grpc-")
+        || [
+            "te",
+            "content-type",
+            "user-agent",
+            "connection",
+            "keep-alive",
+            "proxy-connection",
+            "transfer-encoding",
+            "upgrade",
+        ]
+        .contains(&key.as_str())
+    {
+        bail!("the REAPI header {name:?} is reserved for gRPC or HTTP/2");
+    }
+    Ok(key)
 }
 
 /// The tonic endpoint for `options`, with TLS set up for `grpcs://`, and the host name TLS
@@ -579,6 +618,8 @@ fn check_api_version(capabilities: &remexec::ServerCapabilities) -> Result<()> {
 mod test {
     use super::*;
     use crate::reapi::auth_token::test::{read_again_now, token_file};
+    #[cfg(unix)]
+    use crate::reapi::credential_helper::test::script_helper;
     use crate::reapi::proto::build::bazel::semver::SemVer;
     use remexec::capabilities_server::{Capabilities, CapabilitiesServer};
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -993,6 +1034,46 @@ mod test {
         let metadata = &metadata.lock().unwrap()[0];
         assert_eq!("key", metadata.get("x-api-key").unwrap());
         assert_eq!("Bearer secret", metadata.get("authorization").unwrap());
+    }
+
+    #[test_case("grpcs://farm.example.com:443", "https://farm.example.com" ; "default port")]
+    #[test_case("grpc://10.0.0.1:8980", "https://10.0.0.1:8980" ; "plain text")]
+    #[test_case("grpcs://[::1]:8443/", "https://[::1]:8443" ; "ipv6 with a slash")]
+    fn test_the_credential_helper_gets_the_uri_bazel_sends(endpoint: &str, uri: &str) {
+        assert_eq!(uri, credential_helper_uri(endpoint).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_the_credential_helpers_headers_replace_configured_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let credential_helper = Arc::new(script_helper(
+            dir.path(),
+            r#"{"headers": {"x-api-key": ["a", "b"]}}"#,
+        ));
+        credential_helper.renew().await.unwrap();
+        let fake = FakeCapabilities::default();
+        let metadata = fake.metadata.clone();
+        let endpoint = serve_fake(fake).await;
+        Client::connect(&ConnectOptions {
+            headers: [
+                ("x-api-key".to_owned(), "configured".to_owned()),
+                ("x-tenant".to_owned(), "t".to_owned()),
+            ]
+            .into(),
+            credential_helper: Some(credential_helper),
+            ..connect_options(&endpoint)
+        })
+        .await
+        .unwrap();
+        let metadata = &metadata.lock().unwrap()[0];
+        let api_keys: Vec<_> = metadata
+            .get_all("x-api-key")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(vec!["a", "b"], api_keys);
+        assert_eq!("t", metadata.get("x-tenant").unwrap());
     }
 
     #[test_case("x api key", "hidden", "not valid" ; "invalid name")]

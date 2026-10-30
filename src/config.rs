@@ -789,6 +789,9 @@ pub struct ReapiConfig {
     /// A file holding the bearer token sent with every request, read again every 10 seconds at
     /// most.
     pub auth_token_file: Option<PathBuf>,
+    /// A Bazel credential helper whose headers are sent with every request. Can't be set
+    /// with `auth_token_file`.
+    pub credential_helper: Option<PathBuf>,
     /// A file holding the PEM certificates that TLS trusts instead of the system's root
     /// certificates.
     pub tls_ca_file: Option<PathBuf>,
@@ -2924,6 +2927,7 @@ token = "secrettoken"
 endpoint = "grpc://farm:8980"
 instance_name = "main"
 auth_token_file = "/token"
+credential_helper = "/helper"
 tls_ca_file = "/ca.pem"
 tls_client_certificate_file = "/client.pem"
 tls_client_key_file = "/client.key"
@@ -3119,6 +3123,7 @@ key_prefix = "cosprefix"
                     endpoint: "grpc://farm:8980".to_owned(),
                     instance_name: "main".to_owned(),
                     auth_token_file: Some(PathBuf::from("/token")),
+                    credential_helper: Some(PathBuf::from("/helper")),
                     tls_ca_file: Some(PathBuf::from("/ca.pem")),
                     tls_client_certificate_file: Some(PathBuf::from("/client.pem")),
                     tls_client_key_file: Some(PathBuf::from("/client.key")),
@@ -3674,6 +3679,7 @@ endpoint = "grpcs://farm.example.com:443"
             endpoint: "grpcs://farm.example.com:443".to_owned(),
             instance_name: String::new(),
             auth_token_file: None,
+            credential_helper: None,
             tls_ca_file: None,
             tls_client_certificate_file: None,
             tls_client_key_file: None,
