@@ -12,61 +12,95 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::compiler::{Cacheable, Compilation, DistType};
+use super::{DistInputOptions, DistJob, LocalCompile, RemoteExecutor, RemoteJob};
+use crate::compiler::{Compilation, DistType};
 use crate::dist;
 use crate::errors::*;
 use crate::lru_disk_cache;
 use crate::mock_command::CommandCreatorSync;
-use crate::server;
-use fs::File;
-use fs_err as fs;
-use std::path::PathBuf;
+use async_trait::async_trait;
+use fs_err::{self as fs, File};
+use std::io;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 
-pub(crate) async fn dist_or_local_compile<T>(
-    service: &server::SccacheService<T>,
-    dist_client: Option<Arc<dyn dist::Client>>,
-    creator: T,
-    cwd: PathBuf,
-    compilation: Box<dyn Compilation<T>>,
-    weak_toolchain_key: String,
-    out_pretty: String,
-) -> Result<(Cacheable, DistType, process::Output)>
-where
-    T: CommandCreatorSync,
-{
-    use std::io;
+/// What to do when sccache-dist can't complete a compile.
+#[derive(Debug)]
+enum DistError {
+    CompileLocally(Error),
+    FailCompile(Error),
+}
 
-    let rewrite_includes_only = match dist_client {
-        Some(ref client) => client.rewrite_includes_only(),
-        _ => false,
-    };
-    let mut path_transformer = dist::PathTransformer::new();
-    let (compile_cmd, dist_compile_cmd, cacheable) = compilation
-        .generate_compile_commands(&mut path_transformer, rewrite_includes_only)
-        .context("Failed to generate compile commands")?;
+/// A [`RemoteExecutor`] that runs compiles on an sccache-dist cluster.
+pub struct DistExecutor {
+    client: Arc<dyn dist::Client>,
+}
 
-    let dist_client = match dist_compile_cmd.clone().and(dist_client) {
-        Some(dc) => dc,
-        None => {
+#[async_trait]
+impl<T: CommandCreatorSync> RemoteExecutor<T> for DistExecutor {
+    fn dist_input_options(&self) -> Option<DistInputOptions> {
+        Some(DistInputOptions {
+            rewrite_includes_only: self.client.rewrite_includes_only(),
+        })
+    }
+
+    async fn compile(
+        &self,
+        job: RemoteJob<T>,
+        local_compile: LocalCompile<'_, T>,
+    ) -> Result<(DistType, process::Output)> {
+        let RemoteJob {
+            compilation,
+            out_pretty,
+            dist_job,
+        } = job;
+        let Some(dist_job) = dist_job else {
             debug!("[{}]: Compiling locally", out_pretty);
-            return compile_cmd
-                .execute(service, &creator)
-                .await
-                .map(move |o| (cacheable, DistType::NoDist, o));
+            return Ok((DistType::NoDist, local_compile.run().await?));
+        };
+        debug!("[{}]: Attempting distributed compilation", out_pretty);
+        let compiler_path = local_compile.command.get_executable();
+        let result = self
+            .run_on_cluster(compilation, dist_job, compiler_path.clone(), &out_pretty)
+            .await
+            .map_err(|error| classify_error(error, &compiler_path));
+        match result {
+            Ok(compiled) => Ok(compiled),
+            Err(DistError::FailCompile(e)) => Err(e),
+            Err(DistError::CompileLocally(e)) => {
+                // `{:#}` prints the error and the causes in a single line.
+                let errmsg = format!("{:#}", e);
+                warn!(
+                    "[{}]: Could not perform distributed compile, falling back to local: {}",
+                    out_pretty, errmsg
+                );
+                Ok((DistType::Error, local_compile.run().await?))
+            }
         }
-    };
+    }
+}
 
-    debug!("[{}]: Attempting distributed compilation", out_pretty);
-    let out_pretty2 = out_pretty.clone();
+impl DistExecutor {
+    pub fn new(client: Arc<dyn dist::Client>) -> Self {
+        DistExecutor { client }
+    }
 
-    let local_executable = compile_cmd.get_executable();
-    let local_executable2 = compile_cmd.get_executable();
-
-    let do_dist_compile = async move {
-        let mut dist_compile_cmd =
-            dist_compile_cmd.context("Could not create distributed compile command")?;
+    /// Runs `dist_job` on the cluster and writes its outputs to their local paths on the
+    /// client machine.
+    async fn run_on_cluster<T: CommandCreatorSync>(
+        &self,
+        compilation: Box<dyn Compilation<T>>,
+        dist_job: DistJob,
+        compiler_path: PathBuf,
+        out_pretty: &str,
+    ) -> Result<(DistType, process::Output)> {
+        let DistJob {
+            mut path_transformer,
+            command: mut dist_compile_cmd,
+            weak_toolchain_key,
+            cwd,
+        } = dist_job;
         debug!("[{}]: Creating distributed compile request", out_pretty);
         let dist_output_paths = compilation
             .outputs()
@@ -75,13 +109,14 @@ where
             .context("Failed to adapt an output path for distributed compile")?;
         let (inputs_packager, toolchain_packager, outputs_rewriter) =
             compilation.into_dist_packagers(path_transformer)?;
+        let dist_client = &self.client;
 
         debug!(
             "[{}]: Identifying dist toolchain for {:?}",
-            out_pretty, local_executable
+            out_pretty, compiler_path
         );
         let (dist_toolchain, maybe_dist_compile_executable) = dist_client
-            .put_toolchain(local_executable, weak_toolchain_key, toolchain_packager)
+            .put_toolchain(compiler_path, weak_toolchain_key, toolchain_packager)
             .await?;
         let mut tc_archive = None;
         if let Some((dist_compile_executable, archive_path)) = maybe_dist_compile_executable {
@@ -143,7 +178,7 @@ where
                 )
             })?;
 
-        let mut jc = match jres {
+        let jc = match jres {
             dist::RunJobResult::Complete(jc) => jc,
             dist::RunJobResult::JobNotFound => bail!("Job {} not found on server", job_id),
         };
@@ -155,98 +190,146 @@ where
                 .collect::<Vec<_>>()
         );
         let mut output_paths: Vec<PathBuf> = vec![];
-        macro_rules! try_or_cleanup {
-            ($v:expr) => {{
-                match $v {
-                    Ok(v) => v,
-                    Err(e) => {
-                        // Do our best to clear up. We may end up deleting a file that we just wrote over
-                        // the top of, but it's better to clear up too much than too little
-                        for local_path in output_paths.iter() {
-                            if let Err(e) = fs::remove_file(local_path) {
-                                if e.kind() != io::ErrorKind::NotFound {
-                                    warn!("{} while attempting to clear up {}", e, local_path.display())
-                                }
-                            }
-                        }
-                        return Err(e)
-                    },
-                }
-            }};
-        }
-
         for (path, output_data) in jc.outputs {
             let len = output_data.lens().actual;
-            let local_path = try_or_cleanup!(
+            let local_path = remove_outputs_on_error(
+                &output_paths,
                 path_transformer
                     .to_local(&path)
-                    .with_context(|| format!("unable to transform output path {}", path))
-            );
+                    .with_context(|| format!("unable to transform output path {}", path)),
+            )?;
             output_paths.push(local_path);
             // Do this first so cleanup works correctly
             let local_path = output_paths.last().expect("nothing in vec after push");
 
-            let mut file =
-                try_or_cleanup!(File::create(local_path).with_context(|| format!(
-                    "Failed to create output file {}",
-                    local_path.display()
-                )));
-            let count = try_or_cleanup!(
+            let mut file = remove_outputs_on_error(
+                &output_paths,
+                File::create(local_path).with_context(|| {
+                    format!("Failed to create output file {}", local_path.display())
+                }),
+            )?;
+            let count = remove_outputs_on_error(
+                &output_paths,
                 io::copy(&mut output_data.into_reader(), &mut file)
-                    .with_context(|| format!("Failed to write output to {}", local_path.display()))
-            );
+                    .with_context(|| format!("Failed to write output to {}", local_path.display())),
+            )?;
 
             assert!(count == len);
         }
+        let mut output = jc.output;
         let extra_inputs = match tc_archive {
             Some(p) => vec![p],
             None => vec![],
         };
-        try_or_cleanup!(
+        remove_outputs_on_error(
+            &output_paths,
             outputs_rewriter
                 .handle_outputs(&path_transformer, &output_paths, &extra_inputs)
-                .with_context(|| "failed to rewrite outputs from compile")
-        );
+                .with_context(|| "failed to rewrite outputs from compile"),
+        )?;
 
-        if jc.output.code != 0 {
+        if output.code != 0 {
             // Add server info to help diagnose host-specific failures, e.g. due to flaky hardware.
             // Failed builds are not cached so this tampering should not cause too much trouble.
             let server_info = format!("sccache: Job failed on server {}:\n", server_id.addr());
-            jc.output
-                .stderr
-                .splice(0..0, server_info.as_bytes().to_vec());
+            output.stderr.splice(0..0, server_info.as_bytes().to_vec());
         }
 
-        Ok((DistType::Ok(server_id), jc.output.into()))
-    };
+        Ok((DistType::Ok(server_id), output.into()))
+    }
+}
 
-    use futures::TryFutureExt;
-    do_dist_compile
-        .or_else(move |e| async move {
-            if let Some(HttpClientError(_)) = e.downcast_ref::<HttpClientError>() {
-                Err(e)
-            } else if let Some(lru_disk_cache::Error::FileTooLarge) =
-                e.downcast_ref::<lru_disk_cache::Error>()
+/// Returns `result`, deleting `outputs` first if it's an error.
+fn remove_outputs_on_error<V>(outputs: &[PathBuf], result: Result<V>) -> Result<V> {
+    if result.is_err() {
+        // Do our best to clear up. We may end up deleting a file that we just wrote over
+        // the top of, but it's better to clear up too much than too little
+        for local_path in outputs {
+            if let Err(e) = fs::remove_file(local_path)
+                && e.kind() != io::ErrorKind::NotFound
             {
-                Err(anyhow!(
-                    "Could not cache dist toolchain for {:?} locally.
-                 Increase `toolchain_cache_size` or decrease the toolchain archive size.",
-                    local_executable2
-                ))
-            } else {
-                // `{:#}` prints the error and the causes in a single line.
-                let errmsg = format!("{:#}", e);
                 warn!(
-                    "[{}]: Could not perform distributed compile, falling back to local: {}",
-                    out_pretty2, errmsg
+                    "{} while attempting to clear up {}",
+                    e,
+                    local_path.display()
                 );
-
-                compile_cmd
-                    .execute(service, &creator)
-                    .await
-                    .map(|o| (DistType::Error, o))
             }
-        })
-        .map_ok(move |(dt, o)| (cacheable, dt, o))
-        .await
+        }
+    }
+    result
+}
+
+/// Decides whether to fail the compile or compile locally after an sccache-dist error.
+fn classify_error(error: Error, compiler_path: &Path) -> DistError {
+    if let Some(HttpClientError(_)) = error.downcast_ref::<HttpClientError>() {
+        DistError::FailCompile(error)
+    } else if let Some(lru_disk_cache::Error::FileTooLarge) =
+        error.downcast_ref::<lru_disk_cache::Error>()
+    {
+        DistError::FailCompile(anyhow!(
+            "Could not cache dist toolchain for {:?} locally.
+                 Increase `toolchain_cache_size` or decrease the toolchain archive size.",
+            compiler_path
+        ))
+    } else {
+        DistError::CompileLocally(error)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_http_client_error_fails_the_compile() {
+        let e = Error::new(HttpClientError("unauthorized".to_owned()));
+        // Fails the compile, so the error reaches `SccacheService`, which resets the dist
+        // client on it.
+        match classify_error(e, Path::new("/usr/bin/cc")) {
+            DistError::FailCompile(e) => assert!(
+                e.is::<HttpClientError>(),
+                "expected the HttpClientError unchanged, got {e:#}"
+            ),
+            other => panic!("expected FailCompile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_toolchain_too_large_for_the_cache_fails_the_compile() {
+        let e = Error::new(lru_disk_cache::Error::FileTooLarge);
+        match classify_error(e, Path::new("/usr/bin/cc")) {
+            DistError::FailCompile(e) => {
+                assert!(
+                    e.to_string().contains("toolchain_cache_size"),
+                    "expected the toolchain_cache_size hint, got {e:#}"
+                );
+            }
+            other => panic!("expected FailCompile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_remove_outputs_on_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let written = dir.path().join("foo.o");
+        let missing = dir.path().join("foo.d");
+        fs::write(&written, b"partial").unwrap();
+        let outputs = [written.clone(), missing];
+
+        assert_eq!(1, remove_outputs_on_error(&outputs, Ok(1)).unwrap());
+        assert!(written.exists());
+
+        let result: Result<()> = remove_outputs_on_error(&outputs, Err(anyhow!("write failed")));
+        assert!(result.is_err());
+        assert!(!written.exists());
+    }
+
+    #[test]
+    fn test_other_errors_compile_locally() {
+        let result = classify_error(anyhow!("connection refused"), Path::new("/usr/bin/cc"));
+        assert!(
+            matches!(result, DistError::CompileLocally(_)),
+            "expected CompileLocally, got {result:?}"
+        );
+    }
 }
