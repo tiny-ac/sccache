@@ -12,16 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A Rust compile's REAPI command and toolchain files.
+//! A Rust compile's REAPI command and toolchain files, and writing an action result's
+//! output files to their local paths.
 
-use super::digest::DigestCache;
+use super::cas::Cas;
+use super::digest::{self, DigestCache};
 use super::input_root::InputRootFile;
 use super::mapping::{BUILD_ROOT_DIR, ReapiCompile, TOOLCHAIN_DIR};
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use crate::errors::*;
+use crate::mock_command::exit_status;
 use memchr::memmem;
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process;
+use tempfile::{NamedTempFile, TempPath};
 
 /// Starts the stderr line where the worker reports the worker root.
 const WORKER_ROOT_MARKER: &str = "sccache-reapi-pwd:";
@@ -31,8 +37,8 @@ const WORKER_ROOT_MARKER: &str = "sccache-reapi-pwd:";
 /// rustc's arguments.
 pub(super) fn build_command(compile: &ReapiCompile) -> remexec::Command {
     // rustc's paths use the physical cwd, so $PWD must too for the remaps and the worker
-    // root line to match them. The worker root line lets the client machine map the worker
-    // root in stdout and stderr to local paths.
+    // root line to match them. `materialize` reads the worker root line to map the worker
+    // root to local paths.
     let mut script = format!(
         "set -e\ncd -P .\nPWD=$(pwd -P)\nprintf '{WORKER_ROOT_MARKER}%s\\n' \"$PWD\" >&2\n"
     );
@@ -232,10 +238,298 @@ impl<W: Write> Write for WorkerRootScanner<W> {
     }
 }
 
+/// The largest output file downloaded, well above the largest rlibs with debuginfo.
+const MAX_OUTPUT_FILE_BYTES: u64 = 4 << 30;
+/// The largest stdout or stderr downloaded, which is held in memory.
+const MAX_STDOUT_OR_STDERR_BYTES: u64 = 64 << 20;
+
+/// Error for an output file that contains the worker root, such as one from a crate that
+/// embeds `env!("CARGO_MANIFEST_DIR")`.
+#[derive(Debug)]
+pub(super) struct WorkerRootInOutput(PathBuf);
+
+impl std::fmt::Display for WorkerRootInOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} contains the worker root", self.0.display())
+    }
+}
+
+impl std::error::Error for WorkerRootInOutput {}
+
+/// Error for an action result that lacks a digest or the worker root line, or doesn't match
+/// its command or digests.
+#[derive(Debug)]
+pub(super) struct UnusableResult(String);
+
+impl std::fmt::Display for UnusableResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UnusableResult {}
+
+/// Error for output files that can't be written to their local paths, such as on a full disk.
+#[derive(Debug)]
+pub(super) struct UnwritableOutputs;
+
+impl std::fmt::Display for UnwritableOutputs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("failed to write the outputs to their local paths")
+    }
+}
+
+impl std::error::Error for UnwritableOutputs {}
+
+/// An output file's contents, checked for the worker root but not yet at its local path.
+enum OutputContents {
+    /// Downloaded to a temporary file in its local directory.
+    TempFile(TempPath),
+    Inline(Vec<u8>),
+}
+
+/// Writes `result`'s output files to their local paths once all are downloaded and
+/// checked, and returns its stdout and stderr mapped to local paths.
+pub(super) async fn materialize(
+    cas: &Cas,
+    compile: &ReapiCompile,
+    result: &remexec::ActionResult,
+) -> Result<process::Output> {
+    // An exit code that a process can't return, such as 256, would read as success.
+    let exit_code = u8::try_from(result.exit_code)
+        .map_err(|_| UnusableResult(format!("result has exit code {}", result.exit_code)))?;
+    let stdout =
+        download_stdout_or_stderr(cas, &result.stdout_raw, result.stdout_digest.as_ref()).await?;
+    let stderr =
+        download_stdout_or_stderr(cas, &result.stderr_raw, result.stderr_digest.as_ref()).await?;
+    let (worker_root, stderr) = take_worker_root(&stderr)?;
+    check_output_paths(compile, result)?;
+    let output_contents = futures::future::try_join_all(
+        result
+            .output_files
+            .iter()
+            .map(|file| download_output(cas, compile, file, &worker_root)),
+    )
+    .await?;
+    let stdout = compile
+        .path_mapper
+        .worker_paths_to_local(&stdout, &worker_root);
+    let stderr = compile
+        .path_mapper
+        .worker_paths_to_local(&stderr, &worker_root);
+    tokio::task::spawn_blocking(move || write_outputs(output_contents)).await??;
+    Ok(process::Output {
+        status: exit_status_from_code(exit_code),
+        stdout,
+        stderr,
+    })
+}
+
+/// Returns `inline`, or the blob at `digest` when the server didn't inline it.
+async fn download_stdout_or_stderr(
+    cas: &Cas,
+    inline: &[u8],
+    digest: Option<&remexec::Digest>,
+) -> Result<Vec<u8>> {
+    match digest {
+        Some(digest) if inline.is_empty() && digest.size_bytes > 0 => {
+            cas.download_blob(digest, MAX_STDOUT_OR_STDERR_BYTES).await
+        }
+        _ => Ok(inline.to_vec()),
+    }
+}
+
+/// Splits the worker root line off an action's stderr.
+fn take_worker_root(stderr: &[u8]) -> Result<(String, Vec<u8>)> {
+    let mut worker_root = None;
+    let mut rest = Vec::with_capacity(stderr.len());
+    for line in stderr.split_inclusive(|&b| b == b'\n') {
+        match line.strip_prefix(WORKER_ROOT_MARKER.as_bytes()) {
+            Some(reported) if worker_root.is_none() => {
+                worker_root = Some(reported.trim_ascii_end());
+            }
+            _ => rest.extend_from_slice(line),
+        }
+    }
+    // A worker root that isn't UTF-8 couldn't be found in outputs as written.
+    let worker_root = worker_root
+        .and_then(|r| std::str::from_utf8(r).ok())
+        .filter(|r| !r.is_empty())
+        .ok_or_else(|| UnusableResult("result doesn't report the worker root".to_owned()))?;
+    Ok((worker_root.to_owned(), rest))
+}
+
+/// Fails if `result` has outputs other than the files `compile` declares, or lacks an rlib or
+/// rmeta that a successful compile writes.
+// Servers may also report symlinks in the fields REAPI 2.1 deprecated.
+#[allow(deprecated)]
+fn check_output_paths(compile: &ReapiCompile, result: &remexec::ActionResult) -> Result<()> {
+    if !result.output_directories.is_empty()
+        || !result.output_symlinks.is_empty()
+        || !result.output_file_symlinks.is_empty()
+        || !result.output_directory_symlinks.is_empty()
+    {
+        return Err(UnusableResult("result has output directories or symlinks".to_owned()).into());
+    }
+    let declared_paths: HashSet<String> = command_output_paths(compile).collect();
+    let mut returned_paths = HashSet::new();
+    for file in &result.output_files {
+        if !declared_paths.contains(&file.path) {
+            return Err(
+                UnusableResult(format!("result has undeclared output {}", file.path)).into(),
+            );
+        }
+        if !returned_paths.insert(file.path.as_str()) {
+            return Err(UnusableResult(format!("result has output {} twice", file.path)).into());
+        }
+    }
+    // rustc writes its rlib and rmeta when it succeeds, so a successful result without one
+    // would leave a previous build's file at that path.
+    if result.exit_code == 0 {
+        for output in &compile.outputs {
+            if output
+                .extension()
+                .is_some_and(|e| e == "rlib" || e == "rmeta")
+                && let Some(path) = compile.path_mapper.to_input_root(output)
+                && !returned_paths.contains(path.as_str())
+            {
+                return Err(UnusableResult(format!("result lacks output {path}")).into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Downloads `file` next to its local path, or checks its inline contents, and fails if it
+/// contains `worker_root`.
+async fn download_output(
+    cas: &Cas,
+    compile: &ReapiCompile,
+    file: &remexec::OutputFile,
+    worker_root: &str,
+) -> Result<(PathBuf, bool, OutputContents)> {
+    let digest = file
+        .digest
+        .as_ref()
+        .ok_or_else(|| UnusableResult(format!("result's output {} has no digest", file.path)))?;
+    let local_path = compile.path_mapper.to_local(&file.path);
+    if !file.contents.is_empty() {
+        if digest::of_bytes(&file.contents) != *digest {
+            return Err(UnusableResult(format!(
+                "result's inline output {} doesn't match its digest",
+                file.path
+            ))
+            .into());
+        }
+        if memmem::find(&file.contents, worker_root.as_bytes()).is_some() {
+            return Err(WorkerRootInOutput(local_path).into());
+        }
+        let contents = OutputContents::Inline(file.contents.clone());
+        return Ok((local_path, file.is_executable, contents));
+    }
+    let dir = local_path
+        .parent()
+        .with_context(|| format!("output {} has no parent directory", local_path.display()))?;
+    let temp_file = NamedTempFile::new_in(dir)
+        .with_context(|| format!("failed to create a file in {}", dir.display()))
+        .context(UnwritableOutputs)?;
+    let temp_file_path = temp_file.path().to_owned();
+    let scanner = WorkerRootScanner::new(io::BufWriter::new(temp_file), worker_root);
+    let scanner = cas
+        .download_blob_into(digest, MAX_OUTPUT_FILE_BYTES, scanner)
+        .await?;
+    if scanner.contains_worker_root {
+        return Err(WorkerRootInOutput(local_path).into());
+    }
+    let temp_file = scanner
+        .inner
+        .into_inner()
+        .map_err(|e| e.into_error())
+        .with_context(|| format!("failed to write {}", temp_file_path.display()))
+        .context(UnwritableOutputs)?;
+    let contents = OutputContents::TempFile(temp_file.into_temp_path());
+    Ok((local_path, file.is_executable, contents))
+}
+
+/// Moves each output to its local path, or removes the ones already moved if one fails.
+fn write_outputs(output_contents: Vec<(PathBuf, bool, OutputContents)>) -> Result<()> {
+    let mut written_paths = vec![];
+    for (local_path, is_executable, contents) in output_contents {
+        let write_result = match contents {
+            OutputContents::TempFile(temp_path) => temp_path
+                .persist(&local_path)
+                .map_err(|e| Error::new(e.error))
+                .with_context(|| format!("failed to write {}", local_path.display())),
+            OutputContents::Inline(data) => write_output(&local_path, &data),
+        }
+        .and_then(|()| {
+            written_paths.push(local_path.clone());
+            set_mode(&local_path, is_executable)
+        });
+        if let Err(e) = write_result {
+            remove_outputs(&written_paths);
+            return Err(e.context(UnwritableOutputs));
+        }
+    }
+    Ok(())
+}
+
+fn write_output(path: &Path, data: &[u8]) -> Result<()> {
+    let dir = path
+        .parent()
+        .with_context(|| format!("output {} has no parent directory", path.display()))?;
+    let mut temp_file = NamedTempFile::new_in(dir)
+        .with_context(|| format!("failed to create a file in {}", dir.display()))?;
+    temp_file
+        .write_all(data)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    temp_file
+        .persist(path)
+        .map_err(|e| Error::new(e.error))
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+/// Sets an output's mode to what a local compile gives it under umask 022.
+fn set_mode(path: &Path, is_executable: bool) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if is_executable { 0o755 } else { 0o644 };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("failed to set the mode of {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = (path, is_executable);
+    Ok(())
+}
+
+/// Removes `paths`, logging any that can't be removed.
+fn remove_outputs(paths: &[PathBuf]) {
+    for path in paths {
+        if let Err(e) = std::fs::remove_file(path) {
+            warn!("REAPI: failed to remove the output {}: {e}", path.display());
+        }
+    }
+}
+
+/// The status of a process that exited with `exit_code`.
+fn exit_status_from_code(exit_code: u8) -> process::ExitStatus {
+    // A Unix wait status holds the exit code in bits 8 to 15.
+    #[cfg(unix)]
+    let raw_status = i32::from(exit_code) << 8;
+    #[cfg(windows)]
+    let raw_status = u32::from(exit_code);
+    exit_status(raw_status)
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::reapi::fake::FakeServer;
     use crate::reapi::{ActionEnv, PathMapper};
+    use std::sync::Arc;
+    use test_case::test_case;
 
     const RLIB: &str = ".sccache-build/debug/deps/libfoo.rlib";
     const RMETA: &str = ".sccache-build/debug/deps/libfoo.rmeta";
@@ -350,6 +644,280 @@ mod test {
     #[test]
     fn test_sh_quote() {
         assert_eq!(r"'it'\''s'", sh_quote("it's"));
+    }
+
+    fn cas_output(path: &str, data: &[u8]) -> remexec::OutputFile {
+        remexec::OutputFile {
+            path: path.to_owned(),
+            digest: Some(digest::of_bytes(data)),
+            ..Default::default()
+        }
+    }
+
+    fn inline_output(path: &str, data: &[u8]) -> remexec::OutputFile {
+        remexec::OutputFile {
+            contents: data.to_vec(),
+            ..cas_output(path, data)
+        }
+    }
+
+    /// A successful result with `output_files` from a worker whose worker root is /w/1.
+    fn worker_result(output_files: Vec<remexec::OutputFile>) -> remexec::ActionResult {
+        remexec::ActionResult {
+            output_files,
+            stderr_raw: format!("{WORKER_ROOT_MARKER}/w/1\nwarning: in /w/1/src/lib.rs\n")
+                .into_bytes(),
+            ..Default::default()
+        }
+    }
+
+    /// A successful result with the rlib and rmeta from the CAS.
+    fn rlib_and_rmeta_result() -> remexec::ActionResult {
+        worker_result(vec![cas_output(RLIB, b"rlib"), cas_output(RMETA, b"rmeta")])
+    }
+
+    /// Materializes `result` for `reapi_compile_in(dir)`, with `blobs` in the fake's CAS.
+    async fn materialize_in(
+        dir: &Path,
+        blobs: &[&[u8]],
+        result: remexec::ActionResult,
+    ) -> Result<process::Output> {
+        // Cargo creates the output directory before running rustc.
+        std::fs::create_dir_all(dir.join("target/debug/deps")).unwrap();
+        let server = Arc::new(FakeServer::default());
+        for blob in blobs {
+            server.insert_blob(blob);
+        }
+        let cas = Cas::new(&server.serve_and_connect().await);
+        materialize(&cas, &reapi_compile_in(dir.to_str().unwrap()), &result).await
+    }
+
+    /// The names of the files in `dir`'s deps directory. A download that another output's
+    /// failure cancels removes its temp file when its write task ends, which may be later.
+    fn output_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir.join("target/debug/deps"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| !name.starts_with(".tmp"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test_case(cas_output ; "from the CAS")]
+    #[test_case(inline_output ; "inline")]
+    #[tokio::test]
+    async fn test_outputs_are_written_to_their_local_paths(
+        output: fn(&str, &[u8]) -> remexec::OutputFile,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let files = vec![output(RLIB, b"rlib"), output(RMETA, b"rmeta")];
+        let output = materialize_in(dir.path(), &[b"rlib", b"rmeta"], worker_result(files))
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        let deps = dir.path().join("target/debug/deps");
+        assert_eq!(
+            b"rlib".as_slice(),
+            std::fs::read(deps.join("libfoo.rlib")).unwrap()
+        );
+        assert_eq!(
+            b"rmeta".as_slice(),
+            std::fs::read(deps.join("libfoo.rmeta")).unwrap()
+        );
+        // No temp files are left behind.
+        assert_eq!(2, std::fs::read_dir(deps).unwrap().count());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_outputs_get_a_local_compiles_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut result = rlib_and_rmeta_result();
+        result.output_files[0].is_executable = true;
+        materialize_in(dir.path(), &[b"rlib", b"rmeta"], result)
+            .await
+            .unwrap();
+        let deps = dir.path().join("target/debug/deps");
+        let mode = |name: &str| {
+            std::fs::metadata(deps.join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(0o755, mode("libfoo.rlib"));
+        assert_eq!(0o644, mode("libfoo.rmeta"));
+    }
+
+    #[tokio::test]
+    async fn test_stderr_has_local_paths_without_the_worker_root_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = materialize_in(dir.path(), &[b"rlib", b"rmeta"], rlib_and_rmeta_result())
+            .await
+            .unwrap();
+        assert_eq!(
+            format!("warning: in {}\n", dir.path().join("src/lib.rs").display()),
+            String::from_utf8(output.stderr).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stdout_and_stderr_can_come_from_the_cas() {
+        let dir = tempfile::tempdir().unwrap();
+        let stdout = b"in /w/1/src/lib.rs";
+        let stderr = format!("{WORKER_ROOT_MARKER}/w/1\n");
+        let result = remexec::ActionResult {
+            exit_code: 1,
+            stdout_digest: Some(digest::of_bytes(stdout)),
+            stderr_raw: vec![],
+            stderr_digest: Some(digest::of_bytes(stderr.as_bytes())),
+            ..worker_result(vec![])
+        };
+        let output = materialize_in(dir.path(), &[stdout, stderr.as_bytes()], result)
+            .await
+            .unwrap();
+        assert_eq!(
+            format!("in {}", dir.path().join("src/lib.rs").display()),
+            String::from_utf8(output.stdout).unwrap()
+        );
+        assert!(output.stderr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_compile_returns_its_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = remexec::ActionResult {
+            exit_code: 1,
+            ..worker_result(vec![])
+        };
+        let output = materialize_in(dir.path(), &[], result).await.unwrap();
+        assert_eq!(Some(1), output.status.code());
+    }
+
+    #[test_case(
+        remexec::ActionResult { exit_code: 256, ..worker_result(vec![]) },
+        "exit code 256" ; "exit code a process can't return")]
+    #[test_case(
+        worker_result(vec![cas_output(RLIB, b"rlib"), cas_output(RMETA, b"rmeta"), inline_output("other", b"x")]),
+        "result has undeclared output other" ; "undeclared output")]
+    #[test_case(
+        worker_result(vec![cas_output(RLIB, b"rlib"), cas_output(RMETA, b"rmeta"), inline_output("../x", b"x")]),
+        "result has undeclared output ../x" ; "output outside the input root")]
+    #[test_case(
+        worker_result(vec![cas_output(RLIB, b"rlib"), cas_output(RMETA, b"rmeta"), cas_output(RLIB, b"rmeta")]),
+        "twice" ; "output returned twice")]
+    #[test_case(
+        remexec::ActionResult {
+            output_symlinks: vec![remexec::OutputSymlink { path: RLIB.to_owned(), target: "/etc/passwd".to_owned(), ..Default::default() }],
+            ..worker_result(vec![cas_output(RMETA, b"rmeta")])
+        },
+        "symlinks" ; "output symlink")]
+    #[test_case(
+        #[allow(deprecated)]
+        remexec::ActionResult {
+            output_file_symlinks: vec![remexec::OutputSymlink { path: RLIB.to_owned(), target: "/etc/passwd".to_owned(), ..Default::default() }],
+            ..worker_result(vec![cas_output(RMETA, b"rmeta")])
+        },
+        "symlinks" ; "output symlink in a deprecated field")]
+    #[test_case(
+        remexec::ActionResult {
+            output_directories: vec![remexec::OutputDirectory { path: ".sccache-build".to_owned(), ..Default::default() }],
+            ..rlib_and_rmeta_result()
+        },
+        "directories" ; "output directory")]
+    #[test_case(
+        worker_result(vec![cas_output(RMETA, b"rmeta")]),
+        "result lacks output .sccache-build/debug/deps/libfoo.rlib" ; "missing rlib")]
+    #[test_case(
+        worker_result(vec![remexec::OutputFile { digest: None, ..cas_output(RLIB, b"rlib") }, cas_output(RMETA, b"rmeta")]),
+        "has no digest" ; "output without a digest")]
+    #[test_case(
+        worker_result(vec![
+            remexec::OutputFile { digest: Some(digest::of_bytes(b"other")), ..inline_output(RLIB, b"rlib") },
+            cas_output(RMETA, b"rmeta"),
+        ]),
+        "doesn't match its digest" ; "inline output that doesn't match its digest")]
+    #[test_case(
+        remexec::ActionResult { stderr_raw: vec![], ..rlib_and_rmeta_result() },
+        "doesn't report the worker root" ; "no worker root line")]
+    #[test_case(
+        remexec::ActionResult {
+            stderr_raw: format!("{WORKER_ROOT_MARKER}\n").into_bytes(),
+            ..rlib_and_rmeta_result()
+        },
+        "doesn't report the worker root" ; "empty worker root")]
+    #[test_case(
+        remexec::ActionResult {
+            stderr_raw: [WORKER_ROOT_MARKER.as_bytes(), b"/w/\xff\n"].concat(),
+            ..rlib_and_rmeta_result()
+        },
+        "doesn't report the worker root" ; "worker root that isn't UTF-8")]
+    #[tokio::test]
+    async fn test_unusable_results_write_nothing(result: remexec::ActionResult, expected: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let e = materialize_in(dir.path(), &[b"rlib", b"rmeta"], result)
+            .await
+            .unwrap_err();
+        assert!(e.is::<UnusableResult>(), "{e:#}");
+        assert!(format!("{e:#}").contains(expected), "{e:#}");
+        assert!(output_names(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_an_output_the_cas_doesnt_have_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = vec![
+            cas_output(RLIB, b"rlib"),
+            cas_output(RMETA, b"not in the CAS"),
+        ];
+        let e = materialize_in(dir.path(), &[b"rlib"], worker_result(files))
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("NotFound"), "{e:#}");
+        assert!(output_names(dir.path()).is_empty());
+    }
+
+    #[test_case(cas_output(RLIB, b"in /w/1/src") ; "from the CAS")]
+    #[test_case(inline_output(RLIB, b"in /w/1/src") ; "inline")]
+    #[tokio::test]
+    async fn test_an_output_containing_the_worker_root_writes_nothing(rlib: remexec::OutputFile) {
+        let dir = tempfile::tempdir().unwrap();
+        // The rmeta comes first, so writing it before checking the rlib would leave it behind.
+        let files = vec![cas_output(RMETA, b"rmeta"), rlib];
+        let e = materialize_in(
+            dir.path(),
+            &[b"in /w/1/src", b"rmeta"],
+            worker_result(files),
+        )
+        .await
+        .unwrap_err();
+        assert!(e.is::<WorkerRootInOutput>(), "{e:#}");
+        assert!(output_names(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_write_removes_the_outputs_already_written() {
+        let dir = tempfile::tempdir().unwrap();
+        // A non-empty directory at the rmeta's path, which a rename can't replace.
+        std::fs::create_dir_all(dir.path().join("target/debug/deps/libfoo.rmeta/x")).unwrap();
+        let e = materialize_in(dir.path(), &[b"rlib", b"rmeta"], rlib_and_rmeta_result())
+            .await
+            .unwrap_err();
+        assert!(e.is::<UnwritableOutputs>(), "{e:#}");
+        assert_eq!(["libfoo.rmeta"], output_names(dir.path()).as_slice());
+    }
+
+    #[test]
+    fn test_the_worker_root_line_is_taken_once() {
+        let stderr = format!("{WORKER_ROOT_MARKER}/w/1\nwarning: x\n{WORKER_ROOT_MARKER}/w/2\n");
+        let (worker_root, rest) = take_worker_root(stderr.as_bytes()).unwrap();
+        assert_eq!("/w/1", worker_root);
+        assert_eq!(
+            format!("warning: x\n{WORKER_ROOT_MARKER}/w/2\n"),
+            String::from_utf8(rest).unwrap()
+        );
     }
 
     #[test]
