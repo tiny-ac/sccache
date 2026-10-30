@@ -21,7 +21,7 @@ use super::cas::UnreadableBlob;
 use super::client::{ConnectOptions, RPC_TIMEOUT, check_connect_options, rpc_code};
 use super::connection::{Connection, ServerApis};
 use super::digest::DigestCache;
-use super::execution::{Execution, MissingActionBlobs};
+use super::execution::{Execution, MissingActionBlobs, QueuedTooLong};
 use super::mapping::{CompileLocallyReason, ReapiCompile, ToolchainKey};
 use super::pause::Pause;
 use super::proto::build::bazel::remote::execution::v2 as remexec;
@@ -51,6 +51,8 @@ const SYSROOT_COPIES_DIR: &str = "reapi-sysroot-copies";
 const DIGEST_CACHE_FILE: &str = "reapi-digests.json";
 /// Bounds an execution, with its reattaches and its retry after uploading again.
 const EXECUTE_TIMEOUT: Duration = Duration::from_secs(600);
+/// How long a miss the server reports queued waits for a worker without `queue_timeout_secs`.
+const DEFAULT_QUEUE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Caps `ready_wait_secs`, since `Instant::now() + ready_wait` panics on overflow.
 const MAX_READY_WAIT: Duration = Duration::from_secs(3600);
 
@@ -66,6 +68,7 @@ pub struct ReapiExecutor {
     execution_pause: Pause,
     action_options: ActionOptions,
     on_miss: ReapiOnMiss,
+    queue_timeout: Duration,
     is_linux_client: bool,
     rustc_checks: Mutex<HashMap<ToolchainKey, Arc<RustcCheck>>>,
     /// Set when the server refuses an execution, so misses compile locally until the sccache
@@ -125,6 +128,9 @@ impl ReapiExecutor {
             execution_pause: Pause::new(EXECUTE_TIMEOUT),
             action_options: ActionOptions::new(config),
             on_miss: config.on_miss,
+            queue_timeout: config
+                .queue_timeout_secs
+                .map_or(DEFAULT_QUEUE_TIMEOUT, Duration::from_secs),
             is_linux_client: cfg!(target_os = "linux"),
             rustc_checks: Default::default(),
             executions_refused: AtomicBool::new(false),
@@ -304,7 +310,15 @@ impl ReapiExecutor {
                 out_pretty,
             )
             .await?;
-            upload_and_execute(&apis, execution, &action, skip_cache_lookup, out_pretty).await
+            upload_and_execute(
+                &apis,
+                execution,
+                &action,
+                skip_cache_lookup,
+                self.queue_timeout,
+                out_pretty,
+            )
+            .await
         }
         .await;
         let response = match executed {
@@ -426,7 +440,15 @@ impl ReapiExecutor {
             );
             CompileLocallyReason::HashingInputsFailed
         })?;
-        let response = upload_and_execute(apis, execution, &action, false, out_pretty).await?;
+        let response = upload_and_execute(
+            apis,
+            execution,
+            &action,
+            false,
+            self.queue_timeout,
+            out_pretty,
+        )
+        .await?;
         self.execution_pause.call_succeeded();
         let result = response.result.unwrap_or_default();
         let sysroot = key.sysroot.display();
@@ -521,13 +543,14 @@ async fn upload_and_execute(
     execution: &Execution,
     action: &ActionBlobs,
     skip_cache_lookup: bool,
+    queue_timeout: Duration,
     out_pretty: &str,
 ) -> std::result::Result<remexec::ExecuteResponse, CompileLocallyReason> {
     let deadline = tokio::time::Instant::now() + EXECUTE_TIMEOUT;
     let execute = || async {
         tokio::time::timeout_at(
             deadline,
-            execution.execute_action(&action.action_digest, skip_cache_lookup),
+            execution.execute_action(&action.action_digest, skip_cache_lookup, queue_timeout),
         )
         .await
         .unwrap_or_else(|_| bail!("the execution timed out after {EXECUTE_TIMEOUT:?}"))
@@ -545,6 +568,9 @@ async fn upload_and_execute(
     };
     executed.map_err(|e| {
         warn!("[{}]: Compiling locally: {:#}", out_pretty, e);
+        if e.is::<QueuedTooLong>() {
+            return CompileLocallyReason::ExecutionQueuedTooLong;
+        }
         match rpc_code(&e) {
             Some(tonic::Code::Unauthenticated) => CompileLocallyReason::CredentialsRefused,
             // PERMISSION_DENIED on Execute comes from credentials that may look actions up but
@@ -1334,6 +1360,24 @@ mod test {
             FAILURES_TO_PAUSE as usize,
             fixture.server.execute_calls.load(Ordering::SeqCst)
         );
+    }
+
+    #[test]
+    fn test_an_execution_queued_too_long_compiles_locally() {
+        let fixture = executing_fixture(FakeServer {
+            stages_then_stall: vec![remexec::execution_stage::Value::Queued],
+            ..Default::default()
+        });
+        let mut executor = fixture.executor();
+        executor.queue_timeout = Duration::from_millis(100);
+        for _ in 0..2 {
+            assert_eq!(
+                compiled_locally("REAPI execution queued too long"),
+                fixture.compile_with(&executor).0
+            );
+        }
+        // A rustc check that stayed queued isn't kept, so the next miss checks again.
+        assert_eq!(2, fixture.server.execute_calls.load(Ordering::SeqCst));
     }
 
     #[test]

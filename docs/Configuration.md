@@ -69,6 +69,9 @@ salt = ""
 # locally, and sccache never writes to the server. Execution needs a Linux
 # client
 on_miss = "execute"
+# how long a miss that the server reports queued waits for a worker before it
+# compiles locally
+queue_timeout_secs = 60
 # platform properties set on every action; a name can't repeat
 #[dist.reapi.platform]
 #OSFamily = "linux"

@@ -25,7 +25,7 @@ use super::proto::google::bytestream::{
 use super::proto::google::longrunning::{Operation, operation};
 use super::proto::google::rpc;
 use super::remote_compile::WORKER_ROOT_MARKER;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use prost::Message;
 use remexec::action_cache_server::{ActionCache, ActionCacheServer};
 use remexec::capabilities_server::{Capabilities, CapabilitiesServer};
@@ -39,6 +39,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tonic::codegen::BoxFuture;
 use tonic::transport::server::TcpIncoming;
@@ -102,6 +103,11 @@ pub(crate) struct FakeServer {
     /// Refuses each Execute with this code, such as FAILED_PRECONDITION when no worker
     /// matches the platform.
     pub(crate) execute_error: Option<tonic::Code>,
+    /// Sends each Execute an operation at each of these stages, then nothing, as a server
+    /// whose action waits at the last one.
+    pub(crate) stages_then_stall: Vec<remexec::execution_stage::Value>,
+    /// The wait before each operation of `stages_then_stall`.
+    pub(crate) stage_interval: Duration,
     /// Finishes each Execute with an operation error.
     pub(crate) fail_operations: bool,
     /// Breaks this many Execute and WaitExecution streams, after a first, unfinished
@@ -637,6 +643,26 @@ fn finished_operation(result: operation::Result) -> Operation {
     }
 }
 
+/// An unfinished operation at `stage`.
+fn stage_operation(stage: remexec::execution_stage::Value) -> Operation {
+    let metadata = remexec::ExecuteOperationMetadata {
+        stage: stage as i32,
+        ..Default::default()
+    };
+    Operation {
+        name: "operation".to_owned(),
+        metadata: Some(prost_types::Any {
+            type_url: concat!(
+                "type.googleapis.com/",
+                "build.bazel.remote.execution.v2.ExecuteOperationMetadata"
+            )
+            .to_owned(),
+            value: metadata.encode_to_vec(),
+        }),
+        ..Default::default()
+    }
+}
+
 fn response_operation(response: remexec::ExecuteResponse) -> Operation {
     finished_operation(operation::Result::Response(prost_types::Any {
         type_url: "type.googleapis.com/build.bazel.remote.execution.v2.ExecuteResponse".to_owned(),
@@ -819,6 +845,18 @@ impl Execution for FakeServer {
         self.check_input_root(action.input_root_digest.as_ref())?;
         if let Some(code) = self.execute_error {
             return Err(Status::new(code, "execute_error"));
+        }
+        if !self.stages_then_stall.is_empty() {
+            let interval = self.stage_interval;
+            let operations = futures::stream::iter(self.stages_then_stall.clone()).then(
+                move |stage| async move {
+                    tokio::time::sleep(interval).await;
+                    Ok(stage_operation(stage))
+                },
+            );
+            return Ok(Response::new(Box::pin(
+                operations.chain(futures::stream::pending()),
+            )));
         }
         if self.missing_blobs_in_response {
             let response = remexec::ExecuteResponse {
