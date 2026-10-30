@@ -15,8 +15,8 @@
 //! Looks actions up in a REAPI server's action cache.
 
 use super::client::{
-    AuthChannel, Client, MAX_ACTION_RESULT_RESPONSE_BYTES, RPC_TIMEOUT, status_error, with_retries,
-    with_timeout,
+    Client, MAX_ACTION_RESULT_RESPONSE_BYTES, RPC_TIMEOUT, ReapiChannel, status_error,
+    with_retries, with_timeout,
 };
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use crate::errors::*;
@@ -25,7 +25,7 @@ use remexec::action_cache_client::ActionCacheClient;
 /// The action cache of the REAPI server behind a [`Client`].
 pub(crate) struct ActionCache {
     instance_name: String,
-    action_cache_client: ActionCacheClient<AuthChannel>,
+    action_cache_client: ActionCacheClient<ReapiChannel>,
 }
 
 impl ActionCache {

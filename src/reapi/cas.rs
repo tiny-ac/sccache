@@ -16,7 +16,7 @@
 //! from it and checks them against their digests.
 
 use super::client::{
-    AuthChannel, Client, RPC_TIMEOUT, RpcError, status_error, with_retries, with_timeout,
+    Client, RPC_TIMEOUT, ReapiChannel, RpcError, status_error, with_retries, with_timeout,
 };
 use super::digest;
 use super::proto::build::bazel::remote::execution::v2 as remexec;
@@ -150,8 +150,8 @@ fn zstd_window_log_max(size_bytes: u64) -> u32 {
 /// The CAS of the REAPI server behind a [`Client`].
 pub(crate) struct Cas {
     instance_name: String,
-    cas_client: ContentAddressableStorageClient<AuthChannel>,
-    bytestream_client: ByteStreamClient<AuthChannel>,
+    cas_client: ContentAddressableStorageClient<ReapiChannel>,
+    bytestream_client: ByteStreamClient<ReapiChannel>,
     max_batch_bytes: usize,
     supports_zstd_bytestream: bool,
     /// Blobs known to be in the CAS, so blobs every action shares, such as the toolchain's,

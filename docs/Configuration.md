@@ -82,6 +82,12 @@ queue_timeout_secs = 60
 # platform properties set on every action; a name can't repeat
 #[dist.reapi.platform]
 #OSFamily = "linux"
+# headers sent with every request, such as a proxy's API key. A header can't
+# repeat, be "authorization" with auth_token_file set, start with "grpc-", or
+# be one that gRPC or HTTP/2 owns: te, content-type, user-agent, connection,
+# keep-alive, proxy-connection, transfer-encoding or upgrade
+#[dist.reapi.headers]
+#x-api-key = "..."
 
 # Multi-level cache configuration
 # Define cache levels in order (fast to slow).

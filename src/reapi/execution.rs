@@ -15,7 +15,7 @@
 //! Executes actions on a REAPI server's workers.
 
 use super::client::{
-    AuthChannel, Client, MAX_ACTION_RESULT_RESPONSE_BYTES, RPC_TIMEOUT, RpcError, loggable,
+    Client, MAX_ACTION_RESULT_RESPONSE_BYTES, RPC_TIMEOUT, ReapiChannel, RpcError, loggable,
     rpc_code, with_timeout,
 };
 use super::proto::build::bazel::remote::execution::v2 as remexec;
@@ -69,7 +69,7 @@ impl std::error::Error for MissingActionBlobs {}
 /// The Execution API of the REAPI server behind a [`Client`].
 pub(crate) struct Execution {
     instance_name: String,
-    execution_client: ExecutionClient<AuthChannel>,
+    execution_client: ExecutionClient<ReapiChannel>,
 }
 
 impl Execution {
