@@ -17,12 +17,13 @@
 
 use super::cas::Cas;
 use super::digest::{self, DigestCache};
-use super::input_root::InputRootFile;
+use super::input_root::{InputRoot, InputRootFile};
 use super::mapping::{BUILD_ROOT_DIR, CompileLocallyReason, ReapiCompile, TOOLCHAIN_DIR};
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use crate::errors::*;
 use crate::mock_command::exit_status;
 use memchr::memmem;
+use prost::Message;
 use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -106,6 +107,44 @@ fn command_output_paths(compile: &ReapiCompile) -> impl Iterator<Item = String> 
         .outputs
         .iter()
         .filter_map(|output| compile.path_mapper.to_input_root(output))
+}
+
+/// `compile`'s own input root files, without its toolchain's. Hashing blocks, so call it from
+/// a blocking thread.
+pub(super) fn digest_input_root_files(
+    compile: &ReapiCompile,
+    digest_cache: &DigestCache,
+) -> Result<Vec<InputRootFile>> {
+    compile
+        .input_root_files
+        .iter()
+        .map(|local_path| {
+            let path = compile
+                .path_mapper
+                .to_input_root(local_path)
+                .with_context(|| format!("{} is outside the input root", local_path.display()))?;
+            Ok(InputRootFile {
+                path,
+                digest: digest_cache.digest(local_path)?,
+                is_executable: false,
+            })
+        })
+        .collect()
+}
+
+/// The digest of the action that runs `compile` on `files` and `toolchain`'s files.
+pub(super) fn action_digest(
+    compile: &ReapiCompile,
+    files: &[InputRootFile],
+    toolchain: &[(InputRootFile, PathBuf)],
+) -> Result<remexec::Digest> {
+    let input_root = InputRoot::build(files.iter().chain(toolchain.iter().map(|(file, _)| file)))?;
+    let action = remexec::Action {
+        command_digest: Some(digest::of_bytes(&build_command(compile).encode_to_vec())),
+        input_root_digest: Some(input_root.digest),
+        ..Default::default()
+    };
+    Ok(digest::of_bytes(&action.encode_to_vec()))
 }
 
 fn is_identifier(name: &str) -> bool {
@@ -603,6 +642,72 @@ pub(super) mod test {
         assert_eq!(
             build_command(&reapi_compile_in("/home/a/ws")),
             build_command(&reapi_compile_in("/srv/b/ws"))
+        );
+    }
+
+    /// The action digest of a compile of a `src/lib.rs` holding `lib_rs` in a new checkout
+    /// under `dir`, with the toolchain at `sysroot`, changed by `change`.
+    fn action_digest_in(
+        dir: &Path,
+        lib_rs: &str,
+        sysroot: &Path,
+        change: fn(&mut ReapiCompile),
+    ) -> remexec::Digest {
+        let cwd = dir.join("ws");
+        let lib_rs_path = cwd.join("src/lib.rs");
+        std::fs::create_dir_all(lib_rs_path.parent().unwrap()).unwrap();
+        std::fs::write(&lib_rs_path, lib_rs).unwrap();
+        let mut compile = reapi_compile_in(cwd.to_str().unwrap());
+        compile.input_root_files = vec![lib_rs_path];
+        let digest_cache = DigestCache::load(dir.join("digests.json"));
+        change(&mut compile);
+        let files = digest_input_root_files(&compile, &digest_cache).unwrap();
+        let toolchain =
+            toolchain_files(sysroot, "x86_64-unknown-linux-gnu", &digest_cache).unwrap();
+        action_digest(&compile, &files, &toolchain).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_the_action_depends_on_the_compile_but_not_the_checkout_path() {
+        let toolchains = tempfile::tempdir().unwrap();
+        let sysroot = fake_sysroot(&toolchains.path().join("a"));
+        // fake_sysroot writes each file's path into it, so this toolchain's files differ.
+        let other_sysroot = fake_sysroot(&toolchains.path().join("b"));
+        let digest = |lib_rs, sysroot: &Path, change: fn(&mut ReapiCompile)| {
+            let checkout = tempfile::tempdir().unwrap();
+            action_digest_in(checkout.path(), lib_rs, sysroot, change)
+        };
+        let unchanged: fn(&mut ReapiCompile) = |_| {};
+        let first = digest("pub fn f() {}", &sysroot, unchanged);
+        assert_eq!(
+            first,
+            digest("pub fn f() {}", &sysroot, unchanged),
+            "another checkout"
+        );
+        assert_ne!(
+            first,
+            digest("pub fn g() {}", &sysroot, unchanged),
+            "another lib.rs"
+        );
+        assert_ne!(
+            first,
+            digest("pub fn f() {}", &other_sysroot, unchanged),
+            "another toolchain"
+        );
+        assert_ne!(
+            first,
+            digest("pub fn f() {}", &sysroot, |compile| {
+                compile.arguments.push("-Copt-level=3".to_owned());
+            }),
+            "another argument"
+        );
+        assert_ne!(
+            first,
+            digest("pub fn f() {}", &sysroot, |compile| {
+                compile.env.vars[0].1 = "2.0.0".to_owned();
+            }),
+            "another env var value"
         );
     }
 
