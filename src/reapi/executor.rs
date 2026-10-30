@@ -19,6 +19,7 @@
 use super::client::{ConnectOptions, check_connect_options};
 use super::connection::{Connection, ServerApis};
 use super::digest::DigestCache;
+use super::lookup_pause::LookupPause;
 use super::mapping::{CompileLocallyReason, ReapiCompile};
 use super::remote_compile::{
     action_digest, digest_input_root_files, materialize, materialize_failure_reason,
@@ -52,6 +53,7 @@ pub struct ReapiExecutor {
     toolchains: Arc<Toolchains>,
     ready_wait: Duration,
     sysroot_copies_dir: PathBuf,
+    lookup_pause: LookupPause,
 }
 
 /// What a lookup in the action cache needs.
@@ -86,6 +88,7 @@ impl ReapiExecutor {
             digest_cache,
             ready_wait,
             sysroot_copies_dir: dist_cache_dir.join(SYSROOT_COPIES_DIR),
+            lookup_pause: LookupPause::default(),
         }
     }
 
@@ -133,6 +136,9 @@ impl ReapiExecutor {
         let Some(connection) = &self.connection else {
             return compile_locally(out_pretty, CompileLocallyReason::Misconfigured);
         };
+        if !self.lookup_pause.may_look_up() {
+            return compile_locally(out_pretty, CompileLocallyReason::ActionCacheLookupsPaused);
+        }
         let deadline = Instant::now() + self.ready_wait;
         let ready = tokio::try_join!(
             connection.server_apis(deadline),
@@ -176,15 +182,26 @@ impl ReapiExecutor {
                 return Err(CompileLocallyReason::HashingInputsFailed);
             }
         };
-        let result = match apis.action_cache.get_action_result(&action_digest).await {
-            Ok(Some(result)) if result.exit_code == 0 => result,
-            // A failed result may come from a worker problem, such as running out of memory, so
-            // it counts as a miss.
-            Ok(_) => return compile_locally(out_pretty, CompileLocallyReason::NotInActionCache),
+        let cached = match apis.action_cache.get_action_result(&action_digest).await {
+            Ok(cached) => {
+                self.lookup_pause.lookup_succeeded();
+                cached
+            }
             Err(e) => {
                 warn!("[{}]: Compiling locally: {:#}", out_pretty, e);
+                if let Some(pause) = self.lookup_pause.lookup_failed() {
+                    warn!(
+                        "REAPI: action cache lookups are failing; compiling locally for {pause:?}"
+                    );
+                }
                 return Err(CompileLocallyReason::ActionCacheLookupFailed);
             }
+        };
+        let result = match cached {
+            Some(result) if result.exit_code == 0 => result,
+            // A failed result may come from a worker problem, such as running out of memory, so
+            // it counts as a miss.
+            _ => return compile_locally(out_pretty, CompileLocallyReason::NotInActionCache),
         };
         match materialize(&apis.cas, &reapi_compile, &result).await {
             Ok(output) => {
@@ -304,6 +321,7 @@ mod test {
     use crate::dist;
     use crate::mock_command::{MockChild, MockCommandCreator, exit_status};
     use crate::reapi::fake::FakeServer;
+    use crate::reapi::lookup_pause::FAILURES_TO_PAUSE;
     use crate::reapi::proto::build::bazel::remote::execution::v2 as remexec;
     use crate::reapi::remote_compile::test::{fake_sysroot, inline_output, worker_result};
     use crate::reapi::{PathMapper, ToolchainKey};
@@ -468,10 +486,18 @@ mod test {
             self.server.insert_action_result(&action_digest, result);
         }
 
-        /// Runs the compile through the executor. A local compile writes `out` to stdout and
+        fn executor(&self) -> ReapiExecutor {
+            ReapiExecutor::new(&self.config, &self.dir.path().join("dist"))
+        }
+
+        /// Runs the compile through a new executor. A local compile writes `out` to stdout and
         /// `err` to stderr.
         fn compile(&self) -> (DistType, process::Output) {
-            let executor = ReapiExecutor::new(&self.config, &self.dir.path().join("dist"));
+            self.compile_with(&self.executor())
+        }
+
+        /// Like `compile`, through `executor`.
+        fn compile_with(&self, executor: &ReapiExecutor) -> (DistType, process::Output) {
             let storage = Arc::new(crate::cache::disk::DiskCache::new(
                 self.dir.path(),
                 0,
@@ -557,6 +583,39 @@ mod test {
         let (dist_type, output) = fixture.compile();
         assert_eq!(compiled_locally("action cache lookup failed"), dist_type);
         assert_eq!(b"out".as_slice(), output.stdout);
+    }
+
+    #[test]
+    fn test_compiles_skip_the_lookup_after_failures() {
+        let fixture = Fixture::new(Eligibility::Eligible);
+        fixture.server.fail_lookups.store(true, Ordering::Relaxed);
+        let executor = fixture.executor();
+        for _ in 0..FAILURES_TO_PAUSE {
+            assert_eq!(
+                compiled_locally("action cache lookup failed"),
+                fixture.compile_with(&executor).0
+            );
+        }
+        let (dist_type, output) = fixture.compile_with(&executor);
+        assert_eq!(
+            compiled_locally("action cache lookups paused after failures"),
+            dist_type
+        );
+        assert_eq!(b"out".as_slice(), output.stdout);
+    }
+
+    #[test]
+    fn test_failed_downloads_dont_pause_lookups() {
+        let fixture = Fixture::new(Eligibility::Eligible);
+        // Without inline contents, the client downloads the rlib from the CAS, which lacks it.
+        fixture.put_result_in_action_cache(|result| result.output_files[0].contents.clear());
+        let executor = fixture.executor();
+        for _ in 0..=FAILURES_TO_PAUSE {
+            assert_eq!(
+                compiled_locally("failed to download the outputs"),
+                fixture.compile_with(&executor).0
+            );
+        }
     }
 
     #[test_case::test_case(
