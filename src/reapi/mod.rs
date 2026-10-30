@@ -24,6 +24,7 @@ mod executor;
 #[cfg(test)]
 mod fake;
 mod input_root;
+mod lookup_pause;
 mod mapping;
 pub(crate) mod proto;
 mod remote_compile;
