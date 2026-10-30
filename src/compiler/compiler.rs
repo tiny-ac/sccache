@@ -953,6 +953,14 @@ where
         Cacheable,
     )>;
 
+    /// The compile with its paths mapped for REAPI, or why it can't run through REAPI.
+    #[cfg(feature = "reapi")]
+    fn map_for_reapi(
+        &self,
+    ) -> std::result::Result<crate::reapi::ReapiCompile, crate::reapi::NotEligible> {
+        Err(crate::reapi::CompileLocallyReason::NotRust.into())
+    }
+
     /// Create a function that will create the inputs used to perform a distributed compilation
     #[cfg(feature = "dist-client")]
     fn into_dist_packagers(
