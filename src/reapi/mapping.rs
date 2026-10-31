@@ -51,19 +51,50 @@ pub struct ReapiCompile {
     pub(crate) outputs: Vec<PathBuf>,
 }
 
-/// A local toolchain. Two rustcs can report the same commit and still have different files,
-/// so the key includes the sysroot, and the stamps of rustc, its libraries' directory and the
-/// target's std directory, which change when the toolchain is updated in place or gets a
-/// target added.
+/// A local toolchain.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub(crate) struct ToolchainKey {
-    pub(crate) commit_hash: String,
-    pub(crate) sysroot: PathBuf,
-    pub(crate) target_triple: String,
-    stamps: Vec<Option<(u64, SystemTime)>>,
+pub(crate) enum ToolchainKey {
+    Rustc(RustcToolchainKey),
+    C(CToolchainKey),
 }
 
 impl ToolchainKey {
+    /// Reads the stamps, so call it from a blocking thread.
+    pub(crate) fn rustc(commit_hash: String, sysroot: PathBuf, target_triple: String) -> Self {
+        ToolchainKey::Rustc(RustcToolchainKey::new(commit_hash, sysroot, target_triple))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_rustc(&self) -> &RustcToolchainKey {
+        match self {
+            ToolchainKey::Rustc(key) => key,
+            ToolchainKey::C(key) => panic!("{key:?}"),
+        }
+    }
+}
+
+impl std::fmt::Display for ToolchainKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ToolchainKey::Rustc(key) => write!(f, "the toolchain in {}", key.sysroot.display()),
+            ToolchainKey::C(key) => write!(f, "the toolchain of {}", key.driver.display()),
+        }
+    }
+}
+
+/// A local Rust toolchain. Two rustcs can report the same commit and still have different
+/// files, so the key includes the sysroot, and the stamps of rustc, its libraries' directory
+/// and the target's std directory, which change when the toolchain is updated in place or
+/// gets a target added.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct RustcToolchainKey {
+    pub(crate) commit_hash: String,
+    pub(crate) sysroot: PathBuf,
+    pub(crate) target_triple: String,
+    stamps: Vec<Option<Stamp>>,
+}
+
+impl RustcToolchainKey {
     /// Reads the stamps, so call it from a blocking thread.
     pub(crate) fn new(commit_hash: String, sysroot: PathBuf, target_triple: String) -> Self {
         let stamps = [
@@ -72,18 +103,43 @@ impl ToolchainKey {
             sysroot.join("lib/rustlib").join(&target_triple).join("lib"),
         ]
         .iter()
-        .map(|path| {
-            let metadata = std::fs::metadata(path).ok()?;
-            Some((metadata.len(), metadata.modified().ok()?))
-        })
+        .map(|path| stamp(path))
         .collect();
-        ToolchainKey {
+        RustcToolchainKey {
             commit_hash,
             sysroot,
             target_triple,
             stamps,
         }
     }
+}
+
+/// A local gcc or clang. The key includes the stamp of its driver, which changes when the
+/// compiler is updated in place.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct CToolchainKey {
+    pub(crate) driver: PathBuf,
+    stamp: Option<Stamp>,
+}
+
+impl CToolchainKey {
+    /// Reads the stamp, so call it from a blocking thread.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "C compiles aren't mapped for REAPI yet")
+    )]
+    pub(crate) fn new(driver: PathBuf) -> Self {
+        let stamp = stamp(&driver);
+        CToolchainKey { driver, stamp }
+    }
+}
+
+/// A file's size and modification time.
+type Stamp = (u64, SystemTime);
+
+fn stamp(path: &Path) -> Option<Stamp> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.len(), metadata.modified().ok()?))
 }
 
 /// The environment a compile's action runs with.
@@ -128,7 +184,7 @@ impl From<CompileLocallyReason> for NotEligible {
 /// Why a compile runs locally instead of through REAPI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompileLocallyReason {
-    NotRust,
+    UnsupportedCompiler,
     RustcDriver,
     NoCommitHash,
     WindowsPaths,
@@ -185,12 +241,13 @@ pub enum CompileLocallyReason {
     ExecutionTimedOut,
     CompileFailedOnWorker,
     DaemonFailed,
+    CToolchainUnsupported,
 }
 
 impl std::fmt::Display for CompileLocallyReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::NotRust => "not a Rust compile",
+            Self::UnsupportedCompiler => "unsupported compiler",
             Self::RustcDriver => "not rustc",
             Self::NoCommitHash => "rustc without a commit hash",
             Self::WindowsPaths => "Windows paths",
@@ -247,6 +304,7 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::ExecutionTimedOut => "REAPI action ran out of time on a worker",
             Self::CompileFailedOnWorker => "compile failed on a worker",
             Self::DaemonFailed => "the sccache daemon failed",
+            Self::CToolchainUnsupported => "C toolchain unsupported on workers",
         })
     }
 }
@@ -416,7 +474,7 @@ mod test {
         std::fs::create_dir_all(sysroot.join("bin")).unwrap();
         std::fs::write(sysroot.join("bin/rustc"), b"rustc 1").unwrap();
         let key = || {
-            ToolchainKey::new(
+            ToolchainKey::rustc(
                 "abc123".to_owned(),
                 sysroot.clone(),
                 "wasm32-unknown-unknown".to_owned(),

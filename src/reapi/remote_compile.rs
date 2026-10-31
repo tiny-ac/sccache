@@ -759,7 +759,7 @@ pub(super) mod test {
             path_mapper: PathMapper::new(cwd.into(), format!("{cwd}/target").into()),
             arguments: vec!["--crate-name=foo".to_owned()],
             mapped_crate_root: Some("src/lib.rs".to_owned()),
-            toolchain: ToolchainKey::new(
+            toolchain: ToolchainKey::rustc(
                 "abc123".to_owned(),
                 "/toolchain".into(),
                 "x86_64-unknown-linux-gnu".to_owned(),
