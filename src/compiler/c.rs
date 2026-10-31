@@ -1345,6 +1345,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
         super::c_reapi::map_for_reapi(
             &self.compiler.kind(),
             &self.parsed_args,
+            &self.executable,
             &self.cwd,
             &self.env_vars,
         )
