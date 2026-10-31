@@ -20,10 +20,18 @@ use crate::lru_disk_cache;
 use crate::mock_command::CommandCreatorSync;
 use async_trait::async_trait;
 use fs_err::{self as fs, File};
+use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
+
+mod ipc;
+
+pub(crate) use self::ipc::{
+    DistClientSetup, DistIpcRequest, DistIpcResponse, PendingDistToolchains,
+    handle_dist_ipc_request,
+};
 
 /// What to do when sccache-dist can't complete a compile.
 #[derive(Debug)]
@@ -32,8 +40,9 @@ enum DistError {
     FailCompile(FailCompileReason),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum FailCompileReason {
+    Misconfigured(String),
     ToolchainTooLargeToCache(String),
     HttpClientError(String),
 }
@@ -44,7 +53,8 @@ impl From<FailCompileReason> for Error {
             // Rebuilt as an `HttpClientError`, which `SccacheService` looks for to reset the
             // dist client.
             FailCompileReason::HttpClientError(message) => HttpClientError(message).into(),
-            FailCompileReason::ToolchainTooLargeToCache(message) => anyhow!(message),
+            FailCompileReason::Misconfigured(message)
+            | FailCompileReason::ToolchainTooLargeToCache(message) => anyhow!(message),
         }
     }
 }
@@ -55,7 +65,8 @@ pub struct DistExecutor {
 }
 
 /// A remote compile to run on the cluster, without its packagers.
-struct ClusterCompile {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClusterCompile {
     command: dist::CompileCommand,
     dist_output_paths: Vec<String>,
     compiler_path: PathBuf,
@@ -64,7 +75,8 @@ struct ClusterCompile {
 }
 
 /// The remote compile's result, with its outputs written to their local paths.
-struct ClusterCompileOutput {
+#[derive(Serialize, Deserialize)]
+pub struct ClusterCompileOutput {
     server_id: dist::ServerId,
     output: dist::ProcessOutput,
     local_output_paths: Vec<PathBuf>,
