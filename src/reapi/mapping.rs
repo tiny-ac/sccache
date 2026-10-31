@@ -136,10 +136,6 @@ pub(crate) struct CToolchainKey {
 
 impl CToolchainKey {
     /// Reads the stamp, so call it from a blocking thread.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "C compiles aren't mapped for REAPI yet")
-    )]
     pub(crate) fn new(driver: PathBuf) -> Self {
         let stamp = stamp(&driver);
         CToolchainKey { driver, stamp }
@@ -256,6 +252,8 @@ pub enum CompileLocallyReason {
     UnsupportedLanguage,
     LanguageAfterInput,
     NotFromBuildScript,
+    ExtraOutput,
+    NonUtf8Argument,
     CToolchainUnsupported,
 }
 
@@ -270,7 +268,7 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::UnexpectedCargoLayout => "unexpected cargo dir layout",
             Self::PathOutsideInputRoot => "path outside the cwd and build root",
             Self::SourceOutsideInputRoot => "source file outside the cwd and build root",
-            Self::AbsolutePathInOption => "absolute path in a -C or -Z option",
+            Self::AbsolutePathInOption => "absolute path in an option",
             Self::CustomTargetSpec => "custom target spec",
             Self::NativeCpu => "-C target-cpu=native or -Z tune-cpu=native",
             Self::ProfileUse => "-C profile-use or -C profile-sample-use",
@@ -322,6 +320,8 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::UnsupportedLanguage => "language other than C or C++",
             Self::LanguageAfterInput => "-x after the input",
             Self::NotFromBuildScript => "not run by a cargo build script",
+            Self::ExtraOutput => "output besides the object and the depfile",
+            Self::NonUtf8Argument => "non-UTF-8 argument",
             Self::CToolchainUnsupported => "C toolchain unsupported on workers",
         })
     }
