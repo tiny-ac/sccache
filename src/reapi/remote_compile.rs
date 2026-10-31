@@ -21,10 +21,11 @@ use super::digest::{self, DigestCache};
 use super::input_root::{InputRoot, InputRootFile};
 use super::mapping::{
     BUILD_ROOT_DIR, CToolchainKey, CompileLocallyReason, ReapiCompile, TOOLCHAIN_DIR, ToolchainKey,
-    WorkerProgram,
+    WorkerProgram, lexically_normalize,
 };
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use super::terminal_output::without_terminal_controls;
+use crate::compiler::CCompilerKind;
 use crate::config::ReapiConfig;
 use crate::errors::*;
 use crate::mock_command::exit_status;
@@ -183,6 +184,120 @@ fn rustc_version_command() -> remexec::Command {
         arguments: vec!["/bin/sh".to_owned(), "-c".to_owned(), script],
         ..Default::default()
     }
+}
+
+/// Options whose answers tell C compilers apart: the target, where the driver finds each of
+/// its internal files, and the version. `--version` goes last, since it prints several lines
+/// and only the first counts.
+fn c_compiler_check_options(key: &CToolchainKey) -> Vec<&str> {
+    let mut options = vec!["-dumpmachine"];
+    options.extend(key.internal_files.iter().map(|file| file.option.as_str()));
+    options.push("--version");
+    options
+}
+
+/// The [`ActionBlobs`] of [`c_compiler_check_command`]'s action. Servers neither answer it
+/// from their action cache nor cache its result, so it runs on a worker each time.
+#[expect(dead_code, reason = "the check doesn't run on workers yet")]
+pub(super) fn c_compiler_check_action_blobs(
+    key: &CToolchainKey,
+    toolchain: &[(InputRootFile, PathBuf)],
+    options: &ActionOptions,
+) -> Result<ActionBlobs> {
+    command_action_blobs(
+        c_compiler_check_command(key),
+        toolchain.iter(),
+        options,
+        true,
+    )
+}
+
+/// The command that prints the worker root, then, in a root without a `:` or `=`, the answers
+/// of the input root's copy of the `key` toolchain to [`c_compiler_check_options`]. It fails
+/// unless that copy also compiles a preprocessed source, which runs gcc's `cc1` and `as`.
+fn c_compiler_check_command(key: &CToolchainKey) -> remexec::Command {
+    let mut script = format!(
+        "{ENTER_WORKER_ROOT}printf '%s\\n' \"$PWD\"\n\
+         case \"$PWD\" in *[:=]*) exit 0 ;; esac\n{}",
+        c_toolchain_exports(key)
+    );
+    let driver = format!(
+        "\"$PWD\"/{TOOLCHAIN_DIR}{}",
+        sh_quote(&key.driver.to_string_lossy())
+    );
+    for option in c_compiler_check_options(key) {
+        script.push_str(&format!("{driver} {}\n", sh_quote(option)));
+    }
+    // A gcc without `cc1plus` compiles only C.
+    let has_cc1plus = (key.internal_files.iter()).any(|file| file.option.ends_with("=cc1plus"));
+    let languages = match key.kind {
+        CCompilerKind::Gcc if !has_cc1plus => &["cpp-output"][..],
+        _ => &["cpp-output", "c++-cpp-output"],
+    };
+    for language in languages {
+        script.push_str(&format!(
+            "printf 'int sccache_check;\\n' | {driver} -x {language} -c -o /dev/null -\n"
+        ));
+    }
+    remexec::Command {
+        arguments: vec!["/bin/sh".to_owned(), "-c".to_owned(), script],
+        ..Default::default()
+    }
+}
+
+/// The local `key` toolchain's answers to [`c_compiler_check_options`], one line each, with
+/// the paths of its internal files from `key`. Runs the compiler, so call it from a blocking
+/// thread.
+#[expect(dead_code, reason = "the check doesn't run on workers yet")]
+pub(super) fn local_c_compiler_answers(key: &CToolchainKey) -> Result<Vec<String>> {
+    (c_compiler_check_options(key).into_iter())
+        .map(|option| {
+            if let Some(file) = key.internal_files.iter().find(|f| f.option == option) {
+                return Ok(file.path.to_string_lossy().into_owned());
+            }
+            let output = std::process::Command::new(&key.driver)
+                .arg(option)
+                .env_clear()
+                .output()?;
+            if !output.status.success() {
+                bail!("{option} exits with {}", output.status);
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            Ok(stdout.lines().next().unwrap_or_default().to_owned())
+        })
+        .collect()
+}
+
+/// The answers in the `stdout` of [`c_compiler_check_action_blobs`]'s action, as
+/// [`local_c_compiler_answers`] has them. Fails for a worker root with a `:` or `=`, and for
+/// an internal file outside the toolchain dir.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the check doesn't run on workers yet")
+)]
+pub(super) fn worker_c_compiler_answers(
+    key: &CToolchainKey,
+    stdout: &str,
+) -> std::result::Result<Vec<String>, CompileLocallyReason> {
+    let differs = CompileLocallyReason::CCompilerDiffersOnWorkers;
+    let mut lines = stdout.lines();
+    let worker_root = lines.next().ok_or(differs)?;
+    if worker_root.contains([':', '=']) {
+        return Err(CompileLocallyReason::ColonOrEqualsInPath);
+    }
+    let toolchain_dir = Path::new(worker_root).join(TOOLCHAIN_DIR);
+    (c_compiler_check_options(key).into_iter())
+        .map(|option| {
+            let line = lines.next().ok_or(differs)?;
+            if !key.internal_files.iter().any(|file| file.option == option) {
+                return Ok(line.to_owned());
+            }
+            let path = lexically_normalize(Path::new(line));
+            let path_in_toolchain_dir = path.strip_prefix(&toolchain_dir).map_err(|_| differs)?;
+            let local_path = Path::new("/").join(path_in_toolchain_dir);
+            Ok(local_path.to_string_lossy().into_owned())
+        })
+        .collect()
 }
 
 /// The paths `compile`'s command declares as outputs, input-root-relative.
@@ -855,7 +970,6 @@ fn exit_status_from_code(exit_code: u8) -> process::ExitStatus {
 #[cfg(test)]
 pub(super) mod test {
     use super::*;
-    use crate::compiler::CCompilerKind;
     use crate::reapi::fake::FakeServer;
     use crate::reapi::mapping::{CToolchainKey, InternalFile};
     use crate::reapi::{ActionEnv, PathMapper, PreprocessedSource};
@@ -1304,6 +1418,29 @@ pub(super) mod test {
         );
         let output = run_in_worker_root(&build_command(&gcc_compile()), &worker_root);
         assert!(!output.status.success(), "{output:?}");
+    }
+
+    #[cfg(unix)]
+    #[test_case(":" ; "colon")]
+    #[test_case("=" ; "equals")]
+    fn test_a_c_check_in_a_worker_root_with_a_separator_fails(separator: &str) {
+        let ToolchainKey::C(key) = gcc_compile().toolchain else {
+            unreachable!()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let worker_root = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join(format!("a{separator}b"));
+        // With no driver, the check succeeds only by exiting before it runs one.
+        std::fs::create_dir_all(&worker_root).unwrap();
+        let output = run_in_worker_root(&c_compiler_check_command(&key), &worker_root);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            Err(CompileLocallyReason::ColonOrEqualsInPath),
+            worker_c_compiler_answers(&key, &String::from_utf8_lossy(&output.stdout))
+        );
     }
 
     #[test]
