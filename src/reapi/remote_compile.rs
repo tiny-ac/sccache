@@ -40,6 +40,10 @@ use tempfile::{NamedTempFile, TempPath};
 pub(super) const WORKER_ROOT_MARKER: &str = "sccache-reapi-pwd:";
 /// Starts a worker's script, with `$PWD` set to the physical worker root.
 const ENTER_WORKER_ROOT: &str = "set -e\ncd -P .\nPWD=$(pwd -P)\n";
+/// Fails a C script in a worker root with a `:`, which would split `LD_LIBRARY_PATH` and
+/// `COMPILER_PATH`, or a `=`, which would end the old prefix of `-ffile-prefix-map`.
+const EXIT_IF_WORKER_ROOT_HAS_COLON_OR_EQUALS: &str =
+    "case \"$PWD\" in *[:=]*) echo 'sccache: the worker root has a : or =' >&2; exit 1 ;; esac\n";
 
 /// The command a worker runs for `compile`, which doesn't depend on the checkout path. A
 /// shell script adds the worker root, known only when the action runs, to path env vars and
@@ -91,6 +95,7 @@ pub(super) fn build_command(compile: &ReapiCompile) -> remexec::Command {
         }
         // The worker root differs per action, so objects name it as `.`.
         (WorkerProgram::C, ToolchainKey::C(key)) => {
+            script.push_str(EXIT_IF_WORKER_ROOT_HAS_COLON_OR_EQUALS);
             script.push_str(&c_toolchain_exports(key));
             script.push_str(&format!(
                 "exec \"$PWD\"/{TOOLCHAIN_DIR}{} \"$@\" -ffile-prefix-map=\"$PWD\"=.\n",
@@ -439,11 +444,19 @@ pub(super) fn toolchain_files(
 
 /// `toolchain`'s driver, internal files and libraries, as input root files under
 /// [`TOOLCHAIN_DIR`] at their local absolute paths, paired with those paths. Fails with
-/// [`UnusableToolchain`] for a non-UTF-8 path.
+/// [`UnusableToolchain`] for a non-UTF-8 path, or a dir that a worker's path var can't hold.
 pub(super) fn c_toolchain_files(
     toolchain: &CToolchainKey,
     digest_cache: &DigestCache,
 ) -> Result<Vec<(InputRootFile, PathBuf)>> {
+    for (name, dirs) in c_toolchain_path_vars(toolchain) {
+        if let Some(dir) = dirs.iter().find(|dir| dir.contains([':', '='])) {
+            return Err(unusable(
+                CompileLocallyReason::ColonOrEqualsInPath,
+                format!("{name} would hold {dir}"),
+            ));
+        }
+    }
     let executables: HashSet<&PathBuf> = std::iter::once(&toolchain.driver)
         .chain(
             (toolchain.internal_files.iter())
@@ -1252,6 +1265,24 @@ pub(super) mod test {
         );
     }
 
+    #[cfg(unix)]
+    #[test_case(":" ; "colon")]
+    #[test_case("=" ; "equals")]
+    fn test_a_c_command_fails_in_a_worker_root_with_a_separator(separator: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let worker_root = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join(format!("a{separator}b"));
+        crate::test::utils::write_executable(
+            &worker_root.join(".sccache-toolchain/usr/bin/gcc"),
+            "",
+        );
+        let output = run_in_worker_root(&build_command(&gcc_compile()), &worker_root);
+        assert!(!output.status.success(), "{output:?}");
+    }
+
     #[test]
     fn test_sh_quote() {
         assert_eq!(r"'it'\''s'", sh_quote("it's"));
@@ -1713,6 +1744,24 @@ pub(super) mod test {
             ],
             files
         );
+    }
+
+    #[test_case("/opt/a:b/libgmp.so.10", "/usr/bin/cc1" ; "colon in a library dir")]
+    #[test_case("/usr/lib/libgmp.so.10", "/opt/a=b/cc1" ; "equals in a program dir")]
+    fn test_a_c_toolchain_whose_path_var_cant_hold_a_dir_is_unusable(library: &str, cc1: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let toolchain = CToolchainKey::with_libraries(
+            CCompilerKind::Gcc,
+            "/usr/bin/gcc".into(),
+            vec![internal_file("-print-prog-name=cc1", cc1)],
+            vec![library.into()],
+        );
+        let digest_cache = DigestCache::load(dir.path().join("digests"));
+        let e = c_toolchain_files(&toolchain, &digest_cache).unwrap_err();
+        assert!(matches!(
+            e.downcast_ref(),
+            Some(UnusableToolchain(CompileLocallyReason::ColonOrEqualsInPath))
+        ));
     }
 
     /// The key of the local `gcc` or `clang`, as a compile of a C source gets it, or `None`
