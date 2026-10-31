@@ -127,32 +127,59 @@ impl RustcToolchainKey {
     }
 }
 
-/// A local gcc or clang: its driver's canonical path, and the files besides the driver that
-/// it runs or reads to compile. The key includes their stamps, which change when one of them
-/// is updated in place.
+/// A local gcc or clang: its driver's canonical path, the files besides the driver that it
+/// runs or reads to compile, and the shared libraries they load other than glibc's. The key
+/// includes their stamps, which change when one of them is updated in place.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct CToolchainKey {
     pub(crate) kind: CCompilerKind,
     pub(crate) driver: PathBuf,
     pub(crate) internal_files: Vec<InternalFile>,
+    pub(crate) libraries: Vec<PathBuf>,
     stamps: Vec<Option<Stamp>>,
 }
 
 impl CToolchainKey {
-    /// Reads the stamps, so call it from a blocking thread.
+    /// Lists the libraries and reads the stamps, so call it from a blocking thread.
     pub(crate) fn new(
         kind: CCompilerKind,
         driver: PathBuf,
         internal_files: Vec<InternalFile>,
+    ) -> Result<Self> {
+        let programs = std::iter::once(&driver).chain(
+            (internal_files.iter())
+                .filter(|file| file.is_program())
+                .map(|file| &file.path),
+        );
+        let mut libraries = std::collections::BTreeSet::new();
+        for program in programs {
+            libraries.extend(shared_libraries(program)?);
+        }
+        Ok(Self::with_libraries(
+            kind,
+            driver,
+            internal_files,
+            libraries.into_iter().collect(),
+        ))
+    }
+
+    /// Reads the stamps, so call it from a blocking thread.
+    pub(crate) fn with_libraries(
+        kind: CCompilerKind,
+        driver: PathBuf,
+        internal_files: Vec<InternalFile>,
+        libraries: Vec<PathBuf>,
     ) -> Self {
         let stamps = std::iter::once(&driver)
             .chain(internal_files.iter().map(|file| &file.path))
+            .chain(&libraries)
             .map(|path| stamp(path))
             .collect();
         CToolchainKey {
             kind,
             driver,
             internal_files,
+            libraries,
             stamps,
         }
     }
@@ -171,6 +198,45 @@ impl InternalFile {
     pub(crate) fn is_program(&self) -> bool {
         self.option.starts_with("-print-prog-name=")
     }
+}
+
+/// Shared libraries of glibc, which must come from the worker: each works only with the loader
+/// and the other libraries of its own glibc.
+#[cfg(target_os = "linux")]
+pub(super) const GLIBC_LIBRARIES: &[&str] = &[
+    "libc.so",
+    "libm.so",
+    "ld-linux",
+    "libpthread.so",
+    "libdl.so",
+    "librt.so",
+];
+
+/// The shared libraries that `program` loads, other than glibc's. A script loads none.
+#[cfg(target_os = "linux")]
+fn shared_libraries(program: &Path) -> Result<Vec<PathBuf>> {
+    let mut magic = [0; 4];
+    let is_elf = std::fs::File::open(program)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut magic))
+        .is_ok_and(|()| magic == *b"\x7fELF");
+    if !is_elf {
+        return Ok(vec![]);
+    }
+    let libraries = crate::dist::ldd::find_ldd_libraries(program)
+        .with_context(|| format!("failed to list the libraries of {}", program.display()))?;
+    Ok(libraries
+        .into_iter()
+        .filter(|library| {
+            let name = library.file_name().unwrap_or_default().to_string_lossy();
+            !GLIBC_LIBRARIES.iter().any(|glibc| name.starts_with(glibc))
+        })
+        .collect())
+}
+
+/// Workers run Linux, so another OS's compiler never runs there.
+#[cfg(not(target_os = "linux"))]
+fn shared_libraries(_program: &Path) -> Result<Vec<PathBuf>> {
+    Ok(vec![])
 }
 
 /// A file's size and modification time.
@@ -297,6 +363,7 @@ pub enum CompileLocallyReason {
     NonUtf8Argument,
     CToolchainUnsupported,
     MissingGccProgram,
+    SharedLibrariesNotListed,
 }
 
 impl std::fmt::Display for CompileLocallyReason {
@@ -376,6 +443,7 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::NonUtf8Argument => "non-UTF-8 argument",
             Self::CToolchainUnsupported => "C toolchain unsupported on workers",
             Self::MissingGccProgram => "gcc without its cc1, cc1plus or as",
+            Self::SharedLibrariesNotListed => "failed to list the compiler's shared libraries",
         })
     }
 }
@@ -560,6 +628,27 @@ mod test {
 
         std::fs::create_dir_all(sysroot.join("lib/rustlib/wasm32-unknown-unknown/lib")).unwrap();
         assert_ne!(updated, key(), "target added");
+    }
+
+    #[test]
+    fn test_a_c_toolchain_key_changes_with_a_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let (driver, library) = (dir.path().join("gcc"), dir.path().join("libgmp.so.10"));
+        std::fs::write(&driver, b"gcc").unwrap();
+        std::fs::write(&library, b"gmp 1").unwrap();
+        let key = || {
+            CToolchainKey::with_libraries(
+                CCompilerKind::Gcc,
+                driver.clone(),
+                vec![],
+                vec![library.clone()],
+            )
+        };
+        let original = key();
+        assert_eq!(original, key());
+
+        std::fs::write(&library, b"gmp 1.1").unwrap();
+        assert_ne!(original, key(), "the library changed");
     }
 
     fn path_mapper() -> PathMapper {

@@ -213,11 +213,9 @@ mod test {
     async fn test_a_c_toolchain_is_unusable() {
         let dir = tempfile::tempdir().unwrap();
         let toolchains = toolchains(dir.path(), RETRY_AFTER);
-        let key = ToolchainKey::C(CToolchainKey::new(
-            CCompilerKind::Gcc,
-            "/usr/bin/cc".into(),
-            vec![],
-        ));
+        let key = ToolchainKey::C(
+            CToolchainKey::new(CCompilerKind::Gcc, "/usr/bin/cc".into(), vec![]).unwrap(),
+        );
         assert_eq!(
             Some(CompileLocallyReason::CToolchainUnsupported),
             toolchains.files(&key, in_secs(10)).await.err()
