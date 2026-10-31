@@ -49,6 +49,7 @@ PROFILES_memcached-deprecated := memcached
 PROFILES_multilevel := multilevel redis memcached s3 azblob webdav
 PROFILES_multilevel-chain := multilevel-chain redis memcached s3
 PROFILES_reapi := reapi
+PROFILES_reapi-buildbarn := reapi-buildbarn
 PROFILES_redis := redis
 PROFILES_redis-deprecated := redis
 PROFILES_s3 := s3
@@ -71,6 +72,7 @@ SERVICES_memcached-deprecated := memcached
 SERVICES_multilevel := redis memcached silo silo-setup azurite azurite-setup webdav
 SERVICES_multilevel-chain := redis memcached silo silo-setup
 SERVICES_reapi := nativelink
+SERVICES_reapi-buildbarn := bb-storage bb-scheduler bb-worker bb-runner
 SERVICES_redis := redis
 SERVICES_redis-deprecated := redis
 SERVICES_s3 := silo silo-setup
@@ -108,6 +110,7 @@ help:
 	@echo "  make test-basedirs           Run basedirs test across all backends"
 	@echo "  make test-file-prefix-map    Run basedirs vs -ffile-prefix-map test"
 	@echo "  make test-reapi              Run REAPI test against NativeLink"
+	@echo "  make test-reapi-buildbarn    Run REAPI test against Buildbarn"
 	@echo "  make test-multilevel         Run multi-level cache test across all backends"
 	@echo "  make test-multilevel-chain   Run multi-level backfill chain test (4 levels)"
 	@echo ""

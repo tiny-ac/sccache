@@ -1,6 +1,6 @@
 # NativeLink on rust:latest. Its worker runs actions without a sandbox, so the rustc and
-# proc macros that sccache uploads need the client's system libraries. The test client runs in
-# this image too.
+# proc macros that sccache uploads need the client's system libraries. The test client and
+# Buildbarn's runner run in this image too.
 FROM ghcr.io/tracemachina/nativelink:v1.7.4 AS nativelink
 
 FROM rust:latest
