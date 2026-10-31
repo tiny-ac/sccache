@@ -1491,9 +1491,7 @@ impl Config {
             // be write races from multiple processes. Until those are addressed, we
             // can't leave the client mode enabled alongside logging.
             && std::env::var_os(crate::LOGGING_ENV).is_none()
-            // Client-side mode is also not compatible with distributed compilation.
-            && dist.scheduler_url.is_none()
-            // Nor with REAPI, whose executor runs in the server.
+            // Client-side mode is not compatible with REAPI, whose executor runs in the server.
             && !(cfg!(feature = "reapi") && dist.reapi.is_some());
 
         let (caches, fallback_cache) = conf_caches.clone().into_fallback();
@@ -3761,4 +3759,31 @@ instance_name = "main"
     );
     let e = config.unwrap_err();
     assert!(e.to_string().contains("endpoint"), "{e}");
+}
+
+#[test]
+fn config_client_side_mode_stays_on_with_a_scheduler() {
+    let env_conf = EnvConfig {
+        cache: Default::default(),
+        basedirs: None,
+        dist_cache_dir: None,
+        client_side_mode: Some(true),
+    };
+    let file_conf = FileConfig {
+        dist: DistConfig {
+            #[cfg(any_dist)]
+            scheduler_url: Some(HTTPUrl::from_url(
+                parse_http_url("http://1.2.3.4:10600").unwrap(),
+            )),
+            #[cfg(not(any_dist))]
+            scheduler_url: Some("http://1.2.3.4:10600".to_owned()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let config = temp_env::with_var_unset(crate::LOGGING_ENV, || {
+        Config::from_env_and_file_configs(env_conf, file_conf).unwrap()
+    });
+    assert!(config.client_side_mode);
 }

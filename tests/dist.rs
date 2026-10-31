@@ -24,12 +24,31 @@ use sccache::errors::*;
 mod harness;
 
 fn basic_compile(tmpdir: &Path, sccache_cfg_path: &Path, sccache_cached_cfg_path: &Path) {
-    let envs: Vec<(_, &OsStr)> = vec![
+    compile_c(
+        tmpdir,
+        sccache_cfg_path,
+        sccache_cached_cfg_path,
+        Mode::ServerSide,
+    );
+}
+
+enum Mode {
+    ServerSide,
+    ClientSide,
+}
+
+/// Compiles a C file through sccache.
+fn compile_c(tmpdir: &Path, sccache_cfg_path: &Path, sccache_cached_cfg_path: &Path, mode: Mode) {
+    let mut envs: Vec<(_, &OsStr)> = vec![
         ("RUST_BACKTRACE", "1".as_ref()),
-        ("SCCACHE_LOG", "debug".as_ref()),
         ("SCCACHE_CONF", sccache_cfg_path.as_ref()),
         ("SCCACHE_CACHED_CONF", sccache_cached_cfg_path.as_ref()),
     ];
+    match mode {
+        // Without SCCACHE_LOG, since logging turns client-side mode off.
+        Mode::ClientSide => envs.push(("SCCACHE_CLIENT_SIDE", "1".as_ref())),
+        Mode::ServerSide => envs.push(("SCCACHE_LOG", "debug".as_ref())),
+    }
     let source_file = "x.c";
     let obj_file = "x.o";
     write_source(
@@ -205,6 +224,44 @@ fn test_dist_failed_compile() {
         assert_eq!(1, info.stats.dist_compiles.values().sum::<usize>());
         assert_eq!(0, info.stats.dist_errors);
         assert_eq!(1, info.stats.compile_fails);
+    });
+}
+
+#[test]
+#[cfg_attr(not(feature = "dist-tests"), ignore)]
+fn test_dist_basic_client_side() {
+    let tmpdir = tempfile::Builder::new()
+        .prefix("sccache_dist_test")
+        .tempdir()
+        .unwrap();
+    let tmpdir = tmpdir.path();
+    let sccache_dist = harness::sccache_dist_path();
+
+    let mut system = harness::DistSystem::new(&sccache_dist, tmpdir);
+    system.add_scheduler();
+    system.add_server();
+
+    let sccache_cfg = dist_test_sccache_client_cfg(tmpdir, system.scheduler_url());
+    let sccache_cfg_path = tmpdir.join("sccache-cfg.json");
+    write_json_cfg(tmpdir, "sccache-cfg.json", &sccache_cfg);
+    let sccache_cached_cfg_path = tmpdir.join("sccache-cached-cfg");
+
+    stop_local_daemon();
+    start_local_daemon(&sccache_cfg_path, &sccache_cached_cfg_path);
+    // The CLI packages the compile and the daemon's dist client runs it.
+    compile_c(
+        tmpdir,
+        &sccache_cfg_path,
+        &sccache_cached_cfg_path,
+        Mode::ClientSide,
+    );
+
+    get_stats(|info| {
+        assert_eq!(1, info.stats.dist_compiles.values().sum::<usize>());
+        assert_eq!(0, info.stats.dist_errors);
+        assert_eq!(1, info.stats.cache_misses.all());
+        // Client-side mode sends the daemon no Compile request.
+        assert_eq!(0, info.stats.compile_requests);
     });
 }
 
