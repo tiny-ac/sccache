@@ -29,7 +29,24 @@ use std::sync::Arc;
 #[derive(Debug)]
 enum DistError {
     CompileLocally(Error),
-    FailCompile(Error),
+    FailCompile(FailCompileReason),
+}
+
+#[derive(Debug)]
+pub enum FailCompileReason {
+    ToolchainTooLargeToCache(String),
+    HttpClientError(String),
+}
+
+impl From<FailCompileReason> for Error {
+    fn from(reason: FailCompileReason) -> Self {
+        match reason {
+            // Rebuilt as an `HttpClientError`, which `SccacheService` looks for to reset the
+            // dist client.
+            FailCompileReason::HttpClientError(message) => HttpClientError(message).into(),
+            FailCompileReason::ToolchainTooLargeToCache(message) => anyhow!(message),
+        }
+    }
 }
 
 /// A [`RemoteExecutor`] that runs compiles on an sccache-dist cluster.
@@ -90,18 +107,28 @@ impl<T: CommandCreatorSync> RemoteExecutor<T> for DistExecutor {
         }
         .await
         .map_err(|error| classify_error(error, &compiler_path));
-        match result {
-            Ok(compiled) => Ok(compiled),
-            Err(DistError::FailCompile(e)) => Err(e),
-            Err(DistError::CompileLocally(e)) => {
-                // `{:#}` prints the error and the causes in a single line.
-                let errmsg = format!("{:#}", e);
-                warn!(
-                    "[{}]: Could not perform distributed compile, falling back to local: {}",
-                    out_pretty, errmsg
-                );
-                Ok((DistType::Error, local_compile.run().await?))
-            }
+        compile_locally_on_error(result, local_compile, &out_pretty).await
+    }
+}
+
+/// Returns `result`, compiling with `local_compile` instead if it's a
+/// [`DistError::CompileLocally`].
+async fn compile_locally_on_error<T: CommandCreatorSync>(
+    result: std::result::Result<(DistType, process::Output), DistError>,
+    local_compile: LocalCompile<'_, T>,
+    out_pretty: &str,
+) -> Result<(DistType, process::Output)> {
+    match result {
+        Ok(compiled) => Ok(compiled),
+        Err(DistError::FailCompile(reason)) => Err(reason.into()),
+        Err(DistError::CompileLocally(e)) => {
+            // `{:#}` prints the error and the causes in a single line.
+            let errmsg = format!("{:#}", e);
+            warn!(
+                "[{}]: Could not perform distributed compile, falling back to local: {}",
+                out_pretty, errmsg
+            );
+            Ok((DistType::Error, local_compile.run().await?))
         }
     }
 }
@@ -331,16 +358,16 @@ fn remove_outputs_on_error<V>(outputs: &[PathBuf], result: Result<V>) -> Result<
 
 /// Decides whether to fail the compile or compile locally after an sccache-dist error.
 fn classify_error(error: Error, compiler_path: &Path) -> DistError {
-    if let Some(HttpClientError(_)) = error.downcast_ref::<HttpClientError>() {
-        DistError::FailCompile(error)
+    if let Some(HttpClientError(message)) = error.downcast_ref::<HttpClientError>() {
+        DistError::FailCompile(FailCompileReason::HttpClientError(message.clone()))
     } else if let Some(lru_disk_cache::Error::FileTooLarge) =
         error.downcast_ref::<lru_disk_cache::Error>()
     {
-        DistError::FailCompile(anyhow!(
+        DistError::FailCompile(FailCompileReason::ToolchainTooLargeToCache(format!(
             "Could not cache dist toolchain for {:?} locally.
                  Increase `toolchain_cache_size` or decrease the toolchain archive size.",
             compiler_path
-        ))
+        )))
     } else {
         DistError::CompileLocally(error)
     }
@@ -356,10 +383,13 @@ mod test {
         // Fails the compile, so the error reaches `SccacheService`, which resets the dist
         // client on it.
         match classify_error(e, Path::new("/usr/bin/cc")) {
-            DistError::FailCompile(e) => assert!(
-                e.is::<HttpClientError>(),
-                "expected the HttpClientError unchanged, got {e:#}"
-            ),
+            DistError::FailCompile(reason) => {
+                let e = Error::from(reason);
+                assert!(
+                    e.is::<HttpClientError>(),
+                    "expected an HttpClientError, got {e:#}"
+                );
+            }
             other => panic!("expected FailCompile, got {other:?}"),
         }
     }
@@ -368,10 +398,10 @@ mod test {
     fn test_toolchain_too_large_for_the_cache_fails_the_compile() {
         let e = Error::new(lru_disk_cache::Error::FileTooLarge);
         match classify_error(e, Path::new("/usr/bin/cc")) {
-            DistError::FailCompile(e) => {
+            DistError::FailCompile(FailCompileReason::ToolchainTooLargeToCache(message)) => {
                 assert!(
-                    e.to_string().contains("toolchain_cache_size"),
-                    "expected the toolchain_cache_size hint, got {e:#}"
+                    message.contains("toolchain_cache_size"),
+                    "expected the toolchain_cache_size hint, got {message}"
                 );
             }
             other => panic!("expected FailCompile, got {other:?}"),
