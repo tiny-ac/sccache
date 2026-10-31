@@ -1322,12 +1322,11 @@ where
         // The reader loop below feeds requests into `reqs_tx`; this task drains
         // them, calls the service, and writes responses back to the sink.
         //
-        // `_handle` must stay bound for the lifetime of `bind` (not `let _ =`,
-        // which would drop it immediately): it is an `AbortOnDropHandle`, so
-        // dropping it aborts this task and its in-flight compile subtasks. That
-        // is the cancellation we want once the client disconnects and the reader
+        // `handler` is an `AbortOnDropHandle`, so dropping it when `bind`
+        // returns aborts this task and its in-flight compile subtasks. That is
+        // the cancellation we want once the client disconnects and the reader
         // loop below exits.
-        let _handle = util::spawn(async move {
+        let handler = util::spawn(async move {
             while let Some(req) = reqs_rx.recv().await {
                 match util::spawn(me.clone().call(req)).await?? {
                     Message::WithoutBody(message) => {
@@ -1350,13 +1349,21 @@ where
         });
 
         // Read requests until the client disconnects (stream ends) or the
-        // stream errors. A send error means the handler task above has ended,
-        // so we stop reading in that case too.
-        while let Some(req) = stream.next().await {
-            reqs_tx.send(req?)?;
-        }
+        // stream errors.
+        let reader = async move {
+            while let Some(req) = stream.next().await {
+                reqs_tx.send(req?)?;
+            }
+            Ok::<_, Error>(())
+        };
 
-        Ok(())
+        // A response the handler can't send, such as one over the frame limit,
+        // ends the handler. Returning then closes the connection, or the client
+        // would wait for that response forever.
+        tokio::select! {
+            read = reader => read,
+            handled = handler => handled?,
+        }
     }
 
     /// Get dist status.
