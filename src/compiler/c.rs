@@ -1359,6 +1359,19 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
         )
     }
 
+    #[cfg(feature = "reapi")]
+    fn reapi_local_compile_changes(
+        &self,
+        _sysroot_copies_dir: &Path,
+    ) -> Option<crate::compiler::LocalCompileChanges> {
+        super::c_reapi::reapi_local_compile_changes(
+            &self.compiler.kind(),
+            &self.parsed_args,
+            &self.cwd,
+            &self.env_vars,
+        )
+    }
+
     fn is_locally_preprocessed(&self) -> bool {
         self.is_locally_preprocessed
     }
