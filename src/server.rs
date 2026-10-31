@@ -3046,6 +3046,7 @@ mod tests {
     #[cfg(feature = "dist-client")]
     mod client_setup {
         use super::*;
+        use crate::compiler::{DistIpcRequest, DistIpcResponse};
 
         /// A dist client with `rewrite_includes_only` on. That's the only setting `client_setup`
         /// needs from it.
@@ -3154,16 +3155,21 @@ mod tests {
             let daemon = std::thread::spawn({
                 let (compiler, archive) = (gcc.canonicalize().unwrap(), archive.clone());
                 move || {
-                    let other =
-                        crate::compiler::test_dist::answer_dist_client_setup(listener, || {
-                            DistClientSetup::Ready {
-                                rewrite_includes_only: false,
-                                custom_toolchains: HashMap::from([(
-                                    compiler.clone(),
-                                    archive.clone(),
-                                )]),
-                            }
-                        });
+                    let other = crate::test::utils::answer_until(listener, |request| {
+                        matches!(request, Request::Dist(DistIpcRequest::GetDistClientSetup)).then(
+                            || {
+                                Response::Dist(DistIpcResponse::DistClientSetup(
+                                    DistClientSetup::Ready {
+                                        rewrite_includes_only: false,
+                                        custom_toolchains: HashMap::from([(
+                                            compiler.clone(),
+                                            archive.clone(),
+                                        )]),
+                                    },
+                                ))
+                            },
+                        )
+                    });
                     assert!(other.is_none(), "unexpected request: {other:?}");
                 }
             });
