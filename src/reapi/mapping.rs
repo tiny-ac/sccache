@@ -376,6 +376,7 @@ pub enum CompileLocallyReason {
     MissingGccProgram,
     SharedLibrariesNotListed,
     ClangConfigFile,
+    SideOutputOption,
 }
 
 impl std::fmt::Display for CompileLocallyReason {
@@ -458,6 +459,7 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::MissingGccProgram => "gcc without its cc1, cc1plus or as",
             Self::SharedLibrariesNotListed => "failed to list the compiler's shared libraries",
             Self::ClangConfigFile => "clang config file",
+            Self::SideOutputOption => "option that writes a file besides the object",
         })
     }
 }
