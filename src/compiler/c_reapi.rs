@@ -40,6 +40,19 @@ const COMPILER_ENV_VARS: &[&str] = &[
     "GCC_COMPARE_DEBUG",
 ];
 
+/// Prefixes of the options that write files besides the object and the depfile.
+const SIDE_OUTPUT_PREFIXES: &[&str] = &[
+    "-fdump-",
+    "-save-temps",
+    "--save-temps",
+    "-ftime-trace",
+    "-fcallgraph-info",
+    "-fdiagnostics-add-output",
+    "-fdiagnostics-set-output",
+    "-fsave-optimization-record",
+    "-foptimization-record-file",
+];
+
 /// Options that print the path of a file gcc runs or reads to compile: its compilers proper,
 /// its assembler, and its specs file if it has one.
 const GCC_INTERNAL_FILES: &[&str] = &[
@@ -358,8 +371,8 @@ fn path_mapper(cwd: &Path, env_vars: &[(OsString, OsString)]) -> Result<PathMapp
 }
 
 /// Fails for an option whose compile a worker can't match: one that builds for the client's
-/// CPU, reads files besides the source, records local paths, macros or the command line, or
-/// changes the programs the compiler runs.
+/// CPU, reads files besides the source, writes files besides the object, records local paths,
+/// macros or the command line, or changes the programs the compiler runs.
 fn check_options(parsed_args: &ParsedArguments) -> Result<(), NotEligible> {
     if !parsed_args.arch_args.is_empty() {
         return Err(CompileLocallyReason::ArchOption.into());
@@ -399,9 +412,21 @@ fn check_options(parsed_args: &ParsedArguments) -> Result<(), NotEligible> {
             _ if option.starts_with("-fplugin")
                 || option.starts_with("-fpass-plugin")
                 || option.starts_with("-specs")
+                || option.starts_with("-fauto-profile")
                 || (option.starts_with("-fsanitize") && option.contains("list=")) =>
             {
                 CompileLocallyReason::OptionReadsFile
+            }
+            // A worker's action declares only the object as an output.
+            "-fstack-usage" | "-aux-info" | "-MJ" | "-fdiagnostics-format=sarif-file" => {
+                CompileLocallyReason::SideOutputOption
+            }
+            _ if SIDE_OUTPUT_PREFIXES
+                .iter()
+                .any(|prefix| option.starts_with(prefix))
+                || (option.starts_with("-fopt-info") && option.contains('=')) =>
+            {
+                CompileLocallyReason::SideOutputOption
             }
             "-Xclang" | "-fno-integrated-as" | "-no-integrated-as" | "-wrapper" => {
                 CompileLocallyReason::CompilerInternalsOption
@@ -552,6 +577,12 @@ mod test {
     #[test_case(Clang, &["-include-pch", "x.pch"], R::PrecompiledHeader ; "pch")]
     #[test_case(Clang, &["-fplugin=x.so"], R::OptionReadsFile ; "plugin")]
     #[test_case(Clang, &["-fsanitize-ignorelist=x.txt"], R::OptionReadsFile ; "sanitizer list")]
+    #[test_case(Gcc, &["-fauto-profile=x.afdo"], R::OptionReadsFile ; "auto profile")]
+    #[test_case(Gcc, &["-fdump-tree-all"], R::SideOutputOption ; "dump")]
+    #[test_case(Gcc, &["-aux-info", "x.h"], R::SideOutputOption ; "aux info")]
+    #[test_case(Gcc, &["-fopt-info-vec=x.txt"], R::SideOutputOption ; "opt info file")]
+    #[test_case(Gcc, &["-fdiagnostics-format=sarif-file"], R::SideOutputOption ; "sarif file")]
+    #[test_case(Gcc, &["-fdiagnostics-add-output=sarif"], R::SideOutputOption ; "added output")]
     #[test_case(Gcc, &["-B/opt/bin"], R::CompilerInternalsOption ; "B")]
     #[test_case(Gcc, &["-fno-integrated-as"], R::CompilerInternalsOption ; "no as")]
     #[test_case(Clang, &["-Xclang", "-fno-pch-timestamp"], R::CompilerInternalsOption ; "xclang")]
