@@ -1041,6 +1041,7 @@ pub(super) mod test {
                     arg,
                 }],
                 stdout_stderr_mapper: None,
+                runs_remote_command: false,
             })
         }
 

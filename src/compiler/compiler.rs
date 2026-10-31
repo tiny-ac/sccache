@@ -651,9 +651,7 @@ where
             }
             _ => (compilation, LocalCompileChanges::default()),
         };
-        // The executor's arguments change the local compile's outputs, so they go into the
-        // hash key.
-        let key = if local_compile_changes.args.is_empty() {
+        let key = if !local_compile_changes.changes_outputs() {
             key
         } else {
             let mut m = Digest::new();
@@ -661,6 +659,9 @@ where
             for arg in &local_compile_changes.args {
                 m.update(arg.hashed_as.as_encoded_bytes());
                 m.update(b"\0");
+            }
+            if local_compile_changes.runs_remote_command {
+                m.update(b"remote command\0");
             }
             m.finish()
         };
@@ -942,8 +943,8 @@ where
     let (mut compile_cmd, dist_compile_cmd, cacheable) = compilation
         .generate_compile_commands(&mut path_transformer, rewrite_includes_only)
         .context("Failed to generate compile commands")?;
-    let local_compile_changed = !local_compile_changes.args.is_empty();
-    if local_compile_changed {
+    let local_compile_changed = local_compile_changes.changes_outputs();
+    if !local_compile_changes.args.is_empty() {
         let args: Vec<OsString> = local_compile_changes
             .args
             .into_iter()
@@ -4149,6 +4150,7 @@ LLVM version: 6.0",
     /// again, so a hit that maps cached output again fails its test.
     struct LocalCompileChangesExecutor {
         arg: Option<crate::compiler::remote::LocalArg>,
+        runs_remote_command: bool,
         jobs: Arc<std::sync::Mutex<Vec<SeenJob>>>,
     }
 
@@ -4172,6 +4174,7 @@ LLVM version: 6.0",
                         .replace("remapped/", "/local/remapped/")
                         .into_bytes()
                 })),
+                runs_remote_command: self.runs_remote_command,
             }
         }
 
@@ -4201,6 +4204,7 @@ LLVM version: 6.0",
         hasher: Box<dyn CompilerHasher<MockCreator>>,
         arguments: Vec<OsString>,
         cache_control: CacheControl,
+        runs_remote_command: bool,
         jobs: Arc<std::sync::Mutex<Vec<SeenJob>>>,
     }
 
@@ -4253,6 +4257,7 @@ LLVM version: 6.0",
                 hasher,
                 arguments,
                 cache_control: CacheControl::Default,
+                runs_remote_command: false,
                 jobs: Default::default(),
             }
         }
@@ -4301,6 +4306,7 @@ LLVM version: 6.0",
             });
             let executor: Arc<dyn RemoteExecutor<_>> = Arc::new(LocalCompileChangesExecutor {
                 arg,
+                runs_remote_command: self.runs_remote_command,
                 jobs: self.jobs.clone(),
             });
             let pool = self.runtime.handle().clone();
@@ -4378,6 +4384,20 @@ LLVM version: 6.0",
             vec![seen_job(true), seen_job(false)],
             *fixture.jobs.lock().unwrap()
         );
+    }
+
+    #[test]
+    fn test_a_local_compile_with_the_remote_command_has_its_own_hash_key() {
+        let mut fixture = LocalCompileChangesFixture::new();
+        assert!(!fixture.compile_with(None, 0).0);
+        assert!(fixture.compile_with(None, 0).0, "the same compile");
+        fixture.runs_remote_command = true;
+        assert!(!fixture.compile_with(None, 0).0, "with the remote command");
+        assert!(fixture.compile_with(None, 0).0, "with it again");
+        let local_compile_changed: Vec<_> = (fixture.jobs.lock().unwrap().iter())
+            .map(|job| job.local_compile_changed)
+            .collect();
+        assert_eq!(vec![false, true], local_compile_changed);
     }
 
     #[test]

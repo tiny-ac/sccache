@@ -2408,6 +2408,7 @@ mod reapi_mapping {
             stdout_stderr_mapper: Some(Box::new(move |text| {
                 path_mapper.input_root_paths_to_local(text)
             })),
+            runs_remote_command: false,
         })
     }
 
