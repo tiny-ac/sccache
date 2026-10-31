@@ -14,7 +14,10 @@
 
 //! Executes actions on a REAPI server's workers.
 
-use super::client::{AuthChannel, Client, RPC_TIMEOUT, RpcError, rpc_code, with_timeout};
+use super::client::{
+    AuthChannel, Client, MAX_ACTION_RESULT_RESPONSE_BYTES, RPC_TIMEOUT, RpcError, rpc_code,
+    with_timeout,
+};
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use super::proto::google::longrunning::{Operation, operation};
 use super::proto::google::rpc;
@@ -73,7 +76,8 @@ impl Execution {
     pub(crate) fn new(client: &Client) -> Self {
         Execution {
             instance_name: client.instance_name().to_owned(),
-            execution_client: ExecutionClient::new(client.channel()),
+            execution_client: ExecutionClient::new(client.channel())
+                .max_decoding_message_size(MAX_ACTION_RESULT_RESPONSE_BYTES),
         }
     }
 
@@ -412,6 +416,23 @@ mod test {
             .await
             .unwrap();
         assert_eq!(2, server.actions_run.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_a_result_with_more_than_4_mib_inlined_is_returned() {
+        let server = Arc::new(writing_server());
+        let execution = Execution::new(&server.serve_and_connect().await);
+        let action_digest = insert_action(&server);
+        let result = remexec::ActionResult {
+            stderr_raw: vec![b'w'; 5 << 20],
+            ..Default::default()
+        };
+        server.insert_action_result(&action_digest, result.clone());
+        let response = execution
+            .execute_action(&action_digest, false, QUEUE_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(Some(result), response.result);
     }
 
     #[tokio::test]
