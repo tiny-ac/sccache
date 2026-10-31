@@ -14,7 +14,10 @@
 
 //! Looks actions up in a REAPI server's action cache.
 
-use super::client::{AuthChannel, Client, RPC_TIMEOUT, status_error, with_retries, with_timeout};
+use super::client::{
+    AuthChannel, Client, MAX_ACTION_RESULT_RESPONSE_BYTES, RPC_TIMEOUT, status_error, with_retries,
+    with_timeout,
+};
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use crate::errors::*;
 use remexec::action_cache_client::ActionCacheClient;
@@ -29,7 +32,8 @@ impl ActionCache {
     pub(crate) fn new(client: &Client) -> Self {
         ActionCache {
             instance_name: client.instance_name().to_owned(),
-            action_cache_client: ActionCacheClient::new(client.channel()),
+            action_cache_client: ActionCacheClient::new(client.channel())
+                .max_decoding_message_size(MAX_ACTION_RESULT_RESPONSE_BYTES),
         }
     }
 
@@ -97,6 +101,25 @@ mod test {
         let action_digest = digest::of_bytes(b"action");
         let result = remexec::ActionResult {
             exit_code: 1,
+            ..Default::default()
+        };
+        server.insert_action_result(&action_digest, result.clone());
+        assert_eq!(
+            Some(result),
+            action_cache
+                .get_action_result(&action_digest)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_result_with_more_than_4_mib_inlined_is_found() {
+        let server = Arc::new(FakeServer::default());
+        let action_cache = ActionCache::new(&server.serve_and_connect().await);
+        let action_digest = digest::of_bytes(b"action");
+        let result = remexec::ActionResult {
+            stderr_raw: vec![b'w'; 5 << 20],
             ..Default::default()
         };
         server.insert_action_result(&action_digest, result.clone());
