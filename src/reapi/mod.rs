@@ -38,7 +38,9 @@ mod toolchains;
 mod worker_toolchains;
 
 pub(crate) use executor::ReapiExecutor;
-pub(crate) use ipc::{ReapiIpcRequest, ReapiIpcResponse, handle_reapi_ipc_request};
+pub(crate) use ipc::{
+    ReapiIpcExecutor, ReapiIpcRequest, ReapiIpcResponse, handle_reapi_ipc_request,
+};
 pub(crate) use mapping::{
     ActionEnv, CompileLocallyReason, NotEligible, PathMapper, ReapiCompile, ToolchainKey,
     lexically_normalize,
