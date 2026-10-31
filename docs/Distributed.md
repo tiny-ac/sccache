@@ -31,6 +31,13 @@ may request compilation from Linux, Windows or macOS. Linux compilations will
 attempt to automatically package the compiler in use, while Windows and macOS
 users will need to specify a toolchain for cross-compilation ahead of time.
 
+Distributed compilation also works in
+[client-side mode](Architecture.md#client-side-mode-sccache_client_side): the
+sccache CLI hashes and packages each compile, and the sccache daemon runs it
+through its own dist client, so the daemon's `[dist]` settings are the ones
+used. A daemon from an older sccache doesn't understand these requests, so
+restart it after upgrading sccache.
+
 ## Communication
 
 The HTTP implementation of sccache has the following API, where all HTTP body content is encoded using [`bincode`](http://docs.rs/bincode):
