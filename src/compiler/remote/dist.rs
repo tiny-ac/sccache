@@ -29,7 +29,7 @@ use std::sync::Arc;
 mod ipc;
 
 pub(crate) use self::ipc::{
-    DistClientSetup, DistIpcRequest, DistIpcResponse, PendingDistToolchains,
+    DistClientSetup, DistIpcExecutor, DistIpcRequest, DistIpcResponse, PendingDistToolchains,
     handle_dist_ipc_request,
 };
 

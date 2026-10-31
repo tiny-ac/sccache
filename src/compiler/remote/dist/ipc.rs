@@ -17,19 +17,26 @@
 
 use super::{
     ClusterCompile, ClusterCompileOutput, DistError, DistExecutor, FailCompileReason,
-    classify_error,
+    classify_error, compile_locally_on_error,
 };
+use crate::client::ServerConnection;
+use crate::compiler::remote::{DistInputOptions, DistJob, LocalCompile, RemoteExecutor, RemoteJob};
+use crate::compiler::{Compilation, DistType};
 use crate::dist::{self, pkg};
 use crate::errors::*;
+use crate::mock_command::CommandCreatorSync;
+use crate::protocol::{Request, Response};
 use crate::server::DistClientContainer;
+use async_trait::async_trait;
 use fs_err as fs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{OnceCell, watch};
 use tokio::time::Instant;
 
 /// How long a compile waits for another CLI to send the toolchain it needs before
@@ -338,15 +345,225 @@ async fn handle_compile_on_cluster(
     }
 }
 
+/// A [`RemoteExecutor`] that runs compiles on an sccache-dist cluster through the daemon's
+/// dist client.
+pub(crate) struct DistIpcExecutor {
+    conn: Arc<Mutex<ServerConnection>>,
+    /// Asked of the daemon on first use. `SccacheService::remote_executor` fills this before
+    /// handing out the executor, so `dist_input_options` always finds it.
+    dist_client_setup: OnceCell<DistClientSetup>,
+}
+
+impl DistIpcExecutor {
+    pub(crate) fn new(conn: Arc<Mutex<ServerConnection>>) -> Self {
+        DistIpcExecutor {
+            conn,
+            dist_client_setup: OnceCell::new(),
+        }
+    }
+
+    async fn dist_client_setup(&self) -> Result<&DistClientSetup> {
+        self.dist_client_setup
+            .get_or_try_init(|| async {
+                match self
+                    .request(Request::Dist(DistIpcRequest::GetDistClientSetup))
+                    .await?
+                {
+                    Response::Dist(DistIpcResponse::DistClientSetup(setup)) => Ok(setup),
+                    other => {
+                        bail!(
+                            "unexpected response to DistIpcRequest::GetDistClientSetup: {other:?}"
+                        )
+                    }
+                }
+            })
+            .await
+    }
+
+    /// Fails when the daemon's dist client is misconfigured.
+    pub(crate) async fn has_dist_client(&self) -> Result<bool> {
+        match self.dist_client_setup().await {
+            Ok(DistClientSetup::Ready { .. }) => Ok(true),
+            Ok(DistClientSetup::NoDistClient) => Ok(false),
+            Ok(DistClientSetup::Misconfigured(message)) => Err(anyhow!(message.clone())),
+            // A daemon that can't answer makes the CLI compile locally, like an unreachable
+            // scheduler does.
+            Err(e) => {
+                warn!("Could not ask the daemon for its dist client, compiling locally: {e:#}");
+                Ok(false)
+            }
+        }
+    }
+
+    /// The custom toolchain archive the daemon's config names for `compiler`.
+    pub(crate) async fn custom_toolchain(&self, compiler: &Path) -> Option<PathBuf> {
+        match self.dist_client_setup().await {
+            Ok(DistClientSetup::Ready {
+                custom_toolchains, ..
+            }) => custom_toolchains.get(compiler).cloned(),
+            Ok(_) => None,
+            Err(e) => {
+                debug!("Could not ask the daemon for custom toolchains: {e:#}");
+                None
+            }
+        }
+    }
+
+    async fn request(&self, request: Request) -> Result<Response> {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || conn.lock().unwrap().request(request))
+            .await
+            .context("spawn_blocking panicked")?
+    }
+
+    async fn request_compile_on_cluster(
+        &self,
+        cluster_compile: &ClusterCompile,
+        inputs: &InputsArchive,
+        toolchain: &ToolchainPackaging,
+    ) -> Result<CompileOnClusterResult> {
+        let request = DistIpcRequest::CompileOnCluster {
+            cluster_compile: Box::new(cluster_compile.clone()),
+            inputs: inputs.clone(),
+            toolchain: toolchain.clone(),
+        };
+        match self.request(Request::Dist(request)).await? {
+            Response::Dist(DistIpcResponse::CompileOnCluster(result)) => Ok(result),
+            other => bail!("unexpected response to DistIpcRequest::CompileOnCluster: {other:?}"),
+        }
+    }
+
+    /// Packages the compile and runs it with the daemon's dist client, sending the toolchain
+    /// if the daemon asks for it. `None` when the daemon has no dist client.
+    async fn compile_on_cluster<T: CommandCreatorSync>(
+        &self,
+        compilation: Box<dyn Compilation<T>>,
+        dist_job: DistJob,
+        compiler_path: PathBuf,
+        out_pretty: &str,
+    ) -> std::result::Result<Option<(DistType, process::Output)>, DistError> {
+        let (cluster_compile, (inputs_packager, toolchain_packager, outputs_rewriter)) =
+            DistExecutor::prepare(compilation, dist_job, compiler_path, out_pretty)
+                .map_err(DistError::CompileLocally)?;
+        let dir = tempfile::tempdir()
+            .context("failed to create a directory for the compile's archives")
+            .map_err(DistError::CompileLocally)?;
+        let path = dir.path().join("inputs.tar");
+        let inputs = tokio::task::spawn_blocking(move || {
+            let path_transformer = inputs_packager.write_inputs(&mut fs::File::create(&path)?)?;
+            Ok::<_, Error>(InputsArchive {
+                path,
+                path_transformer,
+            })
+        })
+        .await
+        .map_err(Error::from)
+        .and_then(std::convert::identity)
+        .context("failed to package the compile's inputs")
+        .map_err(DistError::CompileLocally)?;
+        let mut toolchain_packager = Some(toolchain_packager);
+        let mut toolchain = ToolchainPackaging::NotPackaged;
+        loop {
+            match self
+                .request_compile_on_cluster(&cluster_compile, &inputs, &toolchain)
+                .await
+                .map_err(DistError::CompileLocally)?
+            {
+                CompileOnClusterResult::RanOnBuildServer(response) => {
+                    return DistExecutor::finish(response, outputs_rewriter)
+                        .map(Some)
+                        .map_err(DistError::CompileLocally);
+                }
+                CompileOnClusterResult::NeedToolchain => {
+                    let Some(toolchain_packager) = toolchain_packager.take() else {
+                        return Err(DistError::CompileLocally(anyhow!(
+                            "the daemon asked for the toolchain twice"
+                        )));
+                    };
+                    let toolchain_path = dir.path().join("toolchain.tar");
+                    // Packaging errors are sent to the daemon, which wakes the compiles
+                    // waiting for the toolchain.
+                    toolchain = match tokio::task::spawn_blocking(move || {
+                        toolchain_packager.write_pkg(fs::File::create(&toolchain_path)?)?;
+                        Ok::<_, Error>(toolchain_path)
+                    })
+                    .await
+                    .map_err(Error::from)
+                    .and_then(std::convert::identity)
+                    {
+                        Ok(path) => ToolchainPackaging::Packaged { path },
+                        Err(e) => ToolchainPackaging::Failed(format!("{e:#}")),
+                    };
+                }
+                CompileOnClusterResult::NoDistClient => return Ok(None),
+                CompileOnClusterResult::CompileLocally(reason) => {
+                    return Err(DistError::CompileLocally(match reason {
+                        CompileLocallyReason::ClusterFailed(message) => anyhow!(message),
+                        CompileLocallyReason::ToolchainPackagingFailed(message) => {
+                            anyhow!("Could not package toolchain: {message}")
+                        }
+                    }));
+                }
+                CompileOnClusterResult::FailCompile(reason) => {
+                    return Err(DistError::FailCompile(reason));
+                }
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl<T: CommandCreatorSync> RemoteExecutor<T> for DistIpcExecutor {
+    fn dist_input_options(&self) -> Option<DistInputOptions> {
+        match self.dist_client_setup.get() {
+            Some(DistClientSetup::Ready {
+                rewrite_includes_only,
+                ..
+            }) => Some(DistInputOptions {
+                rewrite_includes_only: *rewrite_includes_only,
+            }),
+            _ => None,
+        }
+    }
+
+    async fn compile(
+        &self,
+        job: RemoteJob<T>,
+        local_compile: LocalCompile<'_, T>,
+    ) -> Result<(DistType, process::Output)> {
+        let RemoteJob {
+            compilation,
+            out_pretty,
+            dist_job,
+            ..
+        } = job;
+        let Some(dist_job) = dist_job else {
+            debug!("[{}]: Compiling locally", out_pretty);
+            return Ok((DistType::NoDist, local_compile.run().await?));
+        };
+        debug!("[{}]: Attempting distributed compilation", out_pretty);
+        let compiler_path = local_compile.command.get_executable();
+        let result = match self
+            .compile_on_cluster(compilation, dist_job, compiler_path, &out_pretty)
+            .await
+        {
+            Ok(Some(compiled)) => Ok(compiled),
+            Ok(None) => {
+                debug!(
+                    "[{}]: The daemon has no dist client, compiling locally",
+                    out_pretty
+                );
+                return Ok((DistType::NoDist, local_compile.run().await?));
+            }
+            Err(e) => Err(e),
+        };
+        compile_locally_on_error(result, local_compile, &out_pretty).await
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::dist::{
-        AllocJobResult, JobAlloc, RunJobResult, SchedulerStatusResult, SubmitToolchainResult,
-        Toolchain,
-    };
-    use async_trait::async_trait;
-    use std::path::Path;
 
     /// A compile of `/usr/bin/cc`, with an inputs archive the CLI wrote into `dir`.
     fn compile_in(dir: &Path) -> (ClusterCompile, InputsArchive) {
@@ -389,59 +606,13 @@ mod test {
         .await
     }
 
-    /// A dist client whose scheduler refuses its credentials.
-    struct UnauthorizedClient;
-
-    #[async_trait]
-    impl dist::Client for UnauthorizedClient {
-        async fn do_alloc_job(&self, _: Toolchain) -> Result<AllocJobResult> {
-            Err(HttpClientError("MOCK: unauthorized".to_owned()).into())
-        }
-        async fn do_get_status(&self) -> Result<SchedulerStatusResult> {
-            unreachable!()
-        }
-        async fn do_submit_toolchain(
-            &self,
-            _: JobAlloc,
-            _: Toolchain,
-        ) -> Result<SubmitToolchainResult> {
-            unreachable!()
-        }
-        async fn do_run_job(
-            &self,
-            _: JobAlloc,
-            _: dist::CompileCommand,
-            _: Vec<String>,
-            _: Box<dyn pkg::InputsPackager>,
-        ) -> Result<(RunJobResult, dist::PathTransformer)> {
-            unreachable!()
-        }
-        async fn put_toolchain(
-            &self,
-            _: PathBuf,
-            _: String,
-            _: Box<dyn pkg::ToolchainPackager>,
-        ) -> Result<(Toolchain, Option<(String, PathBuf)>)> {
-            let toolchain = Toolchain {
-                archive_id: "somearchiveid".to_owned(),
-            };
-            Ok((toolchain, None))
-        }
-        fn rewrite_includes_only(&self) -> bool {
-            false
-        }
-        fn get_custom_toolchain(&self, _: &Path) -> Option<PathBuf> {
-            None
-        }
-    }
-
     /// An [`HttpClientError`] fails the compile and resets the daemon's dist client.
     #[tokio::test]
     async fn test_daemon_resets_its_dist_client_after_an_http_client_error() {
         let dir = tempfile::tempdir().unwrap();
         let (cluster_compile, inputs) = compile_in(dir.path());
         let dist_client = DistClientContainer::mock(
-            Arc::new(UnauthorizedClient),
+            crate::compiler::test_dist::HttpErrorAllocJobClient::new(),
             tokio::runtime::Handle::current(),
         );
         let response = handle_dist_ipc_request(
@@ -505,6 +676,10 @@ mod test {
     ))]
     mod toolchain {
         use super::*;
+        use crate::dist::{
+            AllocJobResult, JobAlloc, RunJobResult, SchedulerStatusResult, SubmitToolchainResult,
+            Toolchain,
+        };
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         /// Caches the toolchain like the dist client does, then fails, as if the
