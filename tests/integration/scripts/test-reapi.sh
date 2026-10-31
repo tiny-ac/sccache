@@ -1,11 +1,12 @@
 #!/bin/bash
 # Builds tests/integration/reapi/fixture with sccache and REAPI, each build with empty local
 # caches, and checks:
-# - on_miss = "execute": checkout A executes each compile it can on the server's workers, and
-#   checkout B, at another path, hits the action cache for each one and links the rlibs, in
-#   server-side mode and again in client-side mode;
+# - on_miss = "execute": checkout A executes each compile it can on the server's workers, its
+#   rlibs and its build script's C and C++ objects, and checkout B, at another path, hits the
+#   action cache for each one and links them, in server-side mode and again in client-side mode;
 # - on_miss = "local": a build executes nothing and writes no action result, so a later build
-#   with the same salt still executes every compile, and writes the same rlibs;
+#   with the same salt still executes every compile, and writes the same rlibs, objects and
+#   archives;
 # - an unreachable server: the build compiles everything locally.
 set -euo pipefail
 
@@ -85,6 +86,12 @@ rlibs() {
     find "$work/$1/target/debug/deps" -name '*.rlib' | wc -l
 }
 
+# Prints how many compiles REAPI can run that the checkout at $1 ran: its rlibs, and the C and
+# C++ objects of its build scripts.
+compiles() {
+    echo $(($(rlibs "$1") + $(find "$work/$1/target/debug/build" -name '*.o' | wc -l)))
+}
+
 # Checks that cargo test links the rlibs in checkout B's target directory without rebuilding them.
 check_links() {
     local log rebuilt
@@ -104,11 +111,11 @@ execute_on_miss() {
     local stats_a stats_b
     stats_a=$(build checkout-a) || fail "checkout A didn't build"
     stats_b=$(build elsewhere/checkout-b) || fail "checkout B didn't build"
-    echo "checkout A: $(reapi_stat executions "$stats_a") REAPI executions of $(rlibs checkout-a) rlibs"
+    echo "checkout A: $(reapi_stat executions "$stats_a") REAPI executions of $(compiles checkout-a) compiles"
     echo "checkout B: $(reapi_stat action_cache_hits "$stats_b") REAPI action cache hits"
 
-    [ "$(reapi_stat executions "$stats_a")" -eq "$(rlibs checkout-a)" ] ||
-        fail "checkout A executed $(reapi_stat executions "$stats_a") of its $(rlibs checkout-a) rlibs"
+    [ "$(reapi_stat executions "$stats_a")" -eq "$(compiles checkout-a)" ] ||
+        fail "checkout A executed $(reapi_stat executions "$stats_a") of its $(compiles checkout-a) compiles"
     [ "$(reapi_stat action_cache_hits "$stats_b")" -eq "$(reapi_stat executions "$stats_a")" ] ||
         fail "checkout B didn't hit every action checkout A executed"
     [ "$(reapi_stat executions "$stats_b")" -eq 0 ] || fail "checkout B executed actions"
@@ -125,24 +132,26 @@ execute_on_miss() {
 
 local_on_miss() {
     setup "on_miss local" "$ENDPOINT" 300 'on_miss = "local"'
-    local stats_a stats_b rlib
+    local stats_a stats_b output
     stats_a=$(build checkout-a) || fail "checkout A didn't build"
     [ "$(reapi_stat executions "$stats_a")" -eq 0 ] || fail "checkout A executed actions"
-    [ "$(local_compiles "not in the action cache" "$stats_a")" -eq "$(rlibs checkout-a)" ] ||
-        fail "checkout A didn't miss the action cache for each of its $(rlibs checkout-a) rlibs"
+    [ "$(local_compiles "not in the action cache" "$stats_a")" -eq "$(compiles checkout-a)" ] ||
+        fail "checkout A didn't miss the action cache for each of its $(compiles checkout-a) compiles"
     # The same salt with on_miss = "execute" finds nothing checkout A could have written.
     sed -i 's/^on_miss = "local"$/on_miss = "execute"/' "$work/sccache.toml"
     grep -qx 'on_miss = "execute"' "$work/sccache.toml" || fail "the config still has on_miss = \"local\""
     stats_b=$(build elsewhere/checkout-b) || fail "checkout B didn't build"
     [ "$(reapi_stat action_cache_hits "$stats_b")" -eq 0 ] ||
         fail "checkout B hit $(reapi_stat action_cache_hits "$stats_b") actions"
-    [ "$(reapi_stat executions "$stats_b")" -eq "$(rlibs elsewhere/checkout-b)" ] ||
-        fail "checkout B executed $(reapi_stat executions "$stats_b") of its rlibs"
-    # Local compiles run with the worker's arguments, so they write what the worker writes.
-    for rlib in "$work"/checkout-a/target/debug/deps/*.rlib; do
-        cmp -s "$rlib" "$work/elsewhere/checkout-b/target/debug/deps/${rlib##*/}" ||
-            fail "${rlib##*/} differs between the local compile and the execution"
-    done
+    [ "$(reapi_stat executions "$stats_b")" -eq "$(compiles elsewhere/checkout-b)" ] ||
+        fail "checkout B executed $(reapi_stat executions "$stats_b") of its compiles"
+    # Local compiles run with the worker's arguments, or as the worker runs them, so they write
+    # what the worker writes.
+    while read -r output; do
+        cmp -s "$work/checkout-a/target/debug/$output" "$work/elsewhere/checkout-b/target/debug/$output" ||
+            fail "$output differs between the local compile and the execution"
+    done < <(cd "$work/checkout-a/target/debug" &&
+        find deps -name '*.rlib' && find build \( -name '*.o' -o -name '*.a' \))
     echo "✓ PASS: on_miss = \"local\" wrote nothing, and compiled what the worker compiles"
     rm -rf "$work"
 }
@@ -155,8 +164,8 @@ unreachable_server() {
     [ "$(reapi_stat action_cache_hits "$stats_a")" -eq 0 ] || fail "checkout A hit the action cache"
     not_connected=$(($(local_compiles "failed to connect to the REAPI server" "$stats_a") +
         $(local_compiles "connecting to the REAPI server" "$stats_a")))
-    [ "$not_connected" -eq "$(rlibs checkout-a)" ] ||
-        fail "$not_connected of $(rlibs checkout-a) rlibs compiled locally for not connecting"
+    [ "$not_connected" -eq "$(compiles checkout-a)" ] ||
+        fail "$not_connected of $(compiles checkout-a) compiles ran locally for not connecting"
     echo "✓ PASS: an unreachable server leaves every compile local"
     rm -rf "$work"
 }
