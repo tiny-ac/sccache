@@ -40,9 +40,9 @@ pub struct RemoteJob<T: CommandCreatorSync> {
     /// this compile.
     pub dist_job: Option<DistJob>,
     pub cache_control: CacheControl,
-    /// Whether `local_compile_changes` changed the local compile's arguments. sccache caches a
-    /// remote result under the hash key of the changed compile, so an executor uses one only
-    /// when this is true.
+    /// Whether `local_compile_changes` changed the local compile. sccache caches a remote result
+    /// under the hash key of the changed compile, so an executor uses one only when this is
+    /// true.
     pub local_compile_changed: bool,
 }
 
@@ -80,6 +80,15 @@ pub struct LocalArg {
 pub struct LocalCompileChanges {
     pub args: Vec<LocalArg>,
     pub stdout_stderr_mapper: Option<StdoutStderrMapper>,
+    /// The executor compiles with the remote command instead of the compile's own, so it
+    /// writes what a remote compile writes.
+    pub runs_remote_command: bool,
+}
+
+impl LocalCompileChanges {
+    pub fn changes_outputs(&self) -> bool {
+        !self.args.is_empty() || self.runs_remote_command
+    }
 }
 
 /// The job's local compile, for when an executor doesn't run it remotely.
