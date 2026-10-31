@@ -1036,6 +1036,10 @@ where
     #[cfg(feature = "dist-client")]
     pending_dist_toolchains: Arc<PendingDistToolchains>,
 
+    /// Sends a REAPI build's misses to the daemon's REAPI executor. `None` in the daemon.
+    #[cfg(feature = "reapi")]
+    reapi_ipc_executor: Option<Arc<crate::reapi::ReapiIpcExecutor>>,
+
     /// The local slot the daemon holds while the connection's CLI compiles a REAPI build's
     /// miss locally.
     #[cfg(feature = "reapi")]
@@ -1307,6 +1311,8 @@ where
             #[cfg(feature = "dist-client")]
             pending_dist_toolchains: Arc::default(),
             #[cfg(feature = "reapi")]
+            reapi_ipc_executor: None,
+            #[cfg(feature = "reapi")]
             reapi_local_slot: Arc::default(),
         }
     }
@@ -1318,9 +1324,26 @@ where
         self
     }
 
-    /// The executor for remote compiles, if there is a dist client. Fails when the dist client
-    /// is misconfigured.
+    /// Makes the service run a REAPI build's misses with `executor`.
+    #[cfg(feature = "reapi")]
+    pub(crate) fn with_reapi_ipc_executor(
+        mut self,
+        executor: Arc<crate::reapi::ReapiIpcExecutor>,
+    ) -> Self {
+        self.reapi_ipc_executor = Some(executor);
+        self
+    }
+
+    /// The executor for remote compiles, if there is a REAPI executor or a dist client. Fails
+    /// when the dist client is misconfigured.
     pub(crate) async fn remote_executor(&self) -> Result<Option<Arc<dyn RemoteExecutor<C>>>> {
+        // REAPI comes first, as in the daemon, where `[dist.reapi]` turns sccache-dist off.
+        #[cfg(feature = "reapi")]
+        if let Some(executor) = &self.reapi_ipc_executor
+            && executor.has_reapi_executor().await
+        {
+            return Ok(Some(executor.clone()));
+        }
         #[cfg(feature = "dist-client")]
         if let Some(executor) = &self.dist_ipc_executor {
             let has_dist_client = executor.has_dist_client().await?;
@@ -1367,6 +1390,8 @@ where
             #[cfg(feature = "dist-client")]
             pending_dist_toolchains: Arc::default(),
             #[cfg(feature = "reapi")]
+            reapi_ipc_executor: None,
+            #[cfg(feature = "reapi")]
             reapi_local_slot: Arc::default(),
         }
     }
@@ -1396,6 +1421,8 @@ where
             dist_ipc_executor: None,
             #[cfg(feature = "dist-client")]
             pending_dist_toolchains: Arc::default(),
+            #[cfg(feature = "reapi")]
+            reapi_ipc_executor: None,
             #[cfg(feature = "reapi")]
             reapi_local_slot: Arc::default(),
         }
