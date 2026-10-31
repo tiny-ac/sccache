@@ -566,57 +566,22 @@ impl ReapiExecutor {
         out_pretty: &str,
     ) -> std::result::Result<ToolchainOnWorkers, CompileLocallyReason> {
         let (files, action_options) = (toolchain.clone(), self.action_options.clone());
-        let action = tokio::task::spawn_blocking(move || {
-            rustc_version_action_blobs(&files, &action_options)
-        })
-        .await
-        .map_err(Error::from)
-        .flatten()
-        .map_err(|e| {
-            warn!(
-                "[{}]: Compiling locally: failed to hash the toolchain: {:#}",
-                out_pretty, e
-            );
-            CompileLocallyReason::HashingInputsFailed
-        })?;
-        let response = upload_and_execute(
-            apis,
-            execution,
-            &action,
-            RUSTC_VERSION_MNEMONIC,
-            false,
-            self.queue_timeout,
-            out_pretty,
-        )
-        .await?;
-        self.execution_pause.call_succeeded();
-        let result = response.result.unwrap_or_default();
         let sysroot = key.sysroot.display();
-        if result.exit_code != 0 {
-            warn!(
-                "REAPI: rustc -vV of {sysroot} exits with {} on the workers; \
-                 compiling its misses locally",
-                result.exit_code
-            );
-            debug!(
-                "REAPI: rustc -vV of {sysroot} printed on stderr: {}",
-                loggable(&result.stderr_raw)
-            );
+        let stdout = self
+            .run_check_on_worker(
+                apis,
+                execution,
+                RUSTC_VERSION_MNEMONIC,
+                &format!("rustc -vV of {sysroot}"),
+                move || rustc_version_action_blobs(&files, &action_options),
+                out_pretty,
+            )
+            .await?;
+        let Some(stdout) = stdout else {
             return Ok(ToolchainOnWorkers::Unusable(
                 CompileLocallyReason::RustcFailsOnWorkers,
             ));
-        }
-        let stdout =
-            download_stdout_or_stderr(&apis.cas, &result.stdout_raw, result.stdout_digest.as_ref())
-                .await
-                .map_err(|e| {
-                    warn!("[{}]: Compiling locally: {:#}", out_pretty, e);
-                    if is_refused_read(&e) {
-                        CompileLocallyReason::CredentialsRefused
-                    } else {
-                        CompileLocallyReason::DownloadingOutputsFailed
-                    }
-                })?;
+        };
         let stdout = String::from_utf8_lossy(&stdout);
         let commit_hash = stdout
             .lines()
@@ -633,6 +598,64 @@ impl ReapiExecutor {
             ));
         }
         Ok(ToolchainOnWorkers::Matches)
+    }
+
+    /// Runs the check action that `build_action` builds on a worker, and returns its stdout,
+    /// or `None` if `check`, as logs name it, exits non-zero.
+    async fn run_check_on_worker(
+        &self,
+        apis: &ServerApis,
+        execution: &Execution,
+        action_mnemonic: &str,
+        check: &str,
+        build_action: impl FnOnce() -> Result<ActionBlobs> + Send + 'static,
+        out_pretty: &str,
+    ) -> std::result::Result<Option<Vec<u8>>, CompileLocallyReason> {
+        let action = tokio::task::spawn_blocking(build_action)
+            .await
+            .map_err(Error::from)
+            .flatten()
+            .map_err(|e| {
+                warn!(
+                    "[{}]: Compiling locally: failed to hash the toolchain: {:#}",
+                    out_pretty, e
+                );
+                CompileLocallyReason::HashingInputsFailed
+            })?;
+        let response = upload_and_execute(
+            apis,
+            execution,
+            &action,
+            action_mnemonic,
+            false,
+            self.queue_timeout,
+            out_pretty,
+        )
+        .await?;
+        self.execution_pause.call_succeeded();
+        let result = response.result.unwrap_or_default();
+        if result.exit_code != 0 {
+            warn!(
+                "REAPI: {check} exits with {} on the workers; compiling its misses locally",
+                result.exit_code
+            );
+            debug!(
+                "REAPI: {check} printed on stderr: {}",
+                loggable(&result.stderr_raw)
+            );
+            return Ok(None);
+        }
+        download_stdout_or_stderr(&apis.cas, &result.stdout_raw, result.stdout_digest.as_ref())
+            .await
+            .map(Some)
+            .map_err(|e| {
+                warn!("[{}]: Compiling locally: {:#}", out_pretty, e);
+                if is_refused_read(&e) {
+                    CompileLocallyReason::CredentialsRefused
+                } else {
+                    CompileLocallyReason::DownloadingOutputsFailed
+                }
+            })
     }
 }
 
