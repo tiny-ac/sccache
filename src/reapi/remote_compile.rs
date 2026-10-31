@@ -1961,6 +1961,20 @@ pub(super) mod test {
         }
     }
 
+    /// Runs `command` in `worker_root` with a worker's env, and with `LD_DEBUG` set to list
+    /// the libraries each program loads.
+    #[cfg(target_os = "linux")]
+    fn run_on_worker(command: &remexec::Command, worker_root: &Path) -> process::Output {
+        std::process::Command::new(&command.arguments[0])
+            .args(&command.arguments[1..])
+            .current_dir(worker_root)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("LD_DEBUG", "libs")
+            .output()
+            .unwrap()
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn test_a_worker_runs_the_toolchains_own_programs() {
@@ -1996,6 +2010,64 @@ pub(super) mod test {
             let printed = String::from_utf8(output.stdout).unwrap();
             let printed = crate::reapi::lexically_normalize(Path::new(printed.trim_end()));
             assert_eq!(in_worker_root, printed, "{}", file.option);
+        }
+    }
+
+    /// The libraries that `LD_DEBUG=libs` says the programs in `stderr` initialized, other
+    /// than glibc's.
+    #[cfg(target_os = "linux")]
+    fn libraries_loaded(stderr: &str) -> Vec<&str> {
+        (stderr.lines())
+            .filter_map(|line| {
+                line.split_once("calling init: ")?
+                    .1
+                    .split_whitespace()
+                    .next()
+            })
+            .filter(|library| {
+                let name = library.rsplit('/').next().unwrap_or_default();
+                !crate::reapi::mapping::GLIBC_LIBRARIES
+                    .iter()
+                    .any(|glibc| name.starts_with(glibc))
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test_case(CCompilerKind::Gcc ; "gcc")]
+    #[test_case(CCompilerKind::Clang ; "clang")]
+    fn test_c_compiler_check_in_a_worker_root(kind: CCompilerKind) {
+        let Some(key) = local_c_toolchain(&kind) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let worker_root = dir.path().canonicalize().unwrap().join("worker");
+        let digest_cache = DigestCache::load(dir.path().join("digests"));
+        let toolchain = c_toolchain_files(&key, &digest_cache).unwrap();
+        put_in_worker_root(&toolchain, &worker_root);
+        let command = c_compiler_check_command(&key);
+        let output = run_on_worker(&command, &worker_root);
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            Ok(local_c_compiler_answers(&key).unwrap()),
+            worker_c_compiler_answers(&key, &stdout),
+            "{stdout}"
+        );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let loaded = libraries_loaded(&stderr);
+        assert!(!loaded.is_empty(), "{stderr}");
+        let toolchain_dir = worker_root.join(TOOLCHAIN_DIR);
+        for library in loaded {
+            assert!(Path::new(library).starts_with(&toolchain_dir), "{library}");
+        }
+
+        // gcc only prints cc1's path for its check, so it's the compile that runs it.
+        if let Some(cc1) = (key.internal_files.iter()).find(|file| file.option.ends_with("=cc1")) {
+            let cc1 = toolchain_dir.join(cc1.path.strip_prefix("/").unwrap());
+            std::fs::write(cc1, "#!/bin/sh\nexit 1\n").unwrap();
+            let output = run_on_worker(&command, &worker_root);
+            assert!(!output.status.success(), "{output:?}");
         }
     }
 
