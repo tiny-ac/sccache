@@ -253,6 +253,9 @@ pub enum CompileLocallyReason {
     ExecutionTimedOut,
     CompileFailedOnWorker,
     DaemonFailed,
+    UnsupportedLanguage,
+    LanguageAfterInput,
+    NotFromBuildScript,
     CToolchainUnsupported,
 }
 
@@ -316,6 +319,9 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::ExecutionTimedOut => "REAPI action ran out of time on a worker",
             Self::CompileFailedOnWorker => "compile failed on a worker",
             Self::DaemonFailed => "the sccache daemon failed",
+            Self::UnsupportedLanguage => "language other than C or C++",
+            Self::LanguageAfterInput => "-x after the input",
+            Self::NotFromBuildScript => "not run by a cargo build script",
             Self::CToolchainUnsupported => "C toolchain unsupported on workers",
         })
     }
