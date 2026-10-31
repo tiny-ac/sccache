@@ -17,8 +17,8 @@
 //! sccache-dist's, less the options that a compile of a preprocessed source doesn't read: no
 //! `-I`, `-D`, `-M`, `--sysroot` or link options.
 
-use crate::compiler::Language;
 use crate::compiler::c::{CCompilerKind, ParsedArguments};
+use crate::compiler::{Language, LocalCompileChanges};
 use crate::reapi::{
     CToolchainKey, CompileLocallyReason, InternalFile, NotEligible, PathMapper, PreprocessedSource,
     ReapiCompile, ToolchainKey, WorkerProgram, lexically_normalize,
@@ -78,10 +78,7 @@ pub(super) fn map_for_reapi(
     env_vars: &[(OsString, OsString)],
     preprocessed_dir: &Path,
 ) -> Result<ReapiCompile, NotEligible> {
-    let mapped = map_compile(kind, parsed_args, cwd, env_vars)?;
-    if !WORKERS_RUN_C_COMPILES {
-        return Err(CompileLocallyReason::CToolchainUnsupported.into());
-    }
+    let mapped = map_compile_for_workers(kind, parsed_args, cwd, env_vars)?;
     reapi_compile(
         mapped,
         kind,
@@ -91,6 +88,40 @@ pub(super) fn map_for_reapi(
         env_vars,
         preprocessed_dir,
     )
+}
+
+/// A local compile that REAPI could run compiles as a worker does, so that it writes the
+/// object a worker writes. `None` for the other compiles.
+pub(super) fn reapi_local_compile_changes(
+    kind: &CCompilerKind,
+    parsed_args: &ParsedArguments,
+    cwd: &Path,
+    env_vars: &[(OsString, OsString)],
+) -> Option<LocalCompileChanges> {
+    map_compile_for_workers(kind, parsed_args, cwd, env_vars).ok()?;
+    Some(LocalCompileChanges {
+        args: vec![],
+        stdout_stderr_mapper: None,
+        runs_remote_command: true,
+    })
+}
+
+/// [`map_compile`] for compiles a worker can run.
+fn map_compile_for_workers(
+    kind: &CCompilerKind,
+    parsed_args: &ParsedArguments,
+    cwd: &Path,
+    env_vars: &[(OsString, OsString)],
+) -> Result<MappedCompile, NotEligible> {
+    let mapped = map_compile(kind, parsed_args, cwd, env_vars)?;
+    if !WORKERS_RUN_C_COMPILES {
+        return Err(CompileLocallyReason::CToolchainUnsupported.into());
+    }
+    // A non-Linux client's compiler doesn't run on Linux workers.
+    if !cfg!(target_os = "linux") {
+        return Err(CompileLocallyReason::NonLinuxToolchain.into());
+    }
+    Ok(mapped)
 }
 
 /// The `ReapiCompile` of `mapped`, with its toolchain and preprocessed source.
@@ -711,6 +742,21 @@ mod test {
 
     fn reason<T>(mapped: Result<T, NotEligible>) -> CompileLocallyReason {
         mapped.err().expect("the compile mapped").reason
+    }
+
+    #[test_case(&[] ; "eligible")]
+    #[test_case(&["-march=native"] ; "ineligible")]
+    fn test_local_compile_changes_of_eligible_compiles(args: &[&str]) {
+        let mut all_args = args.to_vec();
+        all_args.extend(["-c", "src/x.c", "-o", OBJECT]);
+        let parsed_args = parse(&Gcc, Path::new(WS), &all_args);
+        let env_vars = env_vars(BUILD_SCRIPT_ENV);
+        let changes = reapi_local_compile_changes(&Gcc, &parsed_args, Path::new(WS), &env_vars);
+        let worker_could = WORKERS_RUN_C_COMPILES && cfg!(target_os = "linux") && args.is_empty();
+        assert_eq!(
+            worker_could,
+            changes.is_some_and(|changes| changes.runs_remote_command)
+        );
     }
 
     #[test_case(Diab, &[], R::UnsupportedCompiler ; "other compiler")]
