@@ -242,6 +242,70 @@ pub fn find_rustc() -> PathBuf {
     }
 }
 
+/// Serves `listener`'s first connection as a fake sccache daemon, with `answer`'s responses,
+/// until the client closes the connection or sends a request that `answer` has no response
+/// for, which it returns.
+#[cfg(any(feature = "dist-client", feature = "reapi"))]
+pub fn answer_until(
+    listener: std::net::TcpListener,
+    answer: impl Fn(&crate::protocol::Request) -> Option<crate::protocol::Response>,
+) -> Option<crate::protocol::Request> {
+    use byteorder::{BigEndian, ByteOrder};
+    use std::io::Read;
+
+    let (mut stream, _) = listener.accept().unwrap();
+    loop {
+        let mut len = [0; 4];
+        if stream.read_exact(&mut len).is_err() {
+            return None;
+        }
+        let mut data = vec![0; BigEndian::read_u32(&len) as usize];
+        stream.read_exact(&mut data).unwrap();
+        let request = bincode::deserialize(&data).unwrap();
+        let Some(response) = answer(&request) else {
+            return Some(request);
+        };
+        crate::util::write_length_prefixed_bincode(&mut stream, response).unwrap();
+    }
+}
+
+/// Runs an sccache daemon with a disk cache in `cache_dir` and the dist client container that
+/// `dist` makes on the daemon's runtime. Sends the daemon's address to `addr_tx`, and returns
+/// once `shutdown` resolves and the open connections close.
+#[cfg(any(feature = "dist-client", feature = "reapi"))]
+pub fn run_test_daemon(
+    cache_dir: &Path,
+    dist: impl FnOnce(&tokio::runtime::Handle) -> crate::server::DistClientContainer,
+    addr_tx: std::sync::mpsc::Sender<crate::net::SocketAddr>,
+    shutdown: impl Future,
+) {
+    use crate::cache::CacheMode;
+    use crate::cache::disk::DiskCache;
+    use crate::server::SccacheServer;
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let dist = dist(runtime.handle());
+    let storage = Arc::new(DiskCache::new(
+        cache_dir,
+        u64::MAX,
+        runtime.handle(),
+        Default::default(),
+        CacheMode::ReadWrite,
+        vec![],
+    ));
+    let server: SccacheServer<_, Arc<Mutex<MockCommandCreator>>> = SccacheServer::new(
+        0,
+        runtime,
+        Client::new(),
+        dist,
+        storage,
+        CacheMode::ReadWrite,
+    )
+    .unwrap();
+    addr_tx.send(server.local_addr().unwrap()).unwrap();
+    server.run(shutdown).unwrap();
+}
+
 pub fn single_threaded_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()

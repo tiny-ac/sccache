@@ -3040,7 +3040,7 @@ LLVM version: 6.0",
         fn compile_through_daemon(daemon: TestDaemon, expect_local_compile: bool) -> Outcome {
             use crate::compiler::DistIpcExecutor;
             use crate::protocol::{Request, Response};
-            use crate::server::{DistClientContainer, SccacheServer};
+            use crate::server::DistClientContainer;
 
             drop(env_logger::try_init());
             let creator = new_creator();
@@ -3106,40 +3106,17 @@ LLVM version: 6.0",
                 TestDaemon::WithDistClient(..)
                 | TestDaemon::NoDistClient
                 | TestDaemon::Misconfigured(..) => std::thread::spawn(move || {
-                    let runtime = Runtime::new().unwrap();
-                    let dist = match daemon {
+                    let dist = |runtime: &tokio::runtime::Handle| match daemon {
                         TestDaemon::WithDistClient(client) => {
-                            DistClientContainer::mock(client, runtime.handle().clone())
+                            DistClientContainer::mock(client, runtime.clone())
                         }
                         TestDaemon::NoDistClient => DistClientContainer::new_disabled(),
                         TestDaemon::Misconfigured(message) => {
-                            DistClientContainer::mock_misconfigured(
-                                message,
-                                runtime.handle().clone(),
-                            )
+                            DistClientContainer::mock_misconfigured(message, runtime.clone())
                         }
                         _ => unreachable!("not an sccache daemon"),
                     };
-                    let storage = Arc::new(DiskCache::new(
-                        &daemon_cache,
-                        u64::MAX,
-                        runtime.handle(),
-                        PreprocessorCacheModeConfig::default(),
-                        CacheMode::ReadWrite,
-                        vec![],
-                    ));
-                    let srv: SccacheServer<_, Arc<std::sync::Mutex<MockCommandCreator>>> =
-                        SccacheServer::new(
-                            0,
-                            runtime,
-                            crate::jobserver::Client::new(),
-                            dist,
-                            storage,
-                            CacheMode::ReadWrite,
-                        )
-                        .unwrap();
-                    addr_tx.send(srv.local_addr().unwrap()).unwrap();
-                    srv.run(shutdown_rx).unwrap();
+                    run_test_daemon(&daemon_cache, dist, addr_tx, shutdown_rx);
                 }),
                 TestDaemon::ClosesMidCompile => {
                     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3147,11 +3124,16 @@ LLVM version: 6.0",
                         .send(crate::net::SocketAddr::Net(listener.local_addr().unwrap()))
                         .unwrap();
                     std::thread::spawn(move || {
-                        let compile = test_dist::answer_dist_client_setup(listener, || {
-                            DistClientSetup::Ready {
-                                rewrite_includes_only: true,
-                                custom_toolchains: HashMap::new(),
-                            }
+                        let compile = answer_until(listener, |request| {
+                            matches!(request, Request::Dist(DistIpcRequest::GetDistClientSetup))
+                                .then(|| {
+                                    Response::Dist(DistIpcResponse::DistClientSetup(
+                                        DistClientSetup::Ready {
+                                            rewrite_includes_only: true,
+                                            custom_toolchains: HashMap::new(),
+                                        },
+                                    ))
+                                })
                         });
                         assert!(compile.is_some(), "the CLI didn't send its compile");
                     })
@@ -4419,35 +4401,6 @@ pub(crate) mod test_dist {
     use std::sync::{Arc, atomic::AtomicBool};
 
     use crate::errors::*;
-
-    /// Serves `listener`'s first connection as a daemon whose dist client has `setup`, until
-    /// the CLI closes the connection or sends another request, which it returns.
-    pub(crate) fn answer_dist_client_setup(
-        listener: std::net::TcpListener,
-        setup: impl Fn() -> crate::compiler::DistClientSetup,
-    ) -> Option<crate::protocol::Request> {
-        use crate::compiler::{DistIpcRequest, DistIpcResponse};
-        use crate::protocol::{Request, Response};
-        use byteorder::{BigEndian, ByteOrder};
-        use std::io::Read;
-
-        let (mut stream, _) = listener.accept().unwrap();
-        loop {
-            let mut len = [0; 4];
-            if stream.read_exact(&mut len).is_err() {
-                return None;
-            }
-            let mut data = vec![0; BigEndian::read_u32(&len) as usize];
-            stream.read_exact(&mut data).unwrap();
-            match bincode::deserialize(&data).unwrap() {
-                Request::Dist(DistIpcRequest::GetDistClientSetup) => {
-                    let response = Response::Dist(DistIpcResponse::DistClientSetup(setup()));
-                    crate::util::write_length_prefixed_bincode(&mut stream, response).unwrap();
-                }
-                other => return Some(other),
-            }
-        }
-    }
 
     pub struct ErrorPutToolchainClient;
     impl ErrorPutToolchainClient {
