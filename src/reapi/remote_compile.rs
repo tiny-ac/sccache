@@ -1134,11 +1134,9 @@ pub(super) mod test {
         let compile = ReapiCompile {
             arguments: vec!["-c".to_owned(), "src/x.c".to_owned()],
             program: WorkerProgram::C,
-            toolchain: ToolchainKey::C(CToolchainKey::new(
-                CCompilerKind::Gcc,
-                "/usr/bin/gcc".into(),
-                vec![],
-            )),
+            toolchain: ToolchainKey::C(
+                CToolchainKey::new(CCompilerKind::Gcc, "/usr/bin/gcc".into(), vec![]).unwrap(),
+            ),
             ..reapi_compile_in("/home/a/ws")
         };
         let command = build_command(&compile);

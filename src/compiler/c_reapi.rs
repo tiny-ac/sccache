@@ -240,7 +240,8 @@ fn toolchain_key(
             }
         }
     }
-    Ok(CToolchainKey::new(kind.clone(), driver, internal_files))
+    CToolchainKey::new(kind.clone(), driver, internal_files)
+        .map_err(|e| NotEligible::new(CompileLocallyReason::SharedLibrariesNotListed, e))
 }
 
 /// The file `driver` prints for `option`, or `None` if it prints none. gcc prints a bare name
