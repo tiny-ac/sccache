@@ -43,6 +43,6 @@ pub(crate) use ipc::{
 };
 pub(crate) use mapping::{
     ActionEnv, CompileLocallyReason, NotEligible, PathMapper, ReapiCompile, ToolchainKey,
-    lexically_normalize,
+    WorkerProgram, lexically_normalize,
 };
 pub(crate) use sysroot::sysroot_copy;

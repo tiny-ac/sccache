@@ -2308,7 +2308,7 @@ mod reapi_mapping {
     use crate::compiler::remote::{LocalArg, LocalCompileChanges};
     use crate::reapi::{
         ActionEnv, CompileLocallyReason, NotEligible, PathMapper, ReapiCompile, ToolchainKey,
-        lexically_normalize, sysroot_copy,
+        WorkerProgram, lexically_normalize, sysroot_copy,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -2631,7 +2631,7 @@ mod reapi_mapping {
         Ok(ReapiCompile {
             path_mapper,
             arguments,
-            mapped_crate_root,
+            program: WorkerProgram::Rustc { mapped_crate_root },
             toolchain: ToolchainKey::rustc(commit_hash, compilation.sysroot.clone(), target_triple),
             env,
             input_root_files,
@@ -5353,7 +5353,7 @@ foo.rs:
         use crate::compiler::rust::reapi_mapping::{
             deps_dir_base, map_for_reapi, parse_commit_hash, reapi_local_compile_changes,
         };
-        use crate::reapi::{CompileLocallyReason, ReapiCompile};
+        use crate::reapi::{CompileLocallyReason, ReapiCompile, WorkerProgram};
         use std::os::unix::ffi::OsStringExt;
         use test_case::test_case;
 
@@ -5809,7 +5809,14 @@ foo.rs:
         fn test_an_absolute_crate_root_is_left_out_of_the_arguments() {
             let compilation = compilation_in(CWD, "/ws/app/src/lib.rs", &[]);
             let compile = map_for_reapi(&compilation).unwrap();
-            assert_eq!(Some("src/lib.rs".to_owned()), compile.mapped_crate_root);
+            assert!(
+                matches!(
+                    &compile.program,
+                    WorkerProgram::Rustc { mapped_crate_root: Some(root) } if root == "src/lib.rs"
+                ),
+                "{:?}",
+                compile.program
+            );
             assert!(
                 !compile.arguments.iter().any(|a| a.contains("lib.rs")),
                 "{:?}",

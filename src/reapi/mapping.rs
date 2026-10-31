@@ -38,10 +38,7 @@ pub(super) const TOOLCHAIN_DIR: &str = ".sccache-toolchain";
 pub struct ReapiCompile {
     pub(crate) path_mapper: PathMapper,
     pub(crate) arguments: Vec<String>,
-    /// The crate root when cargo passes it as an absolute path, which `arguments` leave out.
-    /// A worker passes it as an absolute path too, since rustc writes the crate root into its
-    /// output as it was given.
-    pub(crate) mapped_crate_root: Option<String>,
+    pub(crate) program: WorkerProgram,
     /// The toolchain whose files go into the input root.
     pub(crate) toolchain: ToolchainKey,
     pub(crate) env: ActionEnv,
@@ -49,6 +46,21 @@ pub struct ReapiCompile {
     pub(crate) input_root_files: Vec<PathBuf>,
     /// Local paths the compile writes.
     pub(crate) outputs: Vec<PathBuf>,
+}
+
+/// The program a worker runs for a compile, with what its command line needs besides
+/// `ReapiCompile::arguments`.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) enum WorkerProgram {
+    Rustc {
+        /// The crate root when cargo passes it as an absolute path, which `arguments` leave
+        /// out. A worker passes it as an absolute path too, since rustc writes the crate root
+        /// into its output as it was given.
+        mapped_crate_root: Option<String>,
+    },
+    /// gcc or clang, run from the driver that the compile's `ToolchainKey::C` names, which
+    /// the input root holds under [`TOOLCHAIN_DIR`].
+    C,
 }
 
 /// A local toolchain.

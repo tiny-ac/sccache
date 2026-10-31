@@ -19,7 +19,9 @@ use super::cas::{Blob, Cas};
 use super::client::loggable;
 use super::digest::{self, DigestCache};
 use super::input_root::{InputRoot, InputRootFile};
-use super::mapping::{BUILD_ROOT_DIR, CompileLocallyReason, ReapiCompile, TOOLCHAIN_DIR};
+use super::mapping::{
+    BUILD_ROOT_DIR, CompileLocallyReason, ReapiCompile, TOOLCHAIN_DIR, ToolchainKey, WorkerProgram,
+};
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use super::terminal_output::without_terminal_controls;
 use crate::config::ReapiConfig;
@@ -40,9 +42,9 @@ const ENTER_WORKER_ROOT: &str = "set -e\ncd -P .\nPWD=$(pwd -P)\n";
 
 /// The command a worker runs for `compile`, which doesn't depend on the checkout path. A
 /// shell script adds the worker root, known only when the action runs, to path env vars and
-/// rustc's arguments.
+/// the compiler's arguments.
 pub(super) fn build_command(compile: &ReapiCompile) -> remexec::Command {
-    // rustc's paths use the physical cwd, so $PWD must too for the remaps and the worker
+    // Compilers' paths use the physical cwd, so $PWD must too for the remaps and the worker
     // root line to match them. `materialize` reads the worker root line to map the worker
     // root to local paths.
     let mut script =
@@ -69,23 +71,40 @@ pub(super) fn build_command(compile: &ReapiCompile) -> remexec::Command {
     for (name, path) in &path_vars {
         script.push_str(&format!("export {name}=\"$PWD\"/{}\n", sh_quote(path)));
     }
-    let mapped_crate_root_arg = match &compile.mapped_crate_root {
-        Some(path) => format!(" \"$PWD\"/{}", sh_quote(path)),
-        None => String::new(),
+    let program = match (&compile.program, &compile.toolchain) {
+        (WorkerProgram::Rustc { mapped_crate_root }, _) => {
+            let mapped_crate_root_arg = match mapped_crate_root {
+                Some(path) => format!(" \"$PWD\"/{}", sh_quote(path)),
+                None => String::new(),
+            };
+            // Execution may hardlink input root files from their CAS, so rustc may not find
+            // its libraries and sysroot from its own path; the script sets both.
+            // rustc applies the last matching --remap-path-prefix, so BUILD_ROOT_DIR's comes
+            // last.
+            script.push_str(&toolchain_library_path_exports());
+            script.push_str(&format!(
+                "exec \"$PWD\"/{TOOLCHAIN_DIR}/bin/rustc --sysroot \"$PWD\"/{TOOLCHAIN_DIR} \"$@\"{mapped_crate_root_arg} \
+                 --remap-path-prefix=\"$PWD\"=. --remap-path-prefix=\"$PWD\"/{BUILD_ROOT_DIR}={BUILD_ROOT_DIR}\n"
+            ));
+            "rustc"
+        }
+        // The worker root differs per action, so objects name it as `.`.
+        (WorkerProgram::C, ToolchainKey::C(toolchain)) => {
+            script.push_str(&format!(
+                "exec \"$PWD\"/{TOOLCHAIN_DIR}{} \"$@\" -ffile-prefix-map=\"$PWD\"=.\n",
+                sh_quote(&toolchain.driver.to_string_lossy())
+            ));
+            "cc"
+        }
+        (WorkerProgram::C, ToolchainKey::Rustc(_)) => {
+            unreachable!("C compiles are mapped with a C toolchain")
+        }
     };
-    // Execution may hardlink input root files from their CAS, so rustc may not find its
-    // libraries and sysroot from its own path; the script sets both.
-    // rustc applies the last matching --remap-path-prefix, so BUILD_ROOT_DIR's comes last.
-    script.push_str(&toolchain_library_path_exports());
-    script.push_str(&format!(
-        "exec \"$PWD\"/{TOOLCHAIN_DIR}/bin/rustc --sysroot \"$PWD\"/{TOOLCHAIN_DIR} \"$@\"{mapped_crate_root_arg} \
-         --remap-path-prefix=\"$PWD\"=. --remap-path-prefix=\"$PWD\"/{BUILD_ROOT_DIR}={BUILD_ROOT_DIR}\n"
-    ));
     let mut arguments = vec![
         "/bin/sh".to_owned(),
         "-c".to_owned(),
         script,
-        "rustc".to_owned(),
+        program.to_owned(),
     ];
     arguments.extend(compile.arguments.iter().cloned());
     // REAPI requires both lists sorted.
@@ -746,7 +765,8 @@ fn exit_status_from_code(exit_code: u8) -> process::ExitStatus {
 pub(super) mod test {
     use super::*;
     use crate::reapi::fake::FakeServer;
-    use crate::reapi::{ActionEnv, PathMapper, ToolchainKey};
+    use crate::reapi::mapping::CToolchainKey;
+    use crate::reapi::{ActionEnv, PathMapper};
     use std::sync::Arc;
     use test_case::test_case;
 
@@ -758,7 +778,9 @@ pub(super) mod test {
         ReapiCompile {
             path_mapper: PathMapper::new(cwd.into(), format!("{cwd}/target").into()),
             arguments: vec!["--crate-name=foo".to_owned()],
-            mapped_crate_root: Some("src/lib.rs".to_owned()),
+            program: WorkerProgram::Rustc {
+                mapped_crate_root: Some("src/lib.rs".to_owned()),
+            },
             toolchain: ToolchainKey::rustc(
                 "abc123".to_owned(),
                 "/toolchain".into(),
@@ -1095,6 +1117,38 @@ pub(super) mod test {
         assert_eq!(
             format!("{WORKER_ROOT_MARKER}{w}\n"),
             String::from_utf8(output.stderr).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_c_command_runs_the_driver_from_the_toolchain_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let worker_root = tempfile::tempdir().unwrap();
+        let worker_root = worker_root.path().canonicalize().unwrap();
+        let driver = worker_root.join(".sccache-toolchain/usr/bin/gcc");
+        std::fs::create_dir_all(driver.parent().unwrap()).unwrap();
+        std::fs::write(&driver, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let compile = ReapiCompile {
+            arguments: vec!["-c".to_owned(), "src/x.c".to_owned()],
+            program: WorkerProgram::C,
+            toolchain: ToolchainKey::C(CToolchainKey::new("/usr/bin/gcc".into())),
+            ..reapi_compile_in("/home/a/ws")
+        };
+        let command = build_command(&compile);
+        let output = std::process::Command::new(&command.arguments[0])
+            .args(&command.arguments[1..])
+            .current_dir(&worker_root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            format!(
+                "-c\nsrc/x.c\n-ffile-prefix-map={}=.\n",
+                worker_root.display()
+            ),
+            String::from_utf8(output.stdout).unwrap()
         );
     }
 

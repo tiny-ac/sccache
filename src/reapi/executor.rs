@@ -935,6 +935,7 @@ pub(super) mod test {
     use crate::dist;
     use crate::mock_command::{MockChild, MockCommandCreator, exit_status};
     use crate::reapi::fake::FakeServer;
+    use crate::reapi::mapping::WorkerProgram;
     use crate::reapi::pause::FAILURES_TO_PAUSE;
     use crate::reapi::proto::build::bazel::remote::execution::v2 as remexec;
     use crate::reapi::remote_compile::test::{fake_sysroot, inline_output, worker_result};
@@ -992,7 +993,9 @@ pub(super) mod test {
             Ok(ReapiCompile {
                 path_mapper: PathMapper::new(ws.clone(), ws.join("target")),
                 arguments: vec![],
-                mapped_crate_root: None,
+                program: WorkerProgram::Rustc {
+                    mapped_crate_root: None,
+                },
                 toolchain: ToolchainKey::rustc(
                     self.commit_hash.clone(),
                     self.dir.join("sysroot"),
