@@ -121,6 +121,9 @@ pub struct ParsedArguments {
     pub color_mode: ColorMode,
     /// arguments are incompatible with rewrite_includes_only
     pub suppress_rewrite_includes_only: bool,
+    /// Whether the last `-x` follows the input, which gcc and clang then compile in the
+    /// language its extension names.
+    pub language_after_input: bool,
     /// Arguments are incompatible with preprocessor cache mode
     pub too_hard_for_preprocessor_cache_mode: Option<OsString>,
 }
@@ -1265,6 +1268,18 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
         });
         let outputs_rewriter = Box::new(NoopOutputsRewriter);
         Ok((inputs_packager, toolchain_packager, outputs_rewriter))
+    }
+
+    #[cfg(feature = "reapi")]
+    fn map_for_reapi(
+        &self,
+    ) -> std::result::Result<crate::reapi::ReapiCompile, crate::reapi::NotEligible> {
+        super::c_reapi::map_for_reapi(
+            &self.compiler.kind(),
+            &self.parsed_args,
+            &self.cwd,
+            &self.env_vars,
+        )
     }
 
     fn is_locally_preprocessed(&self) -> bool {

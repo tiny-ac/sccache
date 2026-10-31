@@ -326,6 +326,7 @@ where
     }
     let mut need_explicit_dep_argument_path = DepArgumentRequirePath::NotNeeded;
     let mut language = None;
+    let mut language_after_input = false;
     // Clang assembles in-process unless told otherwise; the other compilers
     // parsed here always hand off to a separate assembler.
     let mut integrated_assembler = kind == CCompilerKind::Clang;
@@ -445,6 +446,7 @@ where
             | Some(UnhashedFlag)
             | Some(Unhashed(_)) => {}
             Some(Language(lang)) => {
+                language_after_input = input_arg.is_some();
                 language = match lang.to_string_lossy().as_ref() {
                     // From https://gcc.gnu.org/onlinedocs/gcc/Overall-Options.html
                     // and https://github.com/llvm/llvm-project/blob/main/clang/include/clang/Driver/Types.def
@@ -780,6 +782,7 @@ where
         profile_generate,
         color_mode,
         suppress_rewrite_includes_only,
+        language_after_input,
         too_hard_for_preprocessor_cache_mode,
     })
 }
@@ -1858,6 +1861,20 @@ mod test {
             assert!(a.common_args.is_empty());
             assert_eq!(ovec![flag], a.unhashed_args,);
         }
+    }
+
+    #[test]
+    fn test_parse_arguments_language_after_input() {
+        let parsed = |args| match parse_arguments_(args, false) {
+            CompilerArguments::Ok(args) => args,
+            o => panic!("Got unexpected parse result: {:?}", o),
+        };
+        let before = parsed(stringvec!["-x", "c++", "-c", "foo.c", "-o", "foo.o"]);
+        assert_eq!(Language::Cxx, before.language);
+        assert!(!before.language_after_input);
+        let after = parsed(stringvec!["-c", "foo.cpp", "-o", "foo.o", "-x", "c"]);
+        assert_eq!(Language::C, after.language);
+        assert!(after.language_after_input);
     }
 
     #[test]
@@ -2945,6 +2962,7 @@ mod test {
             profile_generate: false,
             color_mode: ColorMode::Auto,
             suppress_rewrite_includes_only: false,
+            language_after_input: false,
             too_hard_for_preprocessor_cache_mode: None,
         };
         let runtime = single_threaded_runtime();
@@ -3008,6 +3026,7 @@ mod test {
             profile_generate: false,
             color_mode: ColorMode::Auto,
             suppress_rewrite_includes_only: false,
+            language_after_input: false,
             too_hard_for_preprocessor_cache_mode: None,
         };
         let runtime = single_threaded_runtime();
@@ -3111,6 +3130,7 @@ mod test {
             profile_generate: false,
             color_mode: ColorMode::Auto,
             suppress_rewrite_includes_only: false,
+            language_after_input: false,
             too_hard_for_preprocessor_cache_mode: None,
         };
         let runtime = single_threaded_runtime();
