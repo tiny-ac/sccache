@@ -1089,6 +1089,7 @@ pub fn parse_arguments(
         // FIXME: implement color_mode for msvc.
         color_mode: ColorMode::Auto,
         suppress_rewrite_includes_only: false,
+        language_after_input: false,
         too_hard_for_preprocessor_cache_mode: None,
     })
 }
@@ -3598,6 +3599,7 @@ mod test {
             profile_generate: false,
             color_mode: ColorMode::Auto,
             suppress_rewrite_includes_only: false,
+            language_after_input: false,
             too_hard_for_preprocessor_cache_mode: None,
         };
         let runtime = single_threaded_runtime();
@@ -3811,6 +3813,7 @@ mod test {
             profile_generate: false,
             color_mode: ColorMode::Auto,
             suppress_rewrite_includes_only: false,
+            language_after_input: false,
             too_hard_for_preprocessor_cache_mode: None,
         };
         let runtime = single_threaded_runtime();
