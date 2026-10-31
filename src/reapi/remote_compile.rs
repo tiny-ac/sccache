@@ -20,7 +20,8 @@ use super::client::loggable;
 use super::digest::{self, DigestCache};
 use super::input_root::{InputRoot, InputRootFile};
 use super::mapping::{
-    BUILD_ROOT_DIR, CompileLocallyReason, ReapiCompile, TOOLCHAIN_DIR, ToolchainKey, WorkerProgram,
+    BUILD_ROOT_DIR, CToolchainKey, CompileLocallyReason, ReapiCompile, TOOLCHAIN_DIR, ToolchainKey,
+    WorkerProgram,
 };
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use super::terminal_output::without_terminal_controls;
@@ -399,6 +400,41 @@ pub(super) fn toolchain_files(
     Ok(files)
 }
 
+/// `toolchain`'s driver, internal files and libraries, as input root files under
+/// [`TOOLCHAIN_DIR`] at their local absolute paths, paired with those paths. Fails with
+/// [`UnusableToolchain`] for a non-UTF-8 path.
+pub(super) fn c_toolchain_files(
+    toolchain: &CToolchainKey,
+    digest_cache: &DigestCache,
+) -> Result<Vec<(InputRootFile, PathBuf)>> {
+    let executables: HashSet<&PathBuf> = std::iter::once(&toolchain.driver)
+        .chain(
+            (toolchain.internal_files.iter())
+                .filter(|file| file.is_program())
+                .map(|file| &file.path),
+        )
+        .collect();
+    let files = toolchain.internal_files.iter().map(|file| &file.path);
+    std::iter::once(&toolchain.driver)
+        .chain(files)
+        .chain(&toolchain.libraries)
+        .map(|local_path| {
+            let path = local_path.to_str().ok_or_else(|| {
+                unusable(
+                    CompileLocallyReason::NonUtf8ToolchainPath,
+                    format!("non-UTF-8 toolchain path {}", local_path.display()),
+                )
+            })?;
+            let file = InputRootFile {
+                path: format!("{TOOLCHAIN_DIR}{path}"),
+                digest: digest_cache.digest_and_pin(local_path)?,
+                is_executable: executables.contains(local_path),
+            };
+            Ok((file, local_path.clone()))
+        })
+        .collect()
+}
+
 /// Writes to `inner` and records whether the bytes written contain the worker root, even
 /// split across writes. The worker root doesn't exist on the client machine, so an output
 /// that contains it can't be used there.
@@ -766,7 +802,7 @@ pub(super) mod test {
     use super::*;
     use crate::compiler::CCompilerKind;
     use crate::reapi::fake::FakeServer;
-    use crate::reapi::mapping::CToolchainKey;
+    use crate::reapi::mapping::{CToolchainKey, InternalFile};
     use crate::reapi::{ActionEnv, PathMapper};
     use std::sync::Arc;
     use test_case::test_case;
@@ -1119,6 +1155,13 @@ pub(super) mod test {
             format!("{WORKER_ROOT_MARKER}{w}\n"),
             String::from_utf8(output.stderr).unwrap()
         );
+    }
+
+    fn internal_file(option: &str, path: &str) -> InternalFile {
+        InternalFile {
+            option: option.to_owned(),
+            path: path.into(),
+        }
     }
 
     #[cfg(unix)]
@@ -1578,6 +1621,96 @@ pub(super) mod test {
             e.downcast_ref(),
             Some(UnusableToolchain(CompileLocallyReason::MissingRustcOrStd))
         ));
+    }
+
+    #[test]
+    fn test_c_toolchain_files_are_the_driver_its_internal_files_and_libraries() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        for name in ["gcc", "cc1", "specs", "libgmp.so.10"] {
+            std::fs::write(dir.join(name), name).unwrap();
+        }
+        let in_dir = |name: &str| dir.join(name).to_str().unwrap().to_owned();
+        let toolchain = CToolchainKey::with_libraries(
+            CCompilerKind::Gcc,
+            dir.join("gcc"),
+            vec![
+                internal_file("-print-prog-name=cc1", &in_dir("cc1")),
+                internal_file("-print-file-name=specs", &in_dir("specs")),
+            ],
+            vec![dir.join("libgmp.so.10")],
+        );
+        let digest_cache = DigestCache::load(dir.join("digests"));
+        let files = c_toolchain_files(&toolchain, &digest_cache).unwrap();
+        let files: Vec<_> = (files.iter())
+            .map(|(file, local_path)| (file.path.clone(), file.is_executable, local_path))
+            .collect();
+        let in_toolchain_dir = |name| format!("{TOOLCHAIN_DIR}{}", in_dir(name));
+        assert_eq!(
+            vec![
+                (in_toolchain_dir("gcc"), true, &dir.join("gcc")),
+                (in_toolchain_dir("cc1"), true, &dir.join("cc1")),
+                (in_toolchain_dir("specs"), false, &dir.join("specs")),
+                (
+                    in_toolchain_dir("libgmp.so.10"),
+                    false,
+                    &dir.join("libgmp.so.10")
+                ),
+            ],
+            files
+        );
+    }
+
+    /// The key of the local `gcc` or `clang`, as a compile of a C source gets it, or `None`
+    /// without a real one.
+    #[cfg(target_os = "linux")]
+    pub(in crate::reapi) fn local_c_toolchain(kind: &CCompilerKind) -> Option<CToolchainKey> {
+        let (program, version) = match kind {
+            CCompilerKind::Gcc => ("gcc", "Free Software Foundation"),
+            _ => ("clang", "clang version"),
+        };
+        let output = std::process::Command::new(program)
+            .arg("--version")
+            .output();
+        if !output.is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains(version)) {
+            eprintln!("No {program} found, skipping test");
+            return None;
+        }
+        let env_vars = vec![("PATH".into(), std::env::var_os("PATH").unwrap())];
+        let executable = which::which(program).unwrap();
+        let key = crate::compiler::c_reapi::toolchain_key(
+            kind,
+            &executable,
+            &crate::compiler::Language::C,
+            Path::new("/"),
+            &env_vars,
+        );
+        Some(key.unwrap())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_c_toolchain_files_have_the_libraries_but_glibc() {
+        let Some(toolchain) = local_c_toolchain(&CCompilerKind::Gcc) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let digest_cache = DigestCache::load(dir.path().join("digests"));
+        let files = c_toolchain_files(&toolchain, &digest_cache).unwrap();
+        let names: Vec<_> = (files.iter())
+            .map(|(_, local_path)| local_path.file_name().unwrap().to_string_lossy())
+            .collect();
+        // cc1 loads GMP and its kin.
+        assert!(
+            names.iter().any(|name| name.starts_with("libgmp.so")),
+            "{names:?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.starts_with("libc.so") || name.starts_with("ld-linux")),
+            "{names:?}"
+        );
     }
 
     #[test]

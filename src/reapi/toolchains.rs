@@ -19,7 +19,7 @@
 use super::digest::DigestCache;
 use super::input_root::InputRootFile;
 use super::mapping::{CompileLocallyReason, ToolchainKey};
-use super::remote_compile::{UnusableToolchain, toolchain_files};
+use super::remote_compile::{UnusableToolchain, c_toolchain_files, toolchain_files};
 use crate::errors::*;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -110,12 +110,7 @@ impl Toolchains {
                         &toolchain.target_triple,
                         &digest_cache,
                     )?,
-                    // Without a list of a C toolchain's files, workers can't run gcc or clang.
-                    ToolchainKey::C(_) => {
-                        return Err(
-                            UnusableToolchain(CompileLocallyReason::CToolchainUnsupported).into(),
-                        );
-                    }
+                    ToolchainKey::C(toolchain) => c_toolchain_files(toolchain, &digest_cache)?,
                 };
                 if let Err(e) = digest_cache.save() {
                     warn!("REAPI: failed to save the digest cache: {e:#}");
@@ -210,16 +205,14 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_a_c_toolchain_is_unusable() {
+    async fn test_a_c_toolchain_is_hashed() {
         let dir = tempfile::tempdir().unwrap();
+        let driver = dir.path().join("gcc");
+        std::fs::write(&driver, "#!/bin/sh\n").unwrap();
         let toolchains = toolchains(dir.path(), RETRY_AFTER);
-        let key = ToolchainKey::C(
-            CToolchainKey::new(CCompilerKind::Gcc, "/usr/bin/cc".into(), vec![]).unwrap(),
-        );
-        assert_eq!(
-            Some(CompileLocallyReason::CToolchainUnsupported),
-            toolchains.files(&key, in_secs(10)).await.err()
-        );
+        let key = ToolchainKey::C(CToolchainKey::new(CCompilerKind::Gcc, driver, vec![]).unwrap());
+        let files = toolchains.files(&key, in_secs(10)).await.unwrap();
+        assert_eq!(1, files.len(), "{files:?}");
     }
 
     #[tokio::test]
