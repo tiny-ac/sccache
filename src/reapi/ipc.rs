@@ -15,6 +15,7 @@
 //! REAPI in client-side mode, where the CLI maps a cache miss for REAPI and the daemon's
 //! executor compiles it through REAPI, or holds a local slot while the CLI compiles it.
 
+use super::compile_as_worker::{CompileAsWorker, run_as_worker_or_locally};
 use super::executor::{
     CompileLocally, PREPROCESSED_DIR, ReapiExecutor, SYSROOT_COPIES_DIR, compiled_locally, map_miss,
 };
@@ -246,8 +247,12 @@ impl<T: CommandCreatorSync> RemoteExecutor<T> for ReapiIpcExecutor {
             &out_pretty,
         )
         .await;
+        let mut mapped = mapped.map(Box::new);
+        let as_worker = mapped.as_deref_mut().ok().and_then(CompileAsWorker::new);
+        let run_locally =
+            || run_as_worker_or_locally(as_worker.as_ref(), &local_compile, &out_pretty);
         let request = ReapiIpcRequest::CompileThroughReapi {
-            mapped: mapped.map(Box::new),
+            mapped,
             out_pretty: out_pretty.clone(),
         };
         let result = match self.request(request).await {
@@ -264,16 +269,16 @@ impl<T: CommandCreatorSync> RemoteExecutor<T> for ReapiIpcExecutor {
             Ok(CompileThroughReapiResult::CompileLocally(reason)) => reason,
             Ok(CompileThroughReapiResult::NoReapiExecutor) => {
                 debug!("[{out_pretty}]: The daemon has no REAPI executor, compiling locally");
-                return Ok((DistType::NoDist, local_compile.run().await?));
+                return Ok((DistType::NoDist, run_locally().await?));
             }
             // A daemon that didn't answer holds no local slot for the compile.
             Err(e) => {
                 warn!("[{out_pretty}]: REAPI compile request failed, compiling locally: {e:#}");
                 let reason = CompileLocallyReason::DaemonFailed;
-                return Ok((compiled_locally(reason), local_compile.run().await?));
+                return Ok((compiled_locally(reason), run_locally().await?));
             }
         };
-        let output = local_compile.run().await;
+        let output = run_locally().await;
         if let Err(e) = self.request(ReapiIpcRequest::ReleaseLocalSlot).await {
             warn!("[{out_pretty}]: Could not release the daemon's local slot: {e:#}");
         }
@@ -284,7 +289,7 @@ impl<T: CommandCreatorSync> RemoteExecutor<T> for ReapiIpcExecutor {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::reapi::executor::test::{Eligibility, Fixture, RLIB};
+    use crate::reapi::executor::test::{C_OBJECT, Eligibility, Fixture, RLIB};
     use std::num::NonZeroUsize;
     use std::time::Duration;
 
@@ -577,6 +582,23 @@ mod test {
         assert!(stderr.contains("warning: in"), "{stderr}");
         let rlib = std::fs::read(fixture.dir.path().join("ws").join(RLIB)).unwrap();
         assert_eq!(b"rlib", rlib.as_slice());
+        drop(executor);
+        daemon.stop();
+    }
+
+    #[test]
+    fn test_a_cli_compiles_a_c_miss_as_a_worker_does() {
+        let fixture = Fixture::new(Eligibility::EligibleC);
+        let daemon = TestDaemon::start(fixture.executor(), fixture.dir.path().join("daemon"));
+        let executor = cli_executor(&fixture, &daemon.addr);
+        let (dist_type, output) = fixture.compile_with(&executor);
+        assert_eq!(
+            compiled_locally(CompileLocallyReason::NotInActionCache),
+            dist_type
+        );
+        assert_eq!(b"worker out", output.stdout.as_slice());
+        let object = std::fs::read(fixture.dir.path().join("ws").join(C_OBJECT)).unwrap();
+        assert_eq!(b"object", object.as_slice());
         drop(executor);
         daemon.stop();
     }

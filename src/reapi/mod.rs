@@ -19,10 +19,6 @@ mod action_cache;
 mod auth_token;
 mod cas;
 mod client;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "C misses don't compile as a worker yet")
-)]
 mod compile_as_worker;
 mod connection;
 mod credential_helper;
