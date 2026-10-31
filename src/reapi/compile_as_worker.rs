@@ -275,4 +275,65 @@ mod test {
             std::fs::read_to_string(dir.join("ws").join(OBJECT)).unwrap()
         );
     }
+
+    #[cfg(target_os = "linux")]
+    #[test_case::test_case(CCompilerKind::Gcc, &[] ; "gcc")]
+    #[test_case::test_case(CCompilerKind::Gcc, &["-g"] ; "gcc with debug info")]
+    #[test_case::test_case(CCompilerKind::Clang, &[] ; "clang")]
+    #[test_case::test_case(CCompilerKind::Clang, &["-g"] ; "clang with debug info")]
+    fn test_a_compile_as_worker_writes_the_object_a_worker_writes(
+        kind: CCompilerKind,
+        options: &[&str],
+    ) {
+        use crate::reapi::digest::DigestCache;
+        use crate::reapi::remote_compile::test::{local_c_toolchain, put_in_worker_root};
+        use crate::reapi::remote_compile::{build_command, c_toolchain_files};
+        let Some(toolchain) = local_c_toolchain(&kind) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let dir = &dir.path().canonicalize().unwrap();
+        let preprocessed = "# 1 \"./src/x.c\"\n\
+             # 1 \".sccache-build/debug/build/foo-1/out/gen.h\" 1\n\
+             const char *generated(void) { return \"gen.h\"; }\n\
+             # 2 \"./src/x.c\" 2\n\
+             int add(int a, int b) { return a + b; }\n";
+        let object = ".sccache-build/debug/build/foo-1/out/x.o";
+        let mut arguments = vec!["-x", "cpp-output", "-c", "src/x.c", "-o", object];
+        if kind == CCompilerKind::Gcc {
+            arguments.push("-fpreprocessed");
+        }
+        arguments.extend(options);
+        let mut compile = c_compile(
+            &dir.join("local"),
+            toolchain.clone(),
+            preprocessed,
+            &arguments,
+        );
+
+        let worker_root = dir.join("worker/root");
+        let digest_cache = DigestCache::load(dir.join("digests"));
+        let files = c_toolchain_files(&toolchain, &digest_cache).unwrap();
+        put_in_worker_root(&files, &worker_root);
+        std::fs::create_dir_all(worker_root.join("src")).unwrap();
+        std::fs::write(worker_root.join("src/x.c"), preprocessed).unwrap();
+        std::fs::create_dir_all(worker_root.join(object).parent().unwrap()).unwrap();
+        let command = build_command(&compile);
+        let output = std::process::Command::new(&command.arguments[0])
+            .args(&command.arguments[1..])
+            .current_dir(&worker_root)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+
+        let as_worker = CompileAsWorker::new(&mut compile).unwrap();
+        run(&dir.join("local"), &as_worker, "exit 1").unwrap();
+        let local = std::fs::read(dir.join("local/ws").join(OBJECT)).unwrap();
+        let worker = std::fs::read(worker_root.join(object)).unwrap();
+        assert!(local == worker, "the objects differ");
+        let dir = dir.as_os_str().as_encoded_bytes();
+        assert!(memchr::memmem::find(&local, dir).is_none());
+    }
 }
