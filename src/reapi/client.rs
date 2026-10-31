@@ -64,6 +64,8 @@ pub(super) const RUSTC_MNEMONIC: &str = "Rustc";
 pub(super) const CPP_COMPILE_MNEMONIC: &str = "CppCompile";
 /// The mnemonic of the action that runs `rustc -vV` on a worker.
 pub(super) const RUSTC_VERSION_MNEMONIC: &str = "RustcVersion";
+/// The mnemonic of the action that checks a gcc or clang toolchain on a worker.
+pub(super) const CPP_COMPILER_CHECK_MNEMONIC: &str = "CppCompilerCheck";
 /// Carries a [`remexec::RequestMetadata`], which a server logs to tell its clients, their runs
 /// and their actions apart.
 pub(super) const REQUEST_METADATA_HEADER: &str =
