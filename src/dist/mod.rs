@@ -45,6 +45,17 @@ pub use crate::dist::cache::TcCache;
 
 pub use self::path_transform::PathTransformer;
 
+#[cfg(all(
+    target_os = "linux",
+    any(
+        all(
+            feature = "dist-client",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        feature = "reapi"
+    )
+))]
+pub(crate) mod ldd;
 #[cfg(feature = "dist-client")]
 pub mod pkg;
 #[cfg(not(feature = "dist-client"))]
