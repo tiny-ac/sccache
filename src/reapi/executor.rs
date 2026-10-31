@@ -116,6 +116,13 @@ enum RustcOnWorkers {
     Unusable(CompileLocallyReason),
 }
 
+/// A compile that runs locally, for `reason`.
+pub(super) struct CompileLocally {
+    pub(super) reason: CompileLocallyReason,
+    /// Held until the local compile ends. `None` without `local_slots`.
+    pub(super) local_slot: Option<OwnedSemaphorePermit>,
+}
+
 /// What looking a compile up, and executing it on a miss, needs.
 struct Lookup {
     reapi_compile: ReapiCompile,
@@ -210,47 +217,46 @@ impl ReapiExecutor {
         Some(local_slots.acquire_owned().await.expect(SLOTS_NEVER_CLOSE))
     }
 
-    /// What looking `compilation` up needs, or why it compiles locally.
-    async fn prepare_lookup<T: CommandCreatorSync>(
+    /// Looks `mapped` up in the action cache and executes it on a miss, writing the outputs to
+    /// their local paths. Every compile that runs locally, whether `mapped` is a reason or
+    /// REAPI failed, waits for a local slot first.
+    pub(super) async fn compile_through_reapi(
         &self,
-        compilation: Box<dyn Compilation<T>>,
-        cache_control: CacheControl,
-        local_compile_changed: bool,
+        mapped: std::result::Result<ReapiCompile, CompileLocallyReason>,
+        out_pretty: &str,
+    ) -> std::result::Result<(ReapiOutcome, process::Output), CompileLocally> {
+        let mut local_slot = None;
+        let looked_up = async {
+            let lookup = self.prepare_lookup(mapped?, out_pretty).await?;
+            let apis = lookup.apis.clone();
+            let looked_up = self
+                .look_up_or_execute(lookup, &mut local_slot, out_pretty)
+                .await;
+            if let (Err(CompileLocallyReason::CredentialsRefused), Some(connection)) =
+                (&looked_up, &self.connection)
+            {
+                connection.credentials_refused(&apis).await;
+            }
+            looked_up
+        }
+        .await;
+        let reason = match looked_up {
+            Ok(compiled) => return Ok(compiled),
+            Err(reason) => reason,
+        };
+        let local_slot = match local_slot {
+            Some(slot) => Some(slot),
+            None => self.local_slot().await,
+        };
+        Err(CompileLocally { reason, local_slot })
+    }
+
+    /// What looking `reapi_compile` up needs, or why it compiles locally.
+    async fn prepare_lookup(
+        &self,
+        mut reapi_compile: ReapiCompile,
         out_pretty: &str,
     ) -> std::result::Result<Lookup, CompileLocallyReason> {
-        // SCCACHE_RECACHE and SCCACHE_NO_CACHE ask for a real compile, which a hit would skip.
-        if cache_control != CacheControl::Default {
-            return compile_locally(out_pretty, CompileLocallyReason::CacheBypassed);
-        }
-        let mapped = tokio::task::spawn_blocking(move || compilation.map_for_reapi()).await;
-        let mut reapi_compile = match mapped {
-            Ok(Ok(reapi_compile)) => reapi_compile,
-            Ok(Err(not_eligible)) => {
-                match &not_eligible.detail {
-                    Some(detail) => debug!(
-                        "[{}]: Compiling locally: {}: {:#}",
-                        out_pretty, not_eligible.reason, detail
-                    ),
-                    None => debug!(
-                        "[{}]: Compiling locally: {}",
-                        out_pretty, not_eligible.reason
-                    ),
-                }
-                return Err(not_eligible.reason);
-            }
-            // A panic is a bug in sccache, which shouldn't fail a compile that runs locally.
-            Err(e) => {
-                warn!(
-                    "[{}]: Compiling locally: failed to map the compile for REAPI: {}",
-                    out_pretty, e
-                );
-                return Err(CompileLocallyReason::MappingPanicked);
-            }
-        };
-        // sccache caches a hit under the hash key of the changed local compile.
-        if !local_compile_changed {
-            return compile_locally(out_pretty, CompileLocallyReason::LocalCompileUnchanged);
-        }
         let Some(connection) = &self.connection else {
             return compile_locally(out_pretty, CompileLocallyReason::Misconfigured);
         };
@@ -616,6 +622,56 @@ impl ReapiExecutor {
     }
 }
 
+/// How the stats count a compile that ran locally for `reason`. They count reasons by their
+/// text, as they do non-cacheable ones.
+pub(super) fn compiled_locally(reason: CompileLocallyReason) -> DistType {
+    DistType::Reapi(ReapiOutcome::CompiledLocally(reason.to_string()))
+}
+
+/// `compilation` mapped for REAPI, or why its cache miss compiles locally. Mapping runs
+/// rustc and reads files, so it runs on a blocking thread.
+pub(super) async fn map_miss<T: CommandCreatorSync>(
+    compilation: Box<dyn Compilation<T>>,
+    cache_control: CacheControl,
+    local_compile_changed: bool,
+    out_pretty: &str,
+) -> std::result::Result<ReapiCompile, CompileLocallyReason> {
+    // SCCACHE_RECACHE and SCCACHE_NO_CACHE ask for a real compile, which a hit would skip.
+    if cache_control != CacheControl::Default {
+        return compile_locally(out_pretty, CompileLocallyReason::CacheBypassed);
+    }
+    let mapped = tokio::task::spawn_blocking(move || compilation.map_for_reapi()).await;
+    let reapi_compile = match mapped {
+        Ok(Ok(reapi_compile)) => reapi_compile,
+        Ok(Err(not_eligible)) => {
+            match &not_eligible.detail {
+                Some(detail) => debug!(
+                    "[{}]: Compiling locally: {}: {:#}",
+                    out_pretty, not_eligible.reason, detail
+                ),
+                None => debug!(
+                    "[{}]: Compiling locally: {}",
+                    out_pretty, not_eligible.reason
+                ),
+            }
+            return Err(not_eligible.reason);
+        }
+        // A panic is a bug in sccache, which shouldn't fail a compile that runs locally.
+        Err(e) => {
+            warn!(
+                "[{}]: Compiling locally: failed to map the compile for REAPI: {}",
+                out_pretty, e
+            );
+            return Err(CompileLocallyReason::MappingPanicked);
+        }
+    };
+    // sccache caches a hit under the hash key of the changed local compile.
+    if !local_compile_changed {
+        return compile_locally(out_pretty, CompileLocallyReason::LocalCompileUnchanged);
+    }
+    Ok(reapi_compile)
+}
+
 /// Writes `result`'s outputs to `reapi_compile`'s local paths.
 async fn write_outputs(
     apis: &ServerApis,
@@ -847,41 +903,19 @@ impl<T: CommandCreatorSync> RemoteExecutor<T> for ReapiExecutor {
             local_compile_changed,
             ..
         } = job;
-        let mut local_slot = None;
-        let looked_up = async {
-            let lookup = self
-                .prepare_lookup(
-                    compilation,
-                    cache_control,
-                    local_compile_changed,
-                    &out_pretty,
-                )
-                .await?;
-            let apis = lookup.apis.clone();
-            let looked_up = self
-                .look_up_or_execute(lookup, &mut local_slot, &out_pretty)
-                .await;
-            if let (Err(CompileLocallyReason::CredentialsRefused), Some(connection)) =
-                (&looked_up, &self.connection)
-            {
-                connection.credentials_refused(&apis).await;
-            }
-            looked_up
-        }
+        let mapped = map_miss(
+            compilation,
+            cache_control,
+            local_compile_changed,
+            &out_pretty,
+        )
         .await;
-        match looked_up {
+        match self.compile_through_reapi(mapped, &out_pretty).await {
             Ok((outcome, output)) => Ok((DistType::Reapi(outcome), output)),
-            Err(reason) => {
-                let _local_slot = match local_slot {
-                    Some(slot) => Some(slot),
-                    None => self.local_slot().await,
-                };
-                // The stats count reasons by their text, as they do non-cacheable ones.
-                Ok((
-                    DistType::Reapi(ReapiOutcome::CompiledLocally(reason.to_string())),
-                    local_compile.run().await?,
-                ))
-            }
+            Err(CompileLocally {
+                reason,
+                local_slot: _local_slot,
+            }) => Ok((compiled_locally(reason), local_compile.run().await?)),
         }
     }
 }
