@@ -20,8 +20,8 @@
 use crate::compiler::Language;
 use crate::compiler::c::{CCompilerKind, ParsedArguments};
 use crate::reapi::{
-    CToolchainKey, CompileLocallyReason, InternalFile, NotEligible, PathMapper, ReapiCompile,
-    ToolchainKey, WorkerProgram, lexically_normalize,
+    CToolchainKey, CompileLocallyReason, InternalFile, NotEligible, PathMapper, PreprocessedSource,
+    ReapiCompile, ToolchainKey, WorkerProgram, lexically_normalize,
 };
 use anyhow::anyhow;
 use std::ffi::OsString;
@@ -67,23 +67,33 @@ const GCC_INTERNAL_FILES: &[&str] = &[
 /// Off while workers can't run a C toolchain, which keeps every C compile local.
 const WORKERS_RUN_C_COMPILES: bool = false;
 
-/// The compile of `parsed_args` by `executable` in `cwd`, mapped for REAPI, or why it runs
-/// locally. Runs the compiler, so call it from a blocking thread.
+/// The compile of `parsed_args` by `executable` in `cwd`, mapped for REAPI with its
+/// preprocessed source under `preprocessed_dir`, or why it runs locally. Runs the compiler, so
+/// call it from a blocking thread.
 pub(super) fn map_for_reapi(
     kind: &CCompilerKind,
     parsed_args: &ParsedArguments,
     executable: &Path,
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
+    preprocessed_dir: &Path,
 ) -> Result<ReapiCompile, NotEligible> {
     let mapped = map_compile(kind, parsed_args, cwd, env_vars)?;
     if !WORKERS_RUN_C_COMPILES {
         return Err(CompileLocallyReason::CToolchainUnsupported.into());
     }
-    reapi_compile(mapped, kind, parsed_args, executable, cwd, env_vars)
+    reapi_compile(
+        mapped,
+        kind,
+        parsed_args,
+        executable,
+        cwd,
+        env_vars,
+        preprocessed_dir,
+    )
 }
 
-/// The `ReapiCompile` of `mapped`, with its toolchain.
+/// The `ReapiCompile` of `mapped`, with its toolchain and preprocessed source.
 fn reapi_compile(
     mapped: MappedCompile,
     kind: &CCompilerKind,
@@ -91,16 +101,27 @@ fn reapi_compile(
     executable: &Path,
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
+    preprocessed_dir: &Path,
 ) -> Result<ReapiCompile, NotEligible> {
     let MappedCompile {
         path_mapper,
         arguments,
+        mapped_input,
         object,
     } = mapped;
     let toolchain = toolchain_key(kind, executable, &parsed_args.language, cwd, env_vars)?;
     if *kind == CCompilerKind::Clang {
         check_clang_config(executable, &toolchain.driver, cwd, env_vars)?;
     }
+    let preprocessed = preprocess_for_reapi(
+        kind,
+        parsed_args,
+        executable,
+        cwd,
+        env_vars,
+        &path_mapper,
+        preprocessed_dir,
+    )?;
     Ok(ReapiCompile {
         path_mapper,
         arguments,
@@ -108,6 +129,7 @@ fn reapi_compile(
         toolchain: ToolchainKey::C(toolchain),
         env: Default::default(),
         input_root_files: vec![],
+        preprocessed_source: Some(PreprocessedSource::new(preprocessed, mapped_input)),
         outputs: vec![object],
     })
 }
@@ -116,6 +138,8 @@ fn reapi_compile(
 struct MappedCompile {
     path_mapper: PathMapper,
     arguments: Vec<String>,
+    /// The source's path in the input root, where a worker reads the preprocessed source.
+    mapped_input: String,
     object: PathBuf,
 }
 
@@ -191,7 +215,7 @@ fn map_compile(
         "-x".to_owned(),
         preprocessed_language.to_owned(),
         "-c".to_owned(),
-        mapped_input,
+        mapped_input.clone(),
         "-o".to_owned(),
         mapped_object,
     ];
@@ -212,6 +236,7 @@ fn map_compile(
     Ok(MappedCompile {
         path_mapper,
         arguments,
+        mapped_input,
         object,
     })
 }
@@ -493,14 +518,7 @@ fn is_absolute_path_arg(arg: &str) -> bool {
 /// and writes its depfile. sccache's own preprocessing can't be sent: it leaves out line
 /// markers and keeps local paths in `__FILE__`. Runs the compiler, so call it from a blocking
 /// thread.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "C compiles don't reach workers without their toolchain"
-    )
-)]
-pub(super) fn preprocess_for_reapi(
+fn preprocess_for_reapi(
     kind: &CCompilerKind,
     parsed_args: &ParsedArguments,
     executable: &Path,
@@ -639,7 +657,6 @@ mod test {
     const OUT_DIR: &str = "/ws/target/debug/build/foo-1/out";
     const OBJECT: &str = "/ws/target/debug/build/foo-1/out/x.o";
     const BUILD_SCRIPT_ENV: &[(&str, &str)] = &[("OUT_DIR", OUT_DIR), ("CARGO_MANIFEST_DIR", WS)];
-    const CC: &str = "/usr/bin/cc";
 
     fn parse(kind: &CCompilerKind, cwd: &Path, args: &[&str]) -> ParsedArguments {
         let args: Vec<OsString> = args.iter().map(OsString::from).collect();
@@ -846,15 +863,6 @@ mod test {
         assert!(!compile.arguments.contains(&"-fpreprocessed".to_owned()));
     }
 
-    #[test]
-    fn test_mapped_compiles_wait_for_the_c_toolchain() {
-        let kind = &CCompilerKind::Gcc;
-        let parsed_args = parse(kind, Path::new(WS), &["-c", "src/x.c", "-o", OBJECT]);
-        let (cc, ws) = (Path::new(CC), Path::new(WS));
-        let mapped = map_for_reapi(kind, &parsed_args, cc, ws, &env_vars(BUILD_SCRIPT_ENV));
-        assert_eq!(CompileLocallyReason::CToolchainUnsupported, reason(mapped));
-    }
-
     /// A directory holding a gcc driver that prints `<dir>/cc1` for cc1 and only the name of
     /// the other programs, of which `as` is in `<dir>/bin`, and the env vars with that dir on
     /// `PATH`.
@@ -1052,21 +1060,18 @@ const char *s = "/w\"s/src/x.c";
     }
 
     impl Checkout {
-        /// The `.i` that the compile writes under `dir`.
-        fn preprocess(&self, kind: &CCompilerKind, dir: &Path) -> Vec<u8> {
+        /// The compile mapped for REAPI with its preprocessed source under `dir`, as on a
+        /// Linux client.
+        fn reapi_compile(&self, kind: &CCompilerKind, dir: &Path) -> ReapiCompile {
             let (parsed_args, cwd, env_vars) = (&self.parsed_args, &self.cwd, &self.env_vars);
             let mapped = map_compile(kind, parsed_args, cwd, env_vars).unwrap();
-            let path_mapper = &mapped.path_mapper;
-            let preprocessed = preprocess_for_reapi(
-                kind,
-                parsed_args,
-                &self.driver,
-                cwd,
-                env_vars,
-                path_mapper,
-                dir,
-            );
-            std::fs::read(preprocessed.unwrap()).unwrap()
+            reapi_compile(mapped, kind, parsed_args, &self.driver, cwd, env_vars, dir).unwrap()
+        }
+
+        /// The `.i` that the compile writes under `dir`.
+        fn preprocess(&self, kind: &CCompilerKind, dir: &Path) -> Vec<u8> {
+            let compile = self.reapi_compile(kind, dir);
+            std::fs::read(&compile.preprocessed_source.unwrap().path).unwrap()
         }
     }
 
@@ -1109,6 +1114,46 @@ const char *s = "/w\"s/src/x.c";
             cwd: ws,
             env_vars,
         })
+    }
+
+    #[test_case(CCompilerKind::Gcc ; "gcc")]
+    #[test_case(CCompilerKind::Clang ; "clang")]
+    fn test_mapped_compiles_wait_for_the_c_toolchain(kind: CCompilerKind) {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(c) = checkout(&kind, &dir.path().join("ws"), &[]) else {
+            return;
+        };
+        let preprocessed = dir.path().join("preprocessed");
+        let mapped = map_for_reapi(
+            &kind,
+            &c.parsed_args,
+            &c.driver,
+            &c.cwd,
+            &c.env_vars,
+            &preprocessed,
+        );
+        assert_eq!(CompileLocallyReason::CToolchainUnsupported, reason(mapped));
+    }
+
+    #[test_case(CCompilerKind::Gcc ; "gcc")]
+    #[test_case(CCompilerKind::Clang ; "clang")]
+    fn test_preprocessed_source_path_and_lifetime(kind: CCompilerKind) {
+        let dir = tempfile::tempdir().unwrap();
+        let preprocessed = dir.path().join("preprocessed");
+        let Some(c) = checkout(&kind, &dir.path().join("ws"), &[]) else {
+            return;
+        };
+        let compile = c.reapi_compile(&kind, &preprocessed);
+        let source = compile.preprocessed_source.as_ref().unwrap();
+        assert_eq!("src/x.c", source.mapped_path);
+        assert!(source.path.starts_with(&preprocessed), "{source:?}");
+        assert_eq!(
+            Some("src/x.c"),
+            compile.arguments.get(3).map(String::as_str)
+        );
+        let path = source.path.clone();
+        drop(compile);
+        assert!(!path.exists(), "{path:?} outlived the compile");
     }
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {

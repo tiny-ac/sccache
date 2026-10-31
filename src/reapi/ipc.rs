@@ -16,7 +16,7 @@
 //! executor compiles it through REAPI, or holds a local slot while the CLI compiles it.
 
 use super::executor::{
-    CompileLocally, ReapiExecutor, SYSROOT_COPIES_DIR, compiled_locally, map_miss,
+    CompileLocally, PREPROCESSED_DIR, ReapiExecutor, SYSROOT_COPIES_DIR, compiled_locally, map_miss,
 };
 use super::mapping::{CompileLocallyReason, ReapiCompile};
 use crate::client::ServerConnection;
@@ -165,6 +165,7 @@ pub(crate) struct ReapiIpcExecutor {
     /// Asked of the daemon on first use.
     setup: OnceCell<ReapiExecutorSetup>,
     sysroot_copies_dir: PathBuf,
+    preprocessed_dir: PathBuf,
 }
 
 impl ReapiIpcExecutor {
@@ -173,6 +174,7 @@ impl ReapiIpcExecutor {
             conn,
             setup: OnceCell::new(),
             sysroot_copies_dir: dist_cache_dir.join(SYSROOT_COPIES_DIR),
+            preprocessed_dir: dist_cache_dir.join(PREPROCESSED_DIR),
         }
     }
 
@@ -240,6 +242,7 @@ impl<T: CommandCreatorSync> RemoteExecutor<T> for ReapiIpcExecutor {
             compilation,
             cache_control,
             local_compile_changed,
+            self.preprocessed_dir.clone(),
             &out_pretty,
         )
         .await;
@@ -287,7 +290,7 @@ mod test {
 
     fn compile_request(fixture: &Fixture) -> ReapiIpcRequest {
         ReapiIpcRequest::CompileThroughReapi {
-            mapped: (fixture.compilation().map_for_reapi())
+            mapped: (fixture.compilation().map_for_reapi(Path::new("")))
                 .map(Box::new)
                 .map_err(|not_eligible| not_eligible.reason),
             out_pretty: "lib.rs".to_owned(),

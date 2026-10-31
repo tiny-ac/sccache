@@ -2644,6 +2644,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
     #[cfg(feature = "reapi")]
     fn map_for_reapi(
         &self,
+        _preprocessed_dir: &Path,
     ) -> std::result::Result<crate::reapi::ReapiCompile, crate::reapi::NotEligible> {
         reapi_mapping::map_for_reapi(self)
     }
@@ -2991,6 +2992,7 @@ mod reapi_mapping {
             toolchain: ToolchainKey::rustc(commit_hash, compilation.sysroot.clone(), target_triple),
             env,
             input_root_files,
+            preprocessed_source: None,
             outputs,
         })
     }
