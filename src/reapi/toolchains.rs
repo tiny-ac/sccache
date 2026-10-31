@@ -160,6 +160,7 @@ impl Toolchains {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::compiler::CCompilerKind;
     use crate::reapi::mapping::CToolchainKey;
     use crate::reapi::remote_compile::test::fake_sysroot;
     use std::path::Path;
@@ -212,7 +213,11 @@ mod test {
     async fn test_a_c_toolchain_is_unusable() {
         let dir = tempfile::tempdir().unwrap();
         let toolchains = toolchains(dir.path(), RETRY_AFTER);
-        let key = ToolchainKey::C(CToolchainKey::new("/usr/bin/cc".into()));
+        let key = ToolchainKey::C(CToolchainKey::new(
+            CCompilerKind::Gcc,
+            "/usr/bin/cc".into(),
+            vec![],
+        ));
         assert_eq!(
             Some(CompileLocallyReason::CToolchainUnsupported),
             toolchains.files(&key, in_secs(10)).await.err()
