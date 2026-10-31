@@ -198,6 +198,10 @@ fn build_action(
         input_root_digest: Some(input_root_digest),
         platform: options.platform.clone(),
         salt: options.salt.clone(),
+        timeout: Some(prost_types::Duration {
+            seconds: ACTION_TIMEOUT.as_secs() as i64,
+            nanos: 0,
+        }),
         ..Default::default()
     };
     (command, action)
@@ -425,6 +429,9 @@ impl<W: Write> Write for WorkerRootScanner<W> {
     }
 }
 
+/// How long a worker may run an action. Servers keep running an action the client stopped
+/// waiting for, up to this timeout or their own default, which is often longer.
+pub(super) const ACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(540);
 /// The largest output file downloaded, well above the largest rlibs with debuginfo.
 const MAX_OUTPUT_FILE_BYTES: u64 = 4 << 30;
 /// The largest stdout or stderr downloaded, which is held in memory.
@@ -999,6 +1006,18 @@ pub(super) mod test {
         let command_platform = command.platform;
         assert_eq!(platform, command_platform);
         assert_eq!(platform, action.platform);
+    }
+
+    #[test]
+    fn test_the_action_carries_its_timeout() {
+        let options = ActionOptions::new(&config_with_salt_and_platform());
+        let (_, action) = build_action(
+            build_command(&reapi_compile_in("/ws")),
+            digest::of_bytes(b""),
+            &options,
+        );
+        let timeout = action.timeout.unwrap();
+        assert_eq!(ACTION_TIMEOUT.as_secs(), timeout.seconds as u64);
     }
 
     #[test]

@@ -174,6 +174,7 @@ pub(crate) enum CompileLocallyReason {
     UploadFailed,
     ExecutionFailed,
     ExecutionQueuedTooLong,
+    ExecutionTimedOut,
     CompileFailedOnWorker,
 }
 
@@ -227,6 +228,7 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::UploadFailed => "failed to upload the action's blobs",
             Self::ExecutionFailed => "REAPI execution failed",
             Self::ExecutionQueuedTooLong => "REAPI execution queued too long",
+            Self::ExecutionTimedOut => "REAPI action ran out of time on a worker",
             Self::CompileFailedOnWorker => "compile failed on a worker",
         })
     }
