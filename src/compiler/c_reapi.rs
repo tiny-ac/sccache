@@ -200,7 +200,7 @@ fn map_compile(
 
 /// The key of `executable`'s toolchain for a `language` compile, or why it runs locally. Runs
 /// the compiler, so call it from a blocking thread.
-fn toolchain_key(
+pub(crate) fn toolchain_key(
     kind: &CCompilerKind,
     executable: &Path,
     language: &Language,
