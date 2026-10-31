@@ -60,6 +60,8 @@ const MIN_API_MINOR_VERSION: i32 = 1;
 const DEFAULT_MAX_BATCH_BYTES: usize = 2 * 1024 * 1024;
 /// The `RequestMetadata` mnemonic of a compile's action, as rules_rust names it.
 pub(super) const RUSTC_MNEMONIC: &str = "Rustc";
+/// The mnemonic of a C or C++ compile's action, as Bazel names it.
+pub(super) const CPP_COMPILE_MNEMONIC: &str = "CppCompile";
 /// The mnemonic of the action that runs `rustc -vV` on a worker.
 pub(super) const RUSTC_VERSION_MNEMONIC: &str = "RustcVersion";
 /// Carries a [`remexec::RequestMetadata`], which a server logs to tell its clients, their runs
