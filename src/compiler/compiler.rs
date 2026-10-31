@@ -1007,11 +1007,13 @@ where
         Cacheable,
     )>;
 
-    /// The compile with its paths mapped for REAPI, or why it can't run through REAPI.
-    /// May run rustc and read files, so call it from a blocking thread.
+    /// The compile with its paths mapped for REAPI, or why it can't run through REAPI. A C
+    /// compile writes its preprocessed source under `preprocessed_dir`. May run the compiler
+    /// and read files, so call it from a blocking thread.
     #[cfg(feature = "reapi")]
     fn map_for_reapi(
         &self,
+        _preprocessed_dir: &Path,
     ) -> std::result::Result<crate::reapi::ReapiCompile, crate::reapi::NotEligible> {
         Err(crate::reapi::CompileLocallyReason::UnsupportedCompiler.into())
     }
