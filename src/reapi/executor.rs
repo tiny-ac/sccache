@@ -20,7 +20,7 @@
 use super::auth_token::{self, AuthToken};
 use super::cas::UnreadableBlob;
 use super::client::{
-    ConnectOptions, RPC_TIMEOUT, RUSTC_MNEMONIC, RUSTC_VERSION_MNEMONIC, check_connect_options,
+    ConnectOptions, RPC_TIMEOUT, RUSTC_VERSION_MNEMONIC, check_connect_options,
     credential_helper_uri, loggable, rpc_code,
 };
 use super::connection::{Connection, ServerApis};
@@ -342,7 +342,10 @@ impl ReapiExecutor {
         };
         let cached = match apis
             .action_cache
-            .get_action_result(&action.action_digest)
+            .get_action_result(
+                &action.action_digest,
+                reapi_compile.program.action_mnemonic(),
+            )
             .await
         {
             Ok(cached) => {
@@ -436,7 +439,7 @@ impl ReapiExecutor {
                 &apis,
                 execution,
                 &action,
-                RUSTC_MNEMONIC,
+                reapi_compile.program.action_mnemonic(),
                 skip_cache_lookup,
                 self.queue_timeout,
                 out_pretty,
@@ -934,6 +937,7 @@ pub(super) mod test {
     };
     use crate::dist;
     use crate::mock_command::{MockChild, MockCommandCreator, exit_status};
+    use crate::reapi::client::RUSTC_MNEMONIC;
     use crate::reapi::fake::FakeServer;
     use crate::reapi::mapping::WorkerProgram;
     use crate::reapi::pause::FAILURES_TO_PAUSE;

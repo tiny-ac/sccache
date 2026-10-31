@@ -22,6 +22,7 @@
 //! build root (cargo's target dir) go under [`BUILD_ROOT_DIR`], and the toolchain goes
 //! under [`TOOLCHAIN_DIR`].
 
+use super::client::{CPP_COMPILE_MNEMONIC, RUSTC_MNEMONIC};
 use crate::compiler::CCompilerKind;
 use crate::errors::*;
 use serde::{Deserialize, Serialize};
@@ -62,6 +63,15 @@ pub(crate) enum WorkerProgram {
     /// gcc or clang, run from the driver that the compile's `ToolchainKey::C` names, which
     /// the input root holds under [`TOOLCHAIN_DIR`].
     C,
+}
+
+impl WorkerProgram {
+    pub(super) fn action_mnemonic(&self) -> &'static str {
+        match self {
+            WorkerProgram::Rustc { .. } => RUSTC_MNEMONIC,
+            WorkerProgram::C => CPP_COMPILE_MNEMONIC,
+        }
+    }
 }
 
 /// A local toolchain.

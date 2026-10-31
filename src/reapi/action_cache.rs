@@ -15,8 +15,8 @@
 //! Looks actions up in a REAPI server's action cache.
 
 use super::client::{
-    Client, MAX_ACTION_RESULT_RESPONSE_BYTES, RPC_TIMEOUT, RUSTC_MNEMONIC, ReapiChannel,
-    action_request, status_error, with_retries, with_timeout,
+    Client, MAX_ACTION_RESULT_RESPONSE_BYTES, RPC_TIMEOUT, ReapiChannel, action_request,
+    status_error, with_retries, with_timeout,
 };
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use crate::errors::*;
@@ -43,6 +43,7 @@ impl ActionCache {
     pub(crate) async fn get_action_result(
         &self,
         action_digest: &remexec::Digest,
+        action_mnemonic: &str,
     ) -> Result<Option<remexec::ActionResult>> {
         let request = remexec::GetActionResultRequest {
             instance_name: self.instance_name.clone(),
@@ -66,7 +67,7 @@ impl ActionCache {
                         request.clone(),
                         &self.request_metadata,
                         action_digest,
-                        RUSTC_MNEMONIC,
+                        action_mnemonic,
                     ))
                     .await
                 {
@@ -83,6 +84,7 @@ impl ActionCache {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::reapi::client::RUSTC_MNEMONIC;
     use crate::reapi::client::{RETRIES, rpc_code};
     use crate::reapi::digest;
     use crate::reapi::fake::FakeServer;
@@ -94,7 +96,7 @@ mod test {
         let action_cache = ActionCache::new(&server.serve_and_connect().await);
         assert!(
             action_cache
-                .get_action_result(&digest::of_bytes(b"action"))
+                .get_action_result(&digest::of_bytes(b"action"), RUSTC_MNEMONIC)
                 .await
                 .unwrap()
                 .is_none()
@@ -114,7 +116,7 @@ mod test {
         assert_eq!(
             Some(result),
             action_cache
-                .get_action_result(&action_digest)
+                .get_action_result(&action_digest, RUSTC_MNEMONIC)
                 .await
                 .unwrap()
         );
@@ -140,7 +142,7 @@ mod test {
         assert_eq!(
             Some(result),
             action_cache
-                .get_action_result(&action_digest)
+                .get_action_result(&action_digest, RUSTC_MNEMONIC)
                 .await
                 .unwrap()
         );
@@ -155,7 +157,7 @@ mod test {
         server.answer_busy("GetActionResult", RETRIES as usize);
         assert!(
             action_cache
-                .get_action_result(&action_digest)
+                .get_action_result(&action_digest, RUSTC_MNEMONIC)
                 .await
                 .unwrap()
                 .is_some()
@@ -176,7 +178,7 @@ mod test {
         assert_eq!(
             Some(result),
             action_cache
-                .get_action_result(&action_digest)
+                .get_action_result(&action_digest, RUSTC_MNEMONIC)
                 .await
                 .unwrap()
         );
@@ -188,7 +190,7 @@ mod test {
         let action_cache = ActionCache::new(&server.serve_and_connect().await);
         *server.lookup_error.lock().unwrap() = Some(tonic::Code::Internal);
         let e = action_cache
-            .get_action_result(&digest::of_bytes(b"action"))
+            .get_action_result(&digest::of_bytes(b"action"), RUSTC_MNEMONIC)
             .await
             .unwrap_err();
         assert_eq!(Some(tonic::Code::Internal), rpc_code(&e), "{e:#}");
