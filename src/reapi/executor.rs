@@ -921,7 +921,7 @@ impl<T: CommandCreatorSync> RemoteExecutor<T> for ReapiExecutor {
 }
 
 #[cfg(test)]
-mod test {
+pub(super) mod test {
     use super::*;
     use crate::compiler::{
         CacheControl, Cacheable, CompileCommand, LocalArg, SingleCompileCommand,
@@ -944,10 +944,10 @@ mod test {
 
     const TARGET_TRIPLE: &str = "x86_64-unknown-linux-gnu";
     const COMMIT_HASH: &str = "abc123";
-    const RLIB: &str = "target/debug/deps/libfoo.rlib";
+    pub(in crate::reapi) const RLIB: &str = "target/debug/deps/libfoo.rlib";
 
     #[derive(Clone, Copy)]
-    enum Eligibility {
+    pub(in crate::reapi) enum Eligibility {
         Eligible,
         /// Eligible, and loads a proc macro.
         UsesProcMacro,
@@ -957,7 +957,7 @@ mod test {
 
     /// A compile of `dir/ws/src/lib.rs` into `dir/ws/target/debug/deps/libfoo.rlib` with the
     /// toolchain at `dir/sysroot`. Its local compile gets `--sysroot=<sysroot_copies_dir>`.
-    struct FakeCompilation {
+    pub(in crate::reapi) struct FakeCompilation {
         eligibility: Eligibility,
         dir: PathBuf,
         commit_hash: String,
@@ -1044,11 +1044,11 @@ mod test {
 
     /// An executor that waits up to 10s for a fake server, and a temp dir holding the
     /// toolchain and `ws/src/lib.rs`.
-    struct Fixture {
-        runtime: tokio::runtime::Runtime,
+    pub(in crate::reapi) struct Fixture {
+        pub(in crate::reapi) runtime: tokio::runtime::Runtime,
         server: Arc<FakeServer>,
-        dir: tempfile::TempDir,
-        config: ReapiConfig,
+        pub(in crate::reapi) dir: tempfile::TempDir,
+        pub(in crate::reapi) config: ReapiConfig,
         eligibility: Eligibility,
         cache_control: CacheControl,
         local_compile_changed: bool,
@@ -1057,7 +1057,7 @@ mod test {
     }
 
     impl Fixture {
-        fn new(eligibility: Eligibility) -> Self {
+        pub(in crate::reapi) fn new(eligibility: Eligibility) -> Self {
             Self::with_server(eligibility, FakeServer::default())
         }
 
@@ -1084,7 +1084,7 @@ mod test {
             }
         }
 
-        fn compilation(&self) -> FakeCompilation {
+        pub(in crate::reapi) fn compilation(&self) -> FakeCompilation {
             FakeCompilation {
                 eligibility: self.eligibility,
                 dir: self.dir.path().to_owned(),
@@ -1094,7 +1094,10 @@ mod test {
 
         /// Puts a successful result that writes an rlib holding `rlib`, changed by `change`, in
         /// the fake server's action cache.
-        fn put_result_in_action_cache(&self, change: fn(&mut remexec::ActionResult)) {
+        pub(in crate::reapi) fn put_result_in_action_cache(
+            &self,
+            change: fn(&mut remexec::ActionResult),
+        ) {
             let compile = self.compilation().map_for_reapi().unwrap();
             let digest_cache = DigestCache::load(self.dir.path().join("digests.json"));
             let files = digest_input_root_files(&compile, &digest_cache).unwrap();
@@ -1122,7 +1125,7 @@ mod test {
         }
 
         /// An executor on a Linux client.
-        fn executor(&self) -> ReapiExecutor {
+        pub(in crate::reapi) fn executor(&self) -> ReapiExecutor {
             let mut executor = ReapiExecutor::new(&self.config, &[], &self.dir.path().join("dist"));
             executor.is_linux_client = true;
             executor

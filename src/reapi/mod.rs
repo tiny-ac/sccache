@@ -27,6 +27,7 @@ mod executor;
 #[cfg(test)]
 mod fake;
 mod input_root;
+mod ipc;
 mod mapping;
 mod pause;
 pub(crate) mod proto;
@@ -37,6 +38,7 @@ mod toolchains;
 mod worker_toolchains;
 
 pub(crate) use executor::ReapiExecutor;
+pub(crate) use ipc::{ReapiIpcRequest, ReapiIpcResponse, handle_reapi_ipc_request};
 pub(crate) use mapping::{
     ActionEnv, CompileLocallyReason, NotEligible, PathMapper, ReapiCompile, ToolchainKey,
     lexically_normalize,

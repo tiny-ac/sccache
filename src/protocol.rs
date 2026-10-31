@@ -3,6 +3,8 @@ use crate::compiler::ColorMode;
 #[cfg(feature = "dist-client")]
 use crate::compiler::{DistIpcRequest, DistIpcResponse};
 use crate::config::PreprocessorCacheModeConfig;
+#[cfg(feature = "reapi")]
+use crate::reapi::{ReapiIpcRequest, ReapiIpcResponse};
 use crate::server::{DistInfo, ServerInfo, ServerStats};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -42,6 +44,11 @@ pub enum Request {
     /// Use the daemon's dist client.
     #[cfg(feature = "dist-client")]
     Dist(DistIpcRequest),
+
+    // --- REAPI RPCs (client-side mode) ---
+    /// Use the daemon's REAPI executor.
+    #[cfg(feature = "reapi")]
+    Reapi(ReapiIpcRequest),
 }
 
 /// A server response.
@@ -88,6 +95,11 @@ pub enum Response {
     /// Response for `Request::Dist`.
     #[cfg(feature = "dist-client")]
     Dist(DistIpcResponse),
+
+    // --- REAPI RPC responses (client-side mode) ---
+    /// Response for `Request::Reapi`.
+    #[cfg(feature = "reapi")]
+    Reapi(ReapiIpcResponse),
 }
 
 /// Possible responses from the server for a `Compile` request.

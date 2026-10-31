@@ -1125,7 +1125,7 @@ pub enum DistType {
 }
 
 /// What happened to a compile in a REAPI build.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReapiOutcome {
     /// Found in the action cache, with its outputs written to their local paths.
     ActionCacheHit,

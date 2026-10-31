@@ -155,7 +155,7 @@ pub struct DistClientContainer {
 }
 
 #[cfg(feature = "reapi")]
-fn reapi_executor(config: &Config) -> Option<Arc<crate::reapi::ReapiExecutor>> {
+fn create_reapi_executor(config: &Config) -> Option<Arc<crate::reapi::ReapiExecutor>> {
     config.dist.reapi.as_ref().map(|reapi| {
         Arc::new(crate::reapi::ReapiExecutor::new(
             reapi,
@@ -163,6 +163,13 @@ fn reapi_executor(config: &Config) -> Option<Arc<crate::reapi::ReapiExecutor>> {
             &config.dist.cache_dir,
         ))
     })
+}
+
+#[cfg(feature = "reapi")]
+impl DistClientContainer {
+    pub(crate) fn reapi_executor(&self) -> Option<&crate::reapi::ReapiExecutor> {
+        self.reapi.as_deref()
+    }
 }
 
 #[cfg(not(feature = "reapi"))]
@@ -227,7 +234,7 @@ impl DistClientContainer {
         }
         Self {
             #[cfg(feature = "reapi")]
-            reapi: reapi_executor(config),
+            reapi: create_reapi_executor(config),
         }
     }
 
@@ -268,7 +275,7 @@ impl DistClientContainer {
 impl DistClientContainer {
     fn new(config: &Config, pool: &tokio::runtime::Handle) -> Self {
         #[cfg(feature = "reapi")]
-        let reapi = reapi_executor(config);
+        let reapi = create_reapi_executor(config);
         #[cfg(feature = "reapi")]
         let uses_reapi = reapi.is_some();
         #[cfg(not(feature = "reapi"))]
@@ -1099,6 +1106,16 @@ where
                     )
                     .await;
                     Ok(Message::WithoutBody(Response::Dist(response)))
+                }
+                #[cfg(feature = "reapi")]
+                Request::Reapi(request) => {
+                    debug!("handle_client: reapi");
+                    let response = crate::reapi::handle_reapi_ipc_request(
+                        me.dist_client.reapi_executor(),
+                        request,
+                    )
+                    .await;
+                    Ok(Message::WithoutBody(Response::Reapi(response)))
                 }
                 Request::StorageGetPath { key } => {
                     debug!("handle_client: storage_get_path key={}", key);

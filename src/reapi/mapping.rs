@@ -23,6 +23,7 @@
 //! under [`TOOLCHAIN_DIR`].
 
 use crate::errors::*;
+use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
@@ -33,7 +34,7 @@ pub(super) const BUILD_ROOT_DIR: &str = ".sccache-build";
 pub(super) const TOOLCHAIN_DIR: &str = ".sccache-toolchain";
 
 /// A compile that can run through REAPI, with its paths mapped into the input root.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ReapiCompile {
     pub(crate) path_mapper: PathMapper,
     pub(crate) arguments: Vec<String>,
@@ -54,7 +55,7 @@ pub struct ReapiCompile {
 /// so the key includes the sysroot, and the stamps of rustc, its libraries' directory and the
 /// target's std directory, which change when the toolchain is updated in place or gets a
 /// target added.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct ToolchainKey {
     pub(crate) commit_hash: String,
     pub(crate) sysroot: PathBuf,
@@ -86,7 +87,7 @@ impl ToolchainKey {
 }
 
 /// The environment a compile's action runs with.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ActionEnv {
     /// Variables set to these values.
     pub(crate) vars: Vec<(String, String)>,
@@ -125,8 +126,8 @@ impl From<CompileLocallyReason> for NotEligible {
 }
 
 /// Why a compile runs locally instead of through REAPI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CompileLocallyReason {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompileLocallyReason {
     NotRust,
     RustcDriver,
     NoCommitHash,
@@ -183,6 +184,7 @@ pub(crate) enum CompileLocallyReason {
     ExecutionQueuedTooLong,
     ExecutionTimedOut,
     CompileFailedOnWorker,
+    DaemonFailed,
 }
 
 impl std::fmt::Display for CompileLocallyReason {
@@ -244,12 +246,13 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::ExecutionQueuedTooLong => "REAPI execution queued too long",
             Self::ExecutionTimedOut => "REAPI action ran out of time on a worker",
             Self::CompileFailedOnWorker => "compile failed on a worker",
+            Self::DaemonFailed => "the sccache daemon failed",
         })
     }
 }
 
 /// Maps local paths under the cwd and build root to input-root-relative paths.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct PathMapper {
     cwd: PathBuf,
     build_root: PathBuf,
