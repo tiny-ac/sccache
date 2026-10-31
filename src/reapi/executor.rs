@@ -50,6 +50,7 @@ use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::transport::{Certificate, Identity};
 
 /// Directory under the dist cache dir for the sysroot copies local compiles use.
@@ -64,9 +65,10 @@ const EXECUTE_TIMEOUT: Duration = Duration::from_secs(ACTION_TIMEOUT.as_secs() +
 const DEFAULT_QUEUE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Caps `ready_wait_secs`, since `Instant::now() + ready_wait` panics on overflow.
 const MAX_READY_WAIT: Duration = Duration::from_secs(3600);
+const SLOTS_NEVER_CLOSE: &str = "REAPI slot semaphores are never closed";
 
 /// A [`RemoteExecutor`] for a REAPI server.
-pub struct ReapiExecutor {
+pub(crate) struct ReapiExecutor {
     /// `None` when `[dist.reapi]` is misconfigured.
     connection: Option<Arc<Connection>>,
     digest_cache: Arc<DigestCache>,
@@ -85,6 +87,17 @@ pub struct ReapiExecutor {
     /// Set when the server refuses an execution, so misses compile locally until the sccache
     /// server restarts.
     executions_refused: AtomicBool,
+    /// `None` without `local_slots`.
+    local_slots: Option<Arc<Semaphore>>,
+    /// `None` without `remote_slots`.
+    remote_slots: Option<Arc<Semaphore>>,
+}
+
+/// A remote or a local slot, whichever frees first.
+enum Slot {
+    /// `None` without `remote_slots`.
+    Remote(Option<OwnedSemaphorePermit>),
+    Local(OwnedSemaphorePermit),
 }
 
 /// The check, once per toolchain, that the workers run its rustc.
@@ -115,7 +128,7 @@ struct Lookup {
 impl ReapiExecutor {
     /// Reads the TLS files once, so a changed one takes a restart. `dist_toolchains` gives the
     /// Linux toolchains of a client that doesn't run Linux.
-    pub fn new(
+    pub(crate) fn new(
         config: &ReapiConfig,
         dist_toolchains: &[DistToolchainConfig],
         dist_cache_dir: &Path,
@@ -156,7 +169,45 @@ impl ReapiExecutor {
             ),
             rustc_checks: Default::default(),
             executions_refused: AtomicBool::new(false),
+            local_slots: config
+                .local_slots
+                .map(|slots| Arc::new(Semaphore::new(slots.get()))),
+            remote_slots: config
+                .remote_slots
+                .map(|slots| Arc::new(Semaphore::new(slots.get()))),
         }
+    }
+
+    /// A free local slot, or else a remote slot, or a local slot if one frees first.
+    async fn local_or_remote_slot(&self) -> Slot {
+        if let Some(slot) =
+            (self.local_slots.clone()).and_then(|slots| slots.try_acquire_owned().ok())
+        {
+            return Slot::Local(slot);
+        }
+        let Some(remote_slots) = self.remote_slots.clone() else {
+            return Slot::Remote(None);
+        };
+        match self.local_slots.clone() {
+            Some(local_slots) => tokio::select! {
+                slot = remote_slots.acquire_owned() => {
+                    Slot::Remote(Some(slot.expect(SLOTS_NEVER_CLOSE)))
+                }
+                slot = local_slots.acquire_owned() => {
+                    Slot::Local(slot.expect(SLOTS_NEVER_CLOSE))
+                }
+            },
+            None => Slot::Remote(Some(
+                remote_slots.acquire_owned().await.expect(SLOTS_NEVER_CLOSE),
+            )),
+        }
+    }
+
+    /// The next free local slot, so that local compiles don't oversubscribe the cores while
+    /// other compiles execute on workers; `None` without `local_slots`.
+    async fn local_slot(&self) -> Option<OwnedSemaphorePermit> {
+        let local_slots = self.local_slots.clone()?;
+        Some(local_slots.acquire_owned().await.expect(SLOTS_NEVER_CLOSE))
     }
 
     /// What looking `compilation` up needs, or why it compiles locally.
@@ -250,10 +301,12 @@ impl ReapiExecutor {
     }
 
     /// Looks `lookup`'s compile up in the action cache and, on a miss, executes it unless
-    /// `on_miss` is local, then writes its outputs.
+    /// `on_miss` is local, then writes its outputs. A miss that compiles locally because a
+    /// local slot is free puts the slot in `local_slot`.
     async fn look_up_or_execute(
         &self,
         lookup: Lookup,
+        local_slot: &mut Option<OwnedSemaphorePermit>,
         out_pretty: &str,
     ) -> std::result::Result<(ReapiOutcome, process::Output), CompileLocallyReason> {
         let Lookup {
@@ -349,6 +402,17 @@ impl ReapiExecutor {
         if let Some(RustcOnWorkers::Unusable(reason)) = rustc_check.outcome.get() {
             return compile_locally(out_pretty, *reason);
         }
+        // Bounded like a queued execution, since slots stay taken while executions wait for
+        // workers.
+        let slot = tokio::time::timeout(self.queue_timeout, self.local_or_remote_slot()).await;
+        let _remote_slot = match slot {
+            Err(_) => return compile_locally(out_pretty, CompileLocallyReason::NoFreeRemoteSlot),
+            Ok(Slot::Remote(slot)) => slot,
+            Ok(Slot::Local(slot)) => {
+                *local_slot = Some(slot);
+                return compile_locally(out_pretty, CompileLocallyReason::LocalSlotFree);
+            }
+        };
         if !self.execution_pause.may_call() {
             return compile_locally(out_pretty, CompileLocallyReason::ExecutionsPaused);
         }
@@ -783,6 +847,7 @@ impl<T: CommandCreatorSync> RemoteExecutor<T> for ReapiExecutor {
             local_compile_changed,
             ..
         } = job;
+        let mut local_slot = None;
         let looked_up = async {
             let lookup = self
                 .prepare_lookup(
@@ -793,7 +858,9 @@ impl<T: CommandCreatorSync> RemoteExecutor<T> for ReapiExecutor {
                 )
                 .await?;
             let apis = lookup.apis.clone();
-            let looked_up = self.look_up_or_execute(lookup, &out_pretty).await;
+            let looked_up = self
+                .look_up_or_execute(lookup, &mut local_slot, &out_pretty)
+                .await;
             if let (Err(CompileLocallyReason::CredentialsRefused), Some(connection)) =
                 (&looked_up, &self.connection)
             {
@@ -804,11 +871,17 @@ impl<T: CommandCreatorSync> RemoteExecutor<T> for ReapiExecutor {
         .await;
         match looked_up {
             Ok((outcome, output)) => Ok((DistType::Reapi(outcome), output)),
-            // The stats count reasons by their text, as they do non-cacheable ones.
-            Err(reason) => Ok((
-                DistType::Reapi(ReapiOutcome::CompiledLocally(reason.to_string())),
-                local_compile.run().await?,
-            )),
+            Err(reason) => {
+                let _local_slot = match local_slot {
+                    Some(slot) => Some(slot),
+                    None => self.local_slot().await,
+                };
+                // The stats count reasons by their text, as they do non-cacheable ones.
+                Ok((
+                    DistType::Reapi(ReapiOutcome::CompiledLocally(reason.to_string())),
+                    local_compile.run().await?,
+                ))
+            }
         }
     }
 }
@@ -829,6 +902,7 @@ mod test {
     use crate::server::SccacheService;
     use crate::test::utils::{new_creator, next_command};
     use std::ffi::OsString;
+    use std::num::NonZeroUsize;
     use std::sync::Mutex;
     use std::sync::atomic::Ordering;
 
@@ -1037,6 +1111,17 @@ mod test {
             executor: &ReapiExecutor,
             n: usize,
         ) -> Vec<(DistType, process::Output)> {
+            self.compile_at_once_while(executor, n, |_| async {})
+        }
+
+        /// Like `compile_at_once`, running `meanwhile` with the creators of the local
+        /// compiles, whose commands are left until they run.
+        fn compile_at_once_while<F: Future<Output = ()>>(
+            &self,
+            executor: &ReapiExecutor,
+            n: usize,
+            meanwhile: impl FnOnce(Vec<Creator>) -> F,
+        ) -> Vec<(DistType, process::Output)> {
             let storage = Arc::new(crate::cache::disk::DiskCache::new(
                 self.dir.path(),
                 0,
@@ -1047,35 +1132,39 @@ mod test {
             ));
             let service = SccacheService::mock_with_storage(storage, self.runtime.handle().clone());
             let creators: Vec<_> = (0..n).map(|_| new_creator()).collect();
-            let compiles = creators.iter().map(|creator| {
-                next_command(creator, Ok(MockChild::new(exit_status(0), "out", "err")));
-                let command = SingleCompileCommand {
-                    executable: "rustc".into(),
-                    arguments: vec![],
-                    env_vars: vec![],
-                    cwd: ".".into(),
-                    share_jobserver: false,
-                };
-                let local_compile = LocalCompile {
-                    service: &service,
-                    creator,
-                    command: crate::compiler::CCompileCommand::new(command),
-                    stdout_stderr_mapper: None,
-                };
-                let job = RemoteJob {
-                    compilation: Box::new(self.compilation()),
-                    out_pretty: "lib.rs".to_owned(),
-                    dist_job: None,
-                    cache_control: self.cache_control,
-                    local_compile_changed: self.local_compile_changed,
-                };
-                executor.compile(job, local_compile)
-            });
-            self.runtime
-                .block_on(futures::future::join_all(compiles))
-                .into_iter()
-                .map(Result::unwrap)
-                .collect()
+            let compiles: Vec<_> = (creators.iter())
+                .map(|creator| {
+                    next_command(creator, Ok(MockChild::new(exit_status(0), "out", "err")));
+                    let command = SingleCompileCommand {
+                        executable: "rustc".into(),
+                        arguments: vec![],
+                        env_vars: vec![],
+                        cwd: ".".into(),
+                        share_jobserver: false,
+                    };
+                    let local_compile = LocalCompile {
+                        service: &service,
+                        creator,
+                        command: crate::compiler::CCompileCommand::new(command),
+                        stdout_stderr_mapper: None,
+                    };
+                    let job = RemoteJob {
+                        compilation: Box::new(self.compilation()),
+                        out_pretty: "lib.rs".to_owned(),
+                        dist_job: None,
+                        cache_control: self.cache_control,
+                        local_compile_changed: self.local_compile_changed,
+                    };
+                    executor.compile(job, local_compile)
+                })
+                .collect();
+            let meanwhile = meanwhile(creators.clone());
+            let all = futures::future::join(futures::future::join_all(compiles), meanwhile);
+            let (compiled, ()) = self
+                .runtime
+                .block_on(async { tokio::time::timeout(Duration::from_secs(60), all).await })
+                .expect("the compiles didn't end");
+            compiled.into_iter().map(Result::unwrap).collect()
         }
     }
 
@@ -1369,6 +1458,175 @@ mod test {
             compiled_locally("toolchain that doesn't run on Linux workers"),
             dist_type
         );
+        assert_eq!(0, fixture.server.execute_calls.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_a_miss_compiles_locally_while_a_local_slot_is_free() {
+        let mut fixture = executing_fixture(FakeServer::default());
+        fixture.config.local_slots = NonZeroUsize::new(1);
+        let (dist_type, _) = fixture.compile();
+        assert_eq!(compiled_locally("a local slot is free"), dist_type);
+        assert_eq!(0, fixture.server.execute_calls.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_a_miss_executes_while_the_local_slots_are_taken() {
+        let mut fixture = executing_fixture(FakeServer::default());
+        fixture.config.local_slots = NonZeroUsize::new(1);
+        let executor = fixture.executor();
+        let _taken = executor
+            .local_slots
+            .clone()
+            .unwrap()
+            .try_acquire_owned()
+            .unwrap();
+        let (dist_type, _) = fixture.compile_with(&executor);
+        assert_eq!(DistType::Reapi(ReapiOutcome::Executed), dist_type);
+    }
+
+    #[test]
+    fn test_a_local_compile_waits_for_a_local_slot_and_holds_it() {
+        let mut fixture = Fixture::new(Eligibility::Ineligible);
+        fixture.config.local_slots = NonZeroUsize::new(1);
+        let executor = fixture.executor();
+        let slots = executor.local_slots.clone().unwrap();
+        let taken = slots.clone().try_acquire_owned().unwrap();
+        let compiled = fixture.compile_at_once_while(&executor, 1, |creators| {
+            let mut creator = creators[0].lock().unwrap();
+            creator.children.clear();
+            creator.next_command_calls(move |_| {
+                assert_eq!(0, slots.available_permits(), "the compile holds no slot");
+                Ok(MockChild::new(exit_status(0), "out", "err"))
+            });
+            drop(creator);
+            async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let children = creators[0].lock().unwrap().children.len();
+                assert_eq!(1, children, "the compile ran without a slot");
+                drop(taken);
+            }
+        });
+        assert_eq!(compiled_locally("staticlib crate type"), compiled[0].0);
+    }
+
+    #[test]
+    fn test_an_execution_holds_its_remote_slot() {
+        let mut fixture = executing_fixture(FakeServer {
+            stages_then_stall: vec![remexec::execution_stage::Value::Queued],
+            ..Default::default()
+        });
+        fixture.config.remote_slots = NonZeroUsize::new(1);
+        let mut executor = fixture.executor();
+        executor.queue_timeout = Duration::from_secs(2);
+        let remote_slots = executor.remote_slots.clone().unwrap();
+        let server = fixture.server.clone();
+        let compiled = fixture.compile_at_once_while(&executor, 1, |_| async move {
+            while server.execute_calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(0, remote_slots.available_permits());
+        });
+        assert_eq!(
+            compiled_locally("REAPI execution queued too long"),
+            compiled[0].0
+        );
+    }
+
+    #[test]
+    fn test_a_miss_compiles_locally_when_no_remote_slot_frees_in_time() {
+        let mut fixture = executing_fixture(FakeServer::default());
+        fixture.config.remote_slots = NonZeroUsize::new(1);
+        let mut executor = fixture.executor();
+        executor.queue_timeout = Duration::from_millis(100);
+        let _taken = executor
+            .remote_slots
+            .clone()
+            .unwrap()
+            .try_acquire_owned()
+            .unwrap();
+        let (dist_type, _) = fixture.compile_with(&executor);
+        assert_eq!(compiled_locally("no remote slot freed in time"), dist_type);
+        assert_eq!(0, fixture.server.execute_calls.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_a_compile_waiting_for_a_local_slot_holds_no_remote_slot() {
+        let mut fixture = executing_fixture(FakeServer {
+            worker_exit_code: 1,
+            ..Default::default()
+        });
+        fixture.config.local_slots = NonZeroUsize::new(1);
+        fixture.config.remote_slots = NonZeroUsize::new(1);
+        let executor = fixture.executor();
+        let local = executor
+            .local_slots
+            .clone()
+            .unwrap()
+            .try_acquire_owned()
+            .unwrap();
+        let remote_slots = executor.remote_slots.clone().unwrap();
+        let server = fixture.server.clone();
+        let compiled = fixture.compile_at_once_while(&executor, 1, |creators| async move {
+            // rustc -vV and the compile ran, and the compile failed on the worker.
+            while server.actions_run.load(Ordering::SeqCst) < 2
+                || remote_slots.available_permits() == 0
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let children = creators[0].lock().unwrap().children.len();
+            assert_eq!(1, children, "the compile ran without a local slot");
+            drop(local);
+        });
+        assert_eq!(
+            compiled_locally("compile failed on a worker"),
+            compiled[0].0
+        );
+    }
+
+    #[test]
+    fn test_a_miss_waits_for_a_remote_slot() {
+        let mut fixture = executing_fixture(FakeServer::default());
+        fixture.config.remote_slots = NonZeroUsize::new(1);
+        let executor = fixture.executor();
+        let taken = executor
+            .remote_slots
+            .clone()
+            .unwrap()
+            .try_acquire_owned()
+            .unwrap();
+        let server = fixture.server.clone();
+        let compiled = fixture.compile_at_once_while(&executor, 1, |_| async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(0, server.execute_calls.load(Ordering::SeqCst));
+            drop(taken);
+        });
+        assert_eq!(DistType::Reapi(ReapiOutcome::Executed), compiled[0].0);
+    }
+
+    #[test]
+    fn test_a_miss_waiting_for_a_remote_slot_takes_a_local_one_that_frees() {
+        let mut fixture = executing_fixture(FakeServer::default());
+        fixture.config.local_slots = NonZeroUsize::new(1);
+        fixture.config.remote_slots = NonZeroUsize::new(1);
+        let executor = fixture.executor();
+        let _remote = executor
+            .remote_slots
+            .clone()
+            .unwrap()
+            .try_acquire_owned()
+            .unwrap();
+        let local = executor
+            .local_slots
+            .clone()
+            .unwrap()
+            .try_acquire_owned()
+            .unwrap();
+        let compiled = fixture.compile_at_once_while(&executor, 1, |_| async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(local);
+        });
+        assert_eq!(compiled_locally("a local slot is free"), compiled[0].0);
         assert_eq!(0, fixture.server.execute_calls.load(Ordering::SeqCst));
     }
 
