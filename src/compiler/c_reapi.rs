@@ -31,6 +31,15 @@ use std::path::{Path, PathBuf};
 /// doesn't link.
 const LEFT_OUT_PREFIXES: &[&str] = &["-D", "-U", "--sysroot=", "-L", "-Wl,"];
 
+/// Env vars that change which programs the compiler runs or what it does, which a worker
+/// doesn't get.
+const COMPILER_ENV_VARS: &[&str] = &[
+    "GCC_EXEC_PREFIX",
+    "COMPILER_PATH",
+    "CCC_OVERRIDE_OPTIONS",
+    "GCC_COMPARE_DEBUG",
+];
+
 pub(super) fn map_for_reapi(
     kind: &CCompilerKind,
     parsed_args: &ParsedArguments,
@@ -76,7 +85,17 @@ fn map_compile(
             anyhow!("{}", parsed_args.language.as_str()),
         )
     })?;
+    if let Some((name, _)) = env_vars
+        .iter()
+        .find(|(name, _)| COMPILER_ENV_VARS.iter().any(|var| name == var))
+    {
+        return Err(NotEligible::new(
+            CompileLocallyReason::CompilerEnvVar,
+            anyhow!("{}", name.to_string_lossy()),
+        ));
+    }
     let path_mapper = path_mapper(cwd, env_vars)?;
+    check_options(parsed_args)?;
     if let Some(name) = parsed_args
         .outputs
         .keys()
@@ -191,6 +210,70 @@ fn path_mapper(cwd: &Path, env_vars: &[(OsString, OsString)]) -> Result<PathMapp
     Ok(PathMapper::new(cwd, build_root))
 }
 
+/// Fails for an option whose compile a worker can't match: one that builds for the client's
+/// CPU, reads files besides the source, records local paths, macros or the command line, or
+/// changes the programs the compiler runs.
+fn check_options(parsed_args: &ParsedArguments) -> Result<(), NotEligible> {
+    if !parsed_args.arch_args.is_empty() {
+        return Err(CompileLocallyReason::ArchOption.into());
+    }
+    if parsed_args.profile_generate {
+        return Err(CompileLocallyReason::ProfilingOrCoverage.into());
+    }
+    let options = parsed_args
+        .preprocessor_args
+        .iter()
+        .chain(&parsed_args.common_args)
+        .chain(&parsed_args.unhashed_args);
+    for option in options {
+        let Some(option) = option.to_str() else {
+            return Err(CompileLocallyReason::NonUtf8Argument.into());
+        };
+        let reason = match option {
+            _ if matches!(
+                option.split_once('='),
+                Some(("-march" | "-mcpu" | "-mtune", cpu)) if cpu.starts_with("native")
+            ) =>
+            {
+                CompileLocallyReason::NativeCpu
+            }
+            "-include-pch" | "-fpch-preprocess" => CompileLocallyReason::PrecompiledHeader,
+            "--coverage" | "-ftest-coverage" | "-fcoverage-mapping" => {
+                CompileLocallyReason::ProfilingOrCoverage
+            }
+            _ if option.starts_with("-fprofile-") => CompileLocallyReason::ProfilingOrCoverage,
+            "-g3" | "-ggdb3" | "-fdebug-macro" => CompileLocallyReason::MacroDebugInfo,
+            "-frecord-command-line" | "-grecord-command-line" | "-frecord-gcc-switches" => {
+                CompileLocallyReason::RecordedCommandLine
+            }
+            _ if option.starts_with("-f") && option.contains("prefix-map=") => {
+                CompileLocallyReason::PrefixMapOption
+            }
+            _ if option.starts_with("-fplugin")
+                || option.starts_with("-fpass-plugin")
+                || option.starts_with("-specs")
+                || (option.starts_with("-fsanitize") && option.contains("list=")) =>
+            {
+                CompileLocallyReason::OptionReadsFile
+            }
+            "-Xclang" | "-fno-integrated-as" | "-no-integrated-as" | "-wrapper" => {
+                CompileLocallyReason::CompilerInternalsOption
+            }
+            _ if option.starts_with("-B") => CompileLocallyReason::CompilerInternalsOption,
+            "-v" | "--verbose" | "-###" => CompileLocallyReason::VerboseOutput,
+            _ => continue,
+        };
+        return Err(NotEligible::new(reason, anyhow!("{option}")));
+    }
+    if let Some(file) = parsed_args.extra_hash_files.first() {
+        return Err(NotEligible::new(
+            CompileLocallyReason::OptionReadsFile,
+            anyhow!("{}", file.display()),
+        ));
+    }
+    Ok(())
+}
+
 /// `option` with an absolute path in it, alone or after `=`, mapped into the input root. An
 /// absolute path elsewhere, in a list for another program or right after a flag, isn't.
 fn map_option(option: &OsString, path_mapper: &PathMapper) -> Result<String, NotEligible> {
@@ -237,6 +320,8 @@ mod test {
     use super::*;
     use crate::compiler::CompilerArguments;
     use crate::compiler::{clang, gcc};
+    use CCompilerKind::{Clang, Diab, Gcc};
+    use CompileLocallyReason as R;
     use test_case::test_case;
 
     const WS: &str = "/ws/app";
@@ -301,16 +386,47 @@ mod test {
         mapped.map(|compile| compile.arguments).unwrap_err().reason
     }
 
-    #[test_case(CCompilerKind::Diab, &[], CompileLocallyReason::UnsupportedCompiler ;
-        "other compiler")]
-    #[test_case(CCompilerKind::Gcc, &["-x", "assembler"], CompileLocallyReason::UnsupportedLanguage ;
-        "assembler")]
+    #[test_case(Diab, &[], R::UnsupportedCompiler ; "other compiler")]
+    #[test_case(Gcc, &["-x", "assembler"], R::UnsupportedLanguage ; "assembler")]
+    #[test_case(Gcc, &["-x", "c-header"], R::UnsupportedLanguage ; "header")]
+    #[test_case(Gcc, &["-march=native"], R::NativeCpu ; "native arch")]
+    #[test_case(Gcc, &["-mtune=native"], R::NativeCpu ; "native tune")]
+    #[test_case(Gcc, &["-mcpu=native+nosve"], R::NativeCpu ; "native cpu with features")]
+    #[test_case(Gcc, &["--coverage"], R::ProfilingOrCoverage ; "coverage")]
+    #[test_case(Gcc, &["-fprofile-generate"], R::ProfilingOrCoverage ; "profile")]
+    #[test_case(Clang, &["-fprofile-use=x.prof"], R::ProfilingOrCoverage ; "pgo")]
+    #[test_case(Gcc, &["-g3"], R::MacroDebugInfo ; "g3")]
+    #[test_case(Clang, &["-fdebug-macro"], R::MacroDebugInfo ; "debug macro")]
+    #[test_case(Gcc, &["-frecord-gcc-switches"], R::RecordedCommandLine ; "gcc switches")]
+    #[test_case(Gcc, &["-frecord-command-line"], R::RecordedCommandLine ; "command line")]
+    #[test_case(Clang, &["-grecord-command-line"], R::RecordedCommandLine ; "debug command line")]
+    #[test_case(Gcc, &["-ffile-prefix-map=/ws=."], R::PrefixMapOption ; "file map")]
+    #[test_case(Gcc, &["-fdebug-prefix-map=/a=b"], R::PrefixMapOption ; "debug map")]
+    #[test_case(Clang, &["-include-pch", "x.pch"], R::PrecompiledHeader ; "pch")]
+    #[test_case(Clang, &["-fplugin=x.so"], R::OptionReadsFile ; "plugin")]
+    #[test_case(Clang, &["-fsanitize-ignorelist=x.txt"], R::OptionReadsFile ; "sanitizer list")]
+    #[test_case(Gcc, &["-B/opt/bin"], R::CompilerInternalsOption ; "B")]
+    #[test_case(Gcc, &["-fno-integrated-as"], R::CompilerInternalsOption ; "no as")]
+    #[test_case(Clang, &["-Xclang", "-fno-pch-timestamp"], R::CompilerInternalsOption ; "xclang")]
+    #[test_case(Gcc, &["-v"], R::VerboseOutput ; "verbose")]
+    #[test_case(Clang, &["-arch", "x86_64"], R::ArchOption ; "arch")]
     fn test_compiles_that_stay_local(
         kind: CCompilerKind,
         args: &[&str],
         expected: CompileLocallyReason,
     ) {
         assert_eq!(expected, reason(map(&kind, args)));
+    }
+
+    #[test]
+    fn test_compiler_env_vars_stay_local() {
+        let env = [
+            ("GCC_EXEC_PREFIX", "/opt/gcc/"),
+            BUILD_SCRIPT_ENV[0],
+            BUILD_SCRIPT_ENV[1],
+        ];
+        let mapped = map_in(&CCompilerKind::Gcc, WS, OUT_DIR, &[], &env);
+        assert_eq!(CompileLocallyReason::CompilerEnvVar, reason(mapped));
     }
 
     #[test]
