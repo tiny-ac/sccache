@@ -21,7 +21,7 @@ use crate::compiler::{
     RemoteExecutor, get_compiler_info,
 };
 #[cfg(feature = "dist-client")]
-use crate::compiler::{DistClientSetup, DistExecutor, PendingDistToolchains};
+use crate::compiler::{DistClientSetup, DistExecutor, DistIpcExecutor, PendingDistToolchains};
 #[cfg(feature = "dist-client")]
 use crate::config;
 use crate::config::Config;
@@ -56,7 +56,7 @@ use std::mem;
 use std::os::android::net::SocketAddrExt;
 #[cfg(target_os = "linux")]
 use std::os::linux::net::SocketAddrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{ExitStatus, Output};
 use std::sync::Arc;
@@ -337,6 +337,15 @@ impl DistClientContainer {
         Self::new_with_state(DistClientState::Some(
             Box::new(DistClientConfig::mock(pool)),
             client,
+        ))
+    }
+
+    /// A container whose dist client failed to be created with `message`, for tests.
+    #[cfg(test)]
+    pub(crate) fn mock_misconfigured(message: String, pool: tokio::runtime::Handle) -> Self {
+        Self::new_with_state(DistClientState::FailWithMessage(
+            Box::new(DistClientConfig::mock(pool)),
+            message,
         ))
     }
 
@@ -940,6 +949,10 @@ where
     /// Distributed sccache client
     dist_client: Arc<DistClientContainer>,
 
+    /// Sends remote compiles to the daemon's dist client. `None` in the daemon.
+    #[cfg(feature = "dist-client")]
+    dist_ipc_executor: Option<Arc<DistIpcExecutor>>,
+
     /// Shared by the daemon's connections.
     #[cfg(feature = "dist-client")]
     pending_dist_toolchains: Arc<PendingDistToolchains>,
@@ -1190,8 +1203,41 @@ where
             info,
             notification_tx: None,
             #[cfg(feature = "dist-client")]
+            dist_ipc_executor: None,
+            #[cfg(feature = "dist-client")]
             pending_dist_toolchains: Arc::default(),
         }
+    }
+
+    /// Makes the service run remote compiles with `executor`.
+    #[cfg(feature = "dist-client")]
+    pub(crate) fn with_dist_ipc_executor(mut self, executor: Arc<DistIpcExecutor>) -> Self {
+        self.dist_ipc_executor = Some(executor);
+        self
+    }
+
+    /// The executor for remote compiles, if there is a dist client. Fails when the dist client
+    /// is misconfigured.
+    pub(crate) async fn remote_executor(&self) -> Result<Option<Arc<dyn RemoteExecutor<C>>>> {
+        #[cfg(feature = "dist-client")]
+        if let Some(executor) = &self.dist_ipc_executor {
+            let has_dist_client = executor.has_dist_client().await?;
+            return Ok(has_dist_client.then(|| executor.clone() as Arc<dyn RemoteExecutor<C>>));
+        }
+        self.dist_client.get_executor().await
+    }
+
+    #[cfg(feature = "dist-client")]
+    async fn dist_ipc_custom_toolchain(&self, compiler: &Path) -> Option<PathBuf> {
+        match &self.dist_ipc_executor {
+            Some(executor) => executor.custom_toolchain(compiler).await,
+            None => None,
+        }
+    }
+
+    #[cfg(not(feature = "dist-client"))]
+    async fn dist_ipc_custom_toolchain(&self, _: &Path) -> Option<PathBuf> {
+        None
     }
 
     pub fn mock_with_storage(
@@ -1214,6 +1260,8 @@ where
             tx,
             info,
             notification_tx: None,
+            #[cfg(feature = "dist-client")]
+            dist_ipc_executor: None,
             #[cfg(feature = "dist-client")]
             pending_dist_toolchains: Arc::default(),
         }
@@ -1240,6 +1288,8 @@ where
             tx,
             info,
             notification_tx: None,
+            #[cfg(feature = "dist-client")]
+            dist_ipc_executor: None,
             #[cfg(feature = "dist-client")]
             pending_dist_toolchains: Arc::default(),
         }
@@ -1459,21 +1509,15 @@ where
             _ => resolved_compiler_path,
         };
 
-        let dist_info = match me1.dist_client.get_client().await {
-            Ok(Some(ref client)) => {
-                if let Some(archive) = client.get_custom_toolchain(&resolved_compiler_path) {
-                    match metadata(&archive)
-                        .map(|attr| FileTime::from_last_modification_time(&attr))
-                    {
-                        Ok(mtime) => Some((archive, mtime)),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            }
-            _ => None,
+        let custom_toolchain = match me1.dist_client.get_client().await {
+            Ok(Some(ref client)) => client.get_custom_toolchain(&resolved_compiler_path),
+            _ => me1.dist_ipc_custom_toolchain(&resolved_compiler_path).await,
         };
+        let dist_info = custom_toolchain.and_then(|archive| {
+            metadata(&archive)
+                .map(|attr| (archive, FileTime::from_last_modification_time(&attr)))
+                .ok()
+        });
 
         let opt = match me1.compilers.read().await.get(&resolved_compiler_path) {
             // It's a hit only if the mtime and dist archive data matches.
@@ -1679,7 +1723,7 @@ where
         let me = self.clone();
 
         util::spawn_on(&self.rt, async move {
-            let result = match me.dist_client.get_executor().await {
+            let result = match me.remote_executor().await {
                 Ok(executor) => std::panic::AssertUnwindSafe(hasher.get_cached_or_compile(
                     &me,
                     executor,
@@ -2915,6 +2959,73 @@ mod tests {
                 }
                 other => panic!("expected Ready, got {other:?}"),
             }
+        }
+
+        /// Serves `listener`'s first connection as a daemon whose config names `archive` as
+        /// the custom toolchain of `compiler`, until the CLI closes it.
+        /// The CLI keeps the daemon's custom toolchain archive in the compiler info. A Rust
+        /// compiler's hash includes that archive.
+        #[test]
+        fn test_client_side_compiler_info_has_the_daemons_custom_toolchain() {
+            use crate::cache::disk::DiskCache;
+            use crate::config::PreprocessorCacheModeConfig;
+            use crate::test::utils::next_assembler;
+
+            let f = TestFixture::new();
+            let gcc = f.mk_bin("gcc").unwrap();
+            let archive = f.tempdir.path().join("gcc.tar.gz");
+            std::fs::write(&archive, b"toolchain").unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = crate::net::SocketAddr::Net(listener.local_addr().unwrap());
+            let daemon = std::thread::spawn({
+                let (compiler, archive) = (gcc.canonicalize().unwrap(), archive.clone());
+                move || {
+                    let other =
+                        crate::compiler::test_dist::answer_dist_client_setup(listener, || {
+                            DistClientSetup::Ready {
+                                rewrite_includes_only: false,
+                                custom_toolchains: HashMap::from([(
+                                    compiler.clone(),
+                                    archive.clone(),
+                                )]),
+                            }
+                        });
+                    assert!(other.is_none(), "unexpected request: {other:?}");
+                }
+            });
+            let conn = Arc::new(std::sync::Mutex::new(
+                crate::client::connect_to_server(&addr).unwrap(),
+            ));
+
+            let runtime = Runtime::new().unwrap();
+            let storage = Arc::new(DiskCache::new(
+                f.tempdir.path().join("cache"),
+                u64::MAX,
+                runtime.handle(),
+                PreprocessorCacheModeConfig::default(),
+                CacheMode::ReadWrite,
+                vec![],
+            ));
+            let service = MockService::mock_with_storage(storage, runtime.handle().clone())
+                .with_dist_ipc_executor(Arc::new(DistIpcExecutor::new(conn)));
+            next_command(
+                &service.creator,
+                Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
+            );
+            next_assembler(&service.creator, "GNU assembler (GNU Binutils) 2.42", "");
+            runtime
+                .block_on(service.compiler_info(gcc, f.tempdir.path().into(), &[], &[]))
+                .unwrap();
+
+            let dist_archive = runtime.block_on(async {
+                let compilers = service.compilers.read().await;
+                let entries: Vec<_> = compilers.values().flatten().collect();
+                assert_eq!(1, entries.len());
+                entries[0].dist_info.clone().map(|(archive, _)| archive)
+            });
+            assert_eq!(Some(archive), dist_archive);
+            drop(service);
+            daemon.join().unwrap();
         }
     }
 

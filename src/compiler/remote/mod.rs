@@ -28,7 +28,7 @@ mod dist;
 pub use self::dist::DistExecutor;
 #[cfg(feature = "dist-client")]
 pub(crate) use self::dist::{
-    DistClientSetup, DistIpcRequest, DistIpcResponse, PendingDistToolchains,
+    DistClientSetup, DistIpcExecutor, DistIpcRequest, DistIpcResponse, PendingDistToolchains,
     handle_dist_ipc_request,
 };
 

@@ -3005,6 +3005,356 @@ LLVM version: 6.0",
         assert_eq!(COMPILER_STDERR, res.stderr.as_slice());
     }
 
+    /// Compiles through a daemon, as a client-side CLI does.
+    #[cfg(feature = "dist-client")]
+    mod through_daemon {
+        use super::*;
+        use crate::compiler::{DistClientSetup, DistIpcRequest, DistIpcResponse};
+        use std::collections::HashMap;
+
+        /// The daemon of a client-side compile.
+        enum TestDaemon {
+            WithDistClient(Arc<dyn dist::Client>),
+            NoDistClient,
+            /// Creating the dist client failed with the given message.
+            Misconfigured(String),
+            /// Closes the connection at the first request.
+            ClosesAtFirstRequest,
+            /// Answers the dist client setup request as a daemon with a dist client, then
+            /// closes the connection at the next request, mid-compile.
+            ClosesMidCompile,
+        }
+
+        struct Outcome {
+            result: Result<(DistType, process::Output)>,
+            /// `None` if `foo.o` doesn't exist.
+            object_file_contents: Option<String>,
+            /// `None` for [`TestDaemon::ClosesAtFirstRequest`] and [`TestDaemon::ClosesMidCompile`].
+            setup_after_compile: Option<DistClientSetup>,
+            /// The options of the remote executor the compile ran with.
+            dist_input_options: Option<DistInputOptions>,
+        }
+
+        /// Compiles `foo.c`, a cache miss, through `daemon`; `expect_local_compile` queues the
+        /// mock compiler run.
+        fn compile_through_daemon(daemon: TestDaemon, expect_local_compile: bool) -> Outcome {
+            use crate::compiler::DistIpcExecutor;
+            use crate::protocol::{Request, Response};
+            use crate::server::{DistClientContainer, SccacheServer};
+
+            drop(env_logger::try_init());
+            let creator = new_creator();
+            let f = TestFixture::new();
+            let gcc = f.mk_bin("gcc").unwrap();
+            let runtime = Runtime::new().unwrap();
+            let pool = runtime.handle().clone();
+            let storage = Arc::new(DiskCache::new(
+                f.tempdir.path().join("cache"),
+                u64::MAX,
+                &pool,
+                PreprocessorCacheModeConfig::default(),
+                CacheMode::ReadWrite,
+                vec![],
+            ));
+            std::fs::write(f.tempdir.path().join("foo.c"), "whatever").unwrap();
+            // Pretend to be GCC.
+            next_command(
+                &creator,
+                Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
+            );
+            next_assembler(&creator, "GNU assembler (GNU Binutils) 2.42", "");
+            let c = get_compiler_info(
+                creator.clone(),
+                &gcc,
+                f.tempdir.path(),
+                &[],
+                &[],
+                &pool,
+                None,
+            )
+            .wait()
+            .unwrap()
+            .0;
+            // The preprocessor invocation.
+            next_command(
+                &creator,
+                Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+            );
+            if expect_local_compile {
+                // The compiler invocation.
+                let obj = f.tempdir.path().join("foo.o");
+                next_command_calls(&creator, move |_| {
+                    File::create(&obj)?.write_all(b"file contents")?;
+                    Ok(MockChild::new(
+                        exit_status(0),
+                        "compiler stdout",
+                        "compiler stderr",
+                    ))
+                });
+            }
+
+            let daemon_cache = f.tempdir.path().join("daemon-cache");
+            let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+            let (shutdown_tx, shutdown_rx) = futures::channel::oneshot::channel::<()>();
+            let is_sccache_daemon = matches!(
+                daemon,
+                TestDaemon::WithDistClient(..)
+                    | TestDaemon::NoDistClient
+                    | TestDaemon::Misconfigured(..)
+            );
+            let daemon = match daemon {
+                TestDaemon::WithDistClient(..)
+                | TestDaemon::NoDistClient
+                | TestDaemon::Misconfigured(..) => std::thread::spawn(move || {
+                    let runtime = Runtime::new().unwrap();
+                    let dist = match daemon {
+                        TestDaemon::WithDistClient(client) => {
+                            DistClientContainer::mock(client, runtime.handle().clone())
+                        }
+                        TestDaemon::NoDistClient => DistClientContainer::new_disabled(),
+                        TestDaemon::Misconfigured(message) => {
+                            DistClientContainer::mock_misconfigured(
+                                message,
+                                runtime.handle().clone(),
+                            )
+                        }
+                        _ => unreachable!("not an sccache daemon"),
+                    };
+                    let storage = Arc::new(DiskCache::new(
+                        &daemon_cache,
+                        u64::MAX,
+                        runtime.handle(),
+                        PreprocessorCacheModeConfig::default(),
+                        CacheMode::ReadWrite,
+                        vec![],
+                    ));
+                    let srv: SccacheServer<_, Arc<std::sync::Mutex<MockCommandCreator>>> =
+                        SccacheServer::new(
+                            0,
+                            runtime,
+                            crate::jobserver::Client::new(),
+                            dist,
+                            storage,
+                            CacheMode::ReadWrite,
+                        )
+                        .unwrap();
+                    addr_tx.send(srv.local_addr().unwrap()).unwrap();
+                    srv.run(shutdown_rx).unwrap();
+                }),
+                TestDaemon::ClosesMidCompile => {
+                    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                    addr_tx
+                        .send(crate::net::SocketAddr::Net(listener.local_addr().unwrap()))
+                        .unwrap();
+                    std::thread::spawn(move || {
+                        let compile = test_dist::answer_dist_client_setup(listener, || {
+                            DistClientSetup::Ready {
+                                rewrite_includes_only: true,
+                                custom_toolchains: HashMap::new(),
+                            }
+                        });
+                        assert!(compile.is_some(), "the CLI didn't send its compile");
+                    })
+                }
+                TestDaemon::ClosesAtFirstRequest => {
+                    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                    addr_tx
+                        .send(crate::net::SocketAddr::Net(listener.local_addr().unwrap()))
+                        .unwrap();
+                    std::thread::spawn(move || {
+                        use std::io::Read;
+                        let (mut stream, _) = listener.accept().unwrap();
+                        stream.read_exact(&mut [0; 4]).unwrap();
+                    })
+                }
+            };
+            let conn = Arc::new(std::sync::Mutex::new(
+                crate::client::connect_to_server(&addr_rx.recv().unwrap()).unwrap(),
+            ));
+            // The client-side service has no dist client of its own.
+            let service = server::SccacheService::mock_with_storage(storage.clone(), pool.clone())
+                .with_dist_ipc_executor(Arc::new(DistIpcExecutor::new(conn.clone())));
+            let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
+            let mut hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
+                CompilerArguments::Ok(h) => h,
+                o => panic!("Bad result from parse_arguments: {:?}", o),
+            };
+            let mut dist_input_options = None;
+            let result = runtime.block_on(async {
+                let executor = service.remote_executor().await?;
+                dist_input_options = executor
+                    .as_ref()
+                    .and_then(|executor| executor.dist_input_options());
+                hasher
+                    .get_cached_or_compile(
+                        &service,
+                        executor,
+                        creator,
+                        storage,
+                        arguments,
+                        f.tempdir.path().to_path_buf(),
+                        vec![],
+                        CacheControl::Default,
+                        pool,
+                    )
+                    .await
+            });
+            let result = result.map(|(cached, res)| match cached {
+                CompileResult::CacheMiss(MissType::Normal, dist_type, _, write) => {
+                    // Wait on the cache write so it doesn't race with the fixture's removal.
+                    write.wait().unwrap();
+                    (dist_type, res)
+                }
+                _ => panic!("Unexpected compile result: {:?}", cached),
+            });
+            let object_file_contents = fs::read_to_string(f.tempdir.path().join("foo.o")).ok();
+            let setup_after_compile = is_sccache_daemon.then(|| {
+                match conn
+                    .lock()
+                    .unwrap()
+                    .request(Request::Dist(DistIpcRequest::GetDistClientSetup))
+                    .unwrap()
+                {
+                    Response::Dist(DistIpcResponse::DistClientSetup(setup)) => setup,
+                    other => {
+                        panic!(
+                            "unexpected response to DistIpcRequest::GetDistClientSetup: {other:?}"
+                        )
+                    }
+                }
+            });
+
+            // The daemon doesn't shut down while a connection is open.
+            drop(service);
+            drop(conn);
+            if is_sccache_daemon {
+                shutdown_tx.send(()).unwrap();
+            }
+            daemon.join().unwrap();
+            Outcome {
+                result,
+                object_file_contents,
+                setup_after_compile,
+                dist_input_options,
+            }
+        }
+
+        /// In client-side mode, a remote compile goes through the daemon's dist client.
+        #[test]
+        fn test_compile_on_the_cluster() {
+            let dist_client = test_dist::OneshotClient::new(
+                0,
+                b"compiler stdout".to_vec(),
+                b"compiler stderr".to_vec(),
+            );
+            let outcome = compile_through_daemon(TestDaemon::WithDistClient(dist_client), false);
+            let (dist_type, res) = outcome.result.unwrap();
+            // The daemon wrote the object file the dist client returned.
+            let object_file_contents = outcome.object_file_contents.unwrap();
+            assert!(
+                object_file_contents.starts_with("some data in"),
+                "{object_file_contents}"
+            );
+            assert!(matches!(dist_type, DistType::Ok(_)), "{dist_type:?}");
+            assert_eq!(exit_status(0), res.status);
+            assert_eq!(b"compiler stdout", res.stdout.as_slice());
+            assert_eq!(b"compiler stderr", res.stderr.as_slice());
+        }
+
+        /// A daemon without a dist client makes the CLI compile locally.
+        #[test]
+        fn test_a_daemon_without_a_dist_client() {
+            let outcome = compile_through_daemon(TestDaemon::NoDistClient, true);
+            let (dist_type, res) = outcome.result.unwrap();
+            assert_eq!(
+                Some("file contents"),
+                outcome.object_file_contents.as_deref()
+            );
+            assert!(matches!(dist_type, DistType::NoDist), "{dist_type:?}");
+            assert_eq!(exit_status(0), res.status);
+            assert_eq!(b"compiler stdout", res.stdout.as_slice());
+        }
+
+        /// A misconfigured dist client in the daemon fails the compile.
+        #[test]
+        fn test_a_misconfigured_dist_client() {
+            let outcome = compile_through_daemon(
+                TestDaemon::Misconfigured("auth not configured".to_owned()),
+                false,
+            );
+            let e = outcome.result.unwrap_err();
+            assert!(format!("{e:#}").contains("auth not configured"), "{e:#}");
+        }
+
+        /// A daemon that closes the connection mid-compile makes the CLI compile locally.
+        #[test]
+        fn test_a_daemon_that_closes_mid_compile() {
+            let outcome = compile_through_daemon(TestDaemon::ClosesMidCompile, true);
+            let (dist_type, res) = outcome.result.unwrap();
+            assert_eq!(
+                Some("file contents"),
+                outcome.object_file_contents.as_deref()
+            );
+            assert!(matches!(dist_type, DistType::Error), "{dist_type:?}");
+            assert_eq!(exit_status(0), res.status);
+        }
+
+        /// A daemon that closes the connection at the first request makes the CLI compile
+        /// locally.
+        #[test]
+        fn test_a_daemon_that_closes_at_the_first_request() {
+            let outcome = compile_through_daemon(TestDaemon::ClosesAtFirstRequest, true);
+            let (dist_type, res) = outcome.result.unwrap();
+            assert_eq!(
+                Some("file contents"),
+                outcome.object_file_contents.as_deref()
+            );
+            assert!(matches!(dist_type, DistType::NoDist), "{dist_type:?}");
+            assert_eq!(exit_status(0), res.status);
+        }
+
+        /// The CLI compiles with the daemon's `rewrite_includes_only`, which goes into the
+        /// cache key.
+        #[test]
+        fn test_the_daemons_input_options_are_used() {
+            let outcome = compile_through_daemon(TestDaemon::ClosesMidCompile, true);
+            let options = outcome.dist_input_options.unwrap();
+            assert!(options.rewrite_includes_only);
+        }
+
+        /// An sccache-dist error in the daemon makes the CLI compile locally.
+        #[test]
+        fn test_a_cluster_error() {
+            let outcome = compile_through_daemon(
+                TestDaemon::WithDistClient(test_dist::ErrorAllocJobClient::new()),
+                true,
+            );
+            let (dist_type, res) = outcome.result.unwrap();
+            assert_eq!(
+                Some("file contents"),
+                outcome.object_file_contents.as_deref()
+            );
+            assert!(matches!(dist_type, DistType::Error), "{dist_type:?}");
+            assert_eq!(exit_status(0), res.status);
+            assert_eq!(b"compiler stdout", res.stdout.as_slice());
+        }
+
+        /// An [`HttpClientError`] in the daemon fails the compile with that error type,
+        /// and the daemon resets its dist client.
+        #[test]
+        fn test_an_http_client_error() {
+            let outcome = compile_through_daemon(
+                TestDaemon::WithDistClient(test_dist::HttpErrorAllocJobClient::new()),
+                false,
+            );
+            let e = outcome.result.unwrap_err();
+            assert!(e.downcast_ref::<HttpClientError>().is_some(), "{e:#}");
+            // After a reset, the mock config has no scheduler, so the daemon has no dist client.
+            let setup = outcome.setup_after_compile.unwrap();
+            assert!(matches!(setup, DistClientSetup::NoDistClient), "{setup:?}");
+        }
+    }
+
     #[test_case(true ; "with preprocessor cache")]
     #[test_case(false ; "without preprocessor cache")]
     #[cfg(feature = "dist-client")]
@@ -4057,7 +4407,7 @@ LLVM version: 6.0",
 
 #[cfg(test)]
 #[cfg(feature = "dist-client")]
-mod test_dist {
+pub(crate) mod test_dist {
     use crate::dist::pkg;
     use crate::dist::{
         self, AllocJobResult, CompileCommand, JobAlloc, JobComplete, JobId, OutputData,
@@ -4069,6 +4419,35 @@ mod test_dist {
     use std::sync::{Arc, atomic::AtomicBool};
 
     use crate::errors::*;
+
+    /// Serves `listener`'s first connection as a daemon whose dist client has `setup`, until
+    /// the CLI closes the connection or sends another request, which it returns.
+    pub(crate) fn answer_dist_client_setup(
+        listener: std::net::TcpListener,
+        setup: impl Fn() -> crate::compiler::DistClientSetup,
+    ) -> Option<crate::protocol::Request> {
+        use crate::compiler::{DistIpcRequest, DistIpcResponse};
+        use crate::protocol::{Request, Response};
+        use byteorder::{BigEndian, ByteOrder};
+        use std::io::Read;
+
+        let (mut stream, _) = listener.accept().unwrap();
+        loop {
+            let mut len = [0; 4];
+            if stream.read_exact(&mut len).is_err() {
+                return None;
+            }
+            let mut data = vec![0; BigEndian::read_u32(&len) as usize];
+            stream.read_exact(&mut data).unwrap();
+            match bincode::deserialize(&data).unwrap() {
+                Request::Dist(DistIpcRequest::GetDistClientSetup) => {
+                    let response = Response::Dist(DistIpcResponse::DistClientSetup(setup()));
+                    crate::util::write_length_prefixed_bincode(&mut stream, response).unwrap();
+                }
+                other => return Some(other),
+            }
+        }
+    }
 
     pub struct ErrorPutToolchainClient;
     impl ErrorPutToolchainClient {
@@ -4141,6 +4520,60 @@ mod test_dist {
         async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
             assert_eq!(self.tc, tc);
             Err((self.error)())
+        }
+        async fn do_get_status(&self) -> Result<SchedulerStatusResult> {
+            unreachable!()
+        }
+        async fn do_submit_toolchain(
+            &self,
+            _: JobAlloc,
+            _: Toolchain,
+        ) -> Result<SubmitToolchainResult> {
+            unreachable!()
+        }
+        async fn do_run_job(
+            &self,
+            _: JobAlloc,
+            _: CompileCommand,
+            _: Vec<String>,
+            _: Box<dyn pkg::InputsPackager>,
+        ) -> Result<(RunJobResult, PathTransformer)> {
+            unreachable!()
+        }
+        async fn put_toolchain(
+            &self,
+            _: PathBuf,
+            _: String,
+            _: Box<dyn pkg::ToolchainPackager>,
+        ) -> Result<(Toolchain, Option<(String, PathBuf)>)> {
+            Ok((self.tc.clone(), None))
+        }
+        fn rewrite_includes_only(&self) -> bool {
+            false
+        }
+        fn get_custom_toolchain(&self, _exe: &Path) -> Option<PathBuf> {
+            None
+        }
+    }
+
+    pub struct HttpErrorAllocJobClient {
+        tc: Toolchain,
+    }
+    impl HttpErrorAllocJobClient {
+        #[allow(clippy::new_ret_no_self)]
+        pub fn new() -> Arc<dyn dist::Client> {
+            Arc::new(Self {
+                tc: Toolchain {
+                    archive_id: "somearchiveid".to_owned(),
+                },
+            })
+        }
+    }
+    #[async_trait]
+    impl dist::Client for HttpErrorAllocJobClient {
+        async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
+            assert_eq!(self.tc, tc);
+            Err(HttpClientError("MOCK: unauthorized".to_owned()).into())
         }
         async fn do_get_status(&self) -> Result<SchedulerStatusResult> {
             unreachable!()

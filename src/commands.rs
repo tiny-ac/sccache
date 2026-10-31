@@ -16,7 +16,7 @@ use crate::cache::{CacheMode, IpcStorage, Storage, storage_from_config};
 use crate::client::{ServerConnection, connect_to_server, connect_with_retry};
 use crate::cmdline::{Command, StatsFormat};
 use crate::compiler::{ColorMode, is_rmeta_artifact_notification};
-use crate::config::Config;
+use crate::config::{Config, DistConfig};
 use crate::jobserver::Client;
 use crate::mock_command::{CommandChild, CommandCreatorSync, ProcessCommandCreator, RunCommand};
 use crate::protocol::{Compile, CompileFinished, CompileResponse, Request, Response};
@@ -715,12 +715,13 @@ where
 }
 
 /// Run a compile in client-side mode: the compile pipeline executes in this
-/// process, and only cache I/O is forwarded to the daemon via `conn`.
+/// process, and cache I/O and remote compiles are forwarded to the daemon via `conn`.
 ///
 /// Shares `handle_compile_result` with the daemon-IPC path so local-fallback
 /// execution is not duplicated.
 #[allow(clippy::too_many_arguments)]
 pub fn do_compile_client_side<C>(
+    dist: &DistConfig,
     jobserver: &Client,
     runtime: &mut Runtime,
     conn: ServerConnection,
@@ -751,6 +752,15 @@ where
         tx,
         info,
     );
+    #[cfg(feature = "dist-client")]
+    let service = match dist.scheduler_url {
+        Some(_) => service.with_dist_ipc_executor(Arc::new(crate::compiler::DistIpcExecutor::new(
+            conn_arc.clone(),
+        ))),
+        None => service,
+    };
+    #[cfg(not(feature = "dist-client"))]
+    let _ = dist;
     let compile = Compile {
         exe: exe_path.as_os_str().to_owned(),
         cwd: cwd.as_os_str().to_owned(),
@@ -1008,6 +1018,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                     .enable_all()
                     .build()?;
                 let res = do_compile_client_side::<ProcessCommandCreator>(
+                    &config.dist,
                     &jobserver,
                     &mut runtime,
                     conn,
