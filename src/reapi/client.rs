@@ -24,6 +24,9 @@ use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub(super) const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+/// The largest response to a call that answers with an `ActionResult`. Servers inline stdout
+/// and stderr up to their own message limit, which is often above tonic's 4 MiB default.
+pub(super) const MAX_ACTION_RESULT_RESPONSE_BYTES: usize = 32 << 20;
 /// Tries after the first for a call that a busy or restarting server refused.
 pub(super) const RETRIES: u32 = 2;
 /// The wait before the first retry, doubled before the next. Short in tests.

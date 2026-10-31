@@ -435,7 +435,7 @@ pub(super) const ACTION_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// The largest output file downloaded, well above the largest rlibs with debuginfo.
 const MAX_OUTPUT_FILE_BYTES: u64 = 4 << 30;
 /// The largest stdout or stderr downloaded, which is held in memory.
-const MAX_STDOUT_OR_STDERR_BYTES: u64 = 64 << 20;
+const MAX_STDOUT_OR_STDERR_BYTES: u64 = 8 << 20;
 
 /// Error for an output file that contains the worker root, such as one from a crate that
 /// embeds `env!("CARGO_MANIFEST_DIR")`.
