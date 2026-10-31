@@ -110,6 +110,7 @@ tokio = { version = "1", features = [
   "net",
   "process",
   "macros",
+  "sync",
 ] }
 tokio-serde = "0.9"
 tokio-util = { version = "0.7.18", features = ["codec", "io", "rt"] }
@@ -172,6 +173,7 @@ thirtyfour = { version = "0.38.1", default-features = false, features = [
   "reqwest",
   "rustls",
 ] }
+tokio = { version = "1", features = ["test-util"] }
 
 [target.'cfg(unix)'.dependencies]
 daemonix = "0.1"

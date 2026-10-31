@@ -1,5 +1,7 @@
 use crate::cache::{CacheMode, GetPathResult};
 use crate::compiler::ColorMode;
+#[cfg(feature = "dist-client")]
+use crate::compiler::{DistIpcRequest, DistIpcResponse};
 use crate::config::PreprocessorCacheModeConfig;
 use crate::server::{DistInfo, ServerInfo, ServerStats};
 use serde::{Deserialize, Serialize};
@@ -35,6 +37,11 @@ pub enum Request {
     StoragePutPreprocessorEntry { key: String, entry_bytes: Vec<u8> },
     /// Merge per-invocation stats into the daemon's running totals.
     RecordStats(Box<ServerStats>),
+
+    // --- sccache-dist RPCs (client-side mode) ---
+    /// Use the daemon's dist client.
+    #[cfg(feature = "dist-client")]
+    Dist(DistIpcRequest),
 }
 
 /// A server response.
@@ -76,6 +83,11 @@ pub enum Response {
     ///
     /// Currently only `.rmeta` notifications are sent (for Cargo pipelining).
     ArtifactNotification(Vec<u8>),
+
+    // --- sccache-dist RPC responses (client-side mode) ---
+    /// Response for `Request::Dist`.
+    #[cfg(feature = "dist-client")]
+    Dist(DistIpcResponse),
 }
 
 /// Possible responses from the server for a `Compile` request.
