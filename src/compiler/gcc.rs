@@ -842,17 +842,45 @@ fn preprocess_cmd<F, T>(
     F: Fn(Language) -> Option<&'static str>,
     T: RunCommand,
 {
+    cmd.args(&preprocess_args(
+        parsed_args,
+        arch_args,
+        may_dist,
+        kind,
+        rewrite_includes_only,
+        &ignorable_whitespace_flags,
+        language_to_arg,
+    ))
+    .env_clear()
+    .envs(env_vars.to_vec())
+    .current_dir(cwd);
+}
+
+/// The arguments that preprocess `parsed_args`' input to stdout.
+pub(super) fn preprocess_args<F>(
+    parsed_args: &ParsedArguments,
+    arch_args: &[OsString],
+    may_dist: bool,
+    kind: CCompilerKind,
+    rewrite_includes_only: bool,
+    ignorable_whitespace_flags: &[String],
+    language_to_arg: F,
+) -> Vec<OsString>
+where
+    F: Fn(Language) -> Option<&'static str>,
+{
+    let mut args: Vec<OsString> = vec![];
     let language = language_to_arg(parsed_args.language);
     if let Some(lang) = &language {
-        cmd.arg("-x").arg(lang);
+        args.extend(["-x".into(), lang.into()]);
     }
-    cmd.arg("-E");
+    args.push("-E".into());
     // When performing distributed compilation, line number info is important for error
     // reporting and to not cause spurious compilation failure (e.g. no exceptions build
     // fails due to exceptions transitively included in the stdlib).
     // With -fprofile-generate line number information is important, so don't use -P.
     if !may_dist && !parsed_args.profile_generate {
-        cmd.args(&ignorable_whitespace_flags);
+        args.extend(ignorable_whitespace_flags.iter().map(OsString::from));
     }
     if rewrite_includes_only {
         if parsed_args.suppress_rewrite_includes_only {
@@ -862,27 +890,25 @@ fn preprocess_cmd<F, T>(
         } else {
             match kind {
                 CCompilerKind::Clang => {
-                    cmd.arg("-frewrite-includes");
+                    args.push("-frewrite-includes".into());
                 }
                 CCompilerKind::Gcc => {
-                    cmd.arg("-fdirectives-only");
+                    args.push("-fdirectives-only".into());
                 }
                 _ => {}
             }
         }
     }
 
-    cmd.args(&parsed_args.preprocessor_args)
-        .args(&parsed_args.dependency_args)
-        .args(&parsed_args.common_args)
-        .args(arch_args);
+    args.extend_from_slice(&parsed_args.preprocessor_args);
+    args.extend_from_slice(&parsed_args.dependency_args);
+    args.extend_from_slice(&parsed_args.common_args);
+    args.extend_from_slice(arch_args);
     if parsed_args.double_dash_input {
-        cmd.arg("--");
+        args.push("--".into());
     }
-    cmd.arg(&parsed_args.input)
-        .env_clear()
-        .envs(env_vars.to_vec())
-        .current_dir(cwd);
+    args.push(parsed_args.input.clone().into());
+    args
 }
 
 #[allow(clippy::too_many_arguments)]
