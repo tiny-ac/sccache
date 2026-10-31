@@ -83,6 +83,9 @@ fn reapi_compile(
         object,
     } = mapped;
     let toolchain = toolchain_key(kind, executable, &parsed_args.language, cwd, env_vars)?;
+    if *kind == CCompilerKind::Clang {
+        check_clang_config(executable, &toolchain.driver, cwd, env_vars)?;
+    }
     Ok(ReapiCompile {
         path_mapper,
         arguments,
@@ -273,6 +276,36 @@ fn internal_file(
         file.path = which::which_in(printed, Some(&path_var.1), cwd).ok()?;
     }
     file.path.is_file().then_some(file)
+}
+
+/// Fails for a clang that reads a config file when run as `executable` or as `driver`. The
+/// toolchain dir holds none, so a worker's clang wouldn't read it.
+fn check_clang_config(
+    executable: &Path,
+    driver: &Path,
+    cwd: &Path,
+    env_vars: &[(OsString, OsString)],
+) -> Result<(), NotEligible> {
+    for program in [executable, driver] {
+        let output = std::process::Command::new(program)
+            .args(["-###", "-c", "-x", "c", "/dev/null", "-o", "/dev/null"])
+            .env_clear()
+            .envs(env_vars.iter().cloned())
+            .current_dir(cwd)
+            .output()
+            .map_err(|e| NotEligible::new(CompileLocallyReason::ClangConfigFile, e.into()))?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if let Some(line) = stderr
+            .lines()
+            .find(|line| line.starts_with("Configuration file:"))
+        {
+            return Err(NotEligible::new(
+                CompileLocallyReason::ClangConfigFile,
+                anyhow!("{line}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The `PathMapper` of a build script's compile, whose cwd is the package's manifest dir, and
@@ -723,6 +756,24 @@ mod test {
         let (dir, env) = fake_gcc(dir.path());
         let key = toolchain_key(&Clang, &dir.join("cc"), &Language::C, &dir, &env).unwrap();
         assert!(key.internal_files.is_empty(), "{key:?}");
+    }
+
+    #[test_case("*/cc", true ; "as the executable")]
+    #[test_case("*/clang-18", true ; "as the driver")]
+    #[test_case("*/other", false ; "neither")]
+    fn test_a_clang_that_reads_a_config_file_stays_local(reads_config_as: &str, local: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let script = format!(
+            "case \"$0\" in {reads_config_as}) echo 'Configuration file: /x.cfg' >&2 ;; esac\n"
+        );
+        write_executable(&dir.join("clang-18"), &script);
+        std::os::unix::fs::symlink(dir.join("clang-18"), dir.join("cc")).unwrap();
+        let checked = check_clang_config(&dir.join("cc"), &dir.join("clang-18"), &dir, &[]);
+        assert_eq!(local, checked.is_err(), "{checked:?}");
+        if let Err(not_eligible) = checked {
+            assert_eq!(R::ClangConfigFile, not_eligible.reason);
+        }
     }
 
     #[test]
