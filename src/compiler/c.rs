@@ -1279,6 +1279,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
     #[cfg(feature = "reapi")]
     fn map_for_reapi(
         &self,
+        preprocessed_dir: &Path,
     ) -> std::result::Result<crate::reapi::ReapiCompile, crate::reapi::NotEligible> {
         super::c_reapi::map_for_reapi(
             &self.compiler.kind(),
@@ -1286,6 +1287,7 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
             &self.executable,
             &self.cwd,
             &self.env_vars,
+            preprocessed_dir,
         )
     }
 

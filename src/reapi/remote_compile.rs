@@ -199,14 +199,19 @@ pub(super) fn digest_input_root_files(
     compile: &ReapiCompile,
     digest_cache: &DigestCache,
 ) -> Result<Vec<(InputRootFile, PathBuf)>> {
-    compile
-        .input_root_files
-        .iter()
-        .map(|local_path| {
-            let path = compile
-                .path_mapper
-                .to_input_root(local_path)
-                .with_context(|| format!("{} is outside the input root", local_path.display()))?;
+    let mapped_files = compile.input_root_files.iter().map(|local_path| {
+        let path = compile
+            .path_mapper
+            .to_input_root(local_path)
+            .with_context(|| format!("{} is outside the input root", local_path.display()))?;
+        Ok((path, local_path))
+    });
+    let preprocessed_source = (compile.preprocessed_source.iter())
+        .map(|source| Ok((source.mapped_path.clone(), &source.path)));
+    mapped_files
+        .chain(preprocessed_source)
+        .map(|mapped_file: Result<(String, &PathBuf)>| {
+            let (path, local_path) = mapped_file?;
             let file = InputRootFile {
                 path,
                 digest: digest_cache.digest(local_path)?,
@@ -853,7 +858,7 @@ pub(super) mod test {
     use crate::compiler::CCompilerKind;
     use crate::reapi::fake::FakeServer;
     use crate::reapi::mapping::{CToolchainKey, InternalFile};
-    use crate::reapi::{ActionEnv, PathMapper};
+    use crate::reapi::{ActionEnv, PathMapper, PreprocessedSource};
     use std::sync::Arc;
     use test_case::test_case;
 
@@ -888,6 +893,7 @@ pub(super) mod test {
                 unset_vars: vec!["HOSTNAME".to_owned(), "GIT_HASH".to_owned()],
             },
             input_root_files: vec![],
+            preprocessed_source: None,
             outputs: vec![
                 format!("{cwd}/target/debug/deps/libfoo.rmeta").into(),
                 format!("{cwd}/target/debug/deps/libfoo.rlib").into(),
@@ -934,6 +940,23 @@ pub(super) mod test {
         let toolchain =
             toolchain_files(sysroot, "x86_64-unknown-linux-gnu", &digest_cache).unwrap();
         action_blobs(&compile, &files, &toolchain, options).unwrap()
+    }
+
+    #[test]
+    fn test_a_preprocessed_source_goes_to_the_sources_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let temp_path = NamedTempFile::new_in(dir.path()).unwrap().into_temp_path();
+        let local_path = temp_path.to_path_buf();
+        let compile = ReapiCompile {
+            preprocessed_source: Some(PreprocessedSource::new(temp_path, "src/x.c".to_owned())),
+            ..reapi_compile_in(dir.path().to_str().unwrap())
+        };
+        let digest_cache = DigestCache::load(dir.path().join("digests.json"));
+        let files = digest_input_root_files(&compile, &digest_cache).unwrap();
+        let files: Vec<_> = (files.iter())
+            .map(|(file, local_path)| (file.path.as_str(), local_path))
+            .collect();
+        assert_eq!(vec![("src/x.c", &local_path)], files);
     }
 
     #[cfg(unix)]

@@ -55,6 +55,8 @@ use tonic::transport::{Certificate, Identity};
 
 /// Directory under the dist cache dir for the sysroot copies local compiles use.
 pub(super) const SYSROOT_COPIES_DIR: &str = "reapi-sysroot-copies";
+/// Directory under the dist cache dir for the sources C compiles preprocess for workers.
+pub(super) const PREPROCESSED_DIR: &str = "reapi-preprocessed";
 const WORKER_TOOLCHAINS_DIR: &str = "reapi-worker-toolchains";
 /// File under the dist cache dir that keeps toolchain file digests across restarts.
 const DIGEST_CACHE_FILE: &str = "reapi-digests.json";
@@ -75,6 +77,7 @@ pub(crate) struct ReapiExecutor {
     toolchains: Arc<Toolchains>,
     ready_wait: Duration,
     sysroot_copies_dir: PathBuf,
+    preprocessed_dir: PathBuf,
     lookup_pause: Pause,
     execution_pause: Pause,
     action_options: ActionOptions,
@@ -162,6 +165,7 @@ impl ReapiExecutor {
             digest_cache,
             ready_wait,
             sysroot_copies_dir: dist_cache_dir.join(SYSROOT_COPIES_DIR),
+            preprocessed_dir: dist_cache_dir.join(PREPROCESSED_DIR),
             lookup_pause: Pause::new(RPC_TIMEOUT),
             execution_pause: Pause::new(EXECUTE_TIMEOUT),
             action_options: ActionOptions::new(config),
@@ -637,19 +641,22 @@ pub(super) fn compiled_locally(reason: CompileLocallyReason) -> DistType {
     DistType::Reapi(ReapiOutcome::CompiledLocally(reason.to_string()))
 }
 
-/// `compilation` mapped for REAPI, or why its cache miss compiles locally. Mapping runs
-/// rustc and reads files, so it runs on a blocking thread.
+/// `compilation` mapped for REAPI, with its preprocessed source under `preprocessed_dir`, or
+/// why its cache miss compiles locally. Mapping runs the compiler and reads files, so it runs
+/// on a blocking thread.
 pub(super) async fn map_miss<T: CommandCreatorSync>(
     compilation: Box<dyn Compilation<T>>,
     cache_control: CacheControl,
     local_compile_changed: bool,
+    preprocessed_dir: PathBuf,
     out_pretty: &str,
 ) -> std::result::Result<ReapiCompile, CompileLocallyReason> {
     // SCCACHE_RECACHE and SCCACHE_NO_CACHE ask for a real compile, which a hit would skip.
     if cache_control != CacheControl::Default {
         return compile_locally(out_pretty, CompileLocallyReason::CacheBypassed);
     }
-    let mapped = tokio::task::spawn_blocking(move || compilation.map_for_reapi()).await;
+    let mapped =
+        tokio::task::spawn_blocking(move || compilation.map_for_reapi(&preprocessed_dir)).await;
     let reapi_compile = match mapped {
         Ok(Ok(reapi_compile)) => reapi_compile,
         Ok(Err(not_eligible)) => {
@@ -916,6 +923,7 @@ impl<T: CommandCreatorSync> RemoteExecutor<T> for ReapiExecutor {
             compilation,
             cache_control,
             local_compile_changed,
+            self.preprocessed_dir.clone(),
             &out_pretty,
         )
         .await;
@@ -987,7 +995,10 @@ pub(super) mod test {
             unimplemented!()
         }
 
-        fn map_for_reapi(&self) -> std::result::Result<ReapiCompile, crate::reapi::NotEligible> {
+        fn map_for_reapi(
+            &self,
+            _preprocessed_dir: &Path,
+        ) -> std::result::Result<ReapiCompile, crate::reapi::NotEligible> {
             match self.eligibility {
                 Eligibility::Eligible | Eligibility::UsesProcMacro => {}
                 Eligibility::Ineligible => return Err(CompileLocallyReason::Staticlib.into()),
@@ -1013,6 +1024,7 @@ pub(super) mod test {
                     ],
                     _ => vec![ws.join("src/lib.rs")],
                 },
+                preprocessed_source: None,
                 outputs: vec![ws.join(RLIB)],
             })
         }
@@ -1111,7 +1123,7 @@ pub(super) mod test {
             &self,
             change: fn(&mut remexec::ActionResult),
         ) {
-            let compile = self.compilation().map_for_reapi().unwrap();
+            let compile = self.compilation().map_for_reapi(Path::new("")).unwrap();
             let digest_cache = DigestCache::load(self.dir.path().join("digests.json"));
             let files = digest_input_root_files(&compile, &digest_cache).unwrap();
             let toolchain = crate::reapi::remote_compile::toolchain_files(
@@ -1246,7 +1258,7 @@ pub(super) mod test {
             },
         );
         fixture.config.on_miss = ReapiOnMiss::Execute;
-        let compile = fixture.compilation().map_for_reapi().unwrap();
+        let compile = fixture.compilation().map_for_reapi(Path::new("")).unwrap();
         let rlib = compile
             .path_mapper
             .to_input_root(&compile.outputs[0])

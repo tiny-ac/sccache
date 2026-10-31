@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
+use tempfile::TempPath;
 
 /// The input root's directory for files under the local build root.
 pub(super) const BUILD_ROOT_DIR: &str = ".sccache-build";
@@ -46,8 +47,33 @@ pub struct ReapiCompile {
     pub(crate) env: ActionEnv,
     /// Local paths of the files that go into the input root.
     pub(crate) input_root_files: Vec<PathBuf>,
+    pub(crate) preprocessed_source: Option<PreprocessedSource>,
     /// Local paths the compile writes.
     pub(crate) outputs: Vec<PathBuf>,
+}
+
+/// A C or C++ source preprocessed for a worker, which the input root holds at the source's
+/// own path.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct PreprocessedSource {
+    /// The local file.
+    pub(crate) path: PathBuf,
+    /// The source's path in the input root.
+    pub(crate) mapped_path: String,
+    /// Removes the file when the CLI's compile ends. The daemon's copy of the compile has
+    /// `None` here, so it leaves the file.
+    #[serde(skip)]
+    _temp_path: Option<TempPath>,
+}
+
+impl PreprocessedSource {
+    pub(crate) fn new(temp_path: TempPath, mapped_path: String) -> Self {
+        PreprocessedSource {
+            path: temp_path.to_path_buf(),
+            mapped_path,
+            _temp_path: Some(temp_path),
+        }
+    }
 }
 
 /// The program a worker runs for a compile, with what its command line needs besides
