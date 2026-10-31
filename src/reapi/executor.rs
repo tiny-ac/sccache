@@ -18,7 +18,7 @@
 //! local compiles by reason.
 
 use super::cas::UnreadableBlob;
-use super::client::{ConnectOptions, RPC_TIMEOUT, check_connect_options, rpc_code};
+use super::client::{ConnectOptions, RPC_TIMEOUT, check_connect_options, loggable, rpc_code};
 use super::connection::{Connection, ServerApis};
 use super::digest::DigestCache;
 use super::execution::{Execution, MissingActionBlobs, QueuedTooLong};
@@ -497,12 +497,6 @@ impl ReapiExecutor {
         }
         Ok(RustcOnWorkers::Matches)
     }
-}
-
-/// Worker output for a log line: escaped, and cut to 200 chars.
-fn loggable(output: &[u8]) -> String {
-    let output: String = String::from_utf8_lossy(output).chars().take(200).collect();
-    format!("{output:?}")
 }
 
 /// Writes `result`'s outputs to `reapi_compile`'s local paths.

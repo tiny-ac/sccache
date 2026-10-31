@@ -16,6 +16,7 @@
 //! output files to their local paths.
 
 use super::cas::{Blob, Cas};
+use super::client::loggable;
 use super::digest::{self, DigestCache};
 use super::input_root::{InputRoot, InputRootFile};
 use super::mapping::{BUILD_ROOT_DIR, CompileLocallyReason, ReapiCompile, TOOLCHAIN_DIR};
@@ -590,9 +591,11 @@ fn check_output_paths(compile: &ReapiCompile, result: &remexec::ActionResult) ->
     let mut returned_paths = HashSet::new();
     for file in &result.output_files {
         if !declared_paths.contains(&file.path) {
-            return Err(
-                UnusableResult(format!("result has undeclared output {}", file.path)).into(),
-            );
+            return Err(UnusableResult(format!(
+                "result has undeclared output {}",
+                loggable(file.path.as_bytes())
+            ))
+            .into());
         }
         if !returned_paths.insert(file.path.as_str()) {
             return Err(UnusableResult(format!("result has output {} twice", file.path)).into());
@@ -1302,10 +1305,10 @@ pub(super) mod test {
         "exit code 256" ; "exit code a process can't return")]
     #[test_case(
         worker_result(vec![cas_output(RLIB, b"rlib"), cas_output(RMETA, b"rmeta"), inline_output("other", b"x")]),
-        "result has undeclared output other" ; "undeclared output")]
+        r#"result has undeclared output "other""# ; "undeclared output")]
     #[test_case(
         worker_result(vec![cas_output(RLIB, b"rlib"), cas_output(RMETA, b"rmeta"), inline_output("../x", b"x")]),
-        "result has undeclared output ../x" ; "output outside the input root")]
+        r#"result has undeclared output "../x""# ; "output outside the input root")]
     #[test_case(
         worker_result(vec![cas_output(RLIB, b"rlib"), cas_output(RMETA, b"rmeta"), cas_output(RLIB, b"rmeta")]),
         "twice" ; "output returned twice")]
