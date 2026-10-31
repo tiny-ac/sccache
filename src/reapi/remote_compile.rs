@@ -30,7 +30,7 @@ use crate::errors::*;
 use crate::mock_command::exit_status;
 use memchr::memmem;
 use prost::Message;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
@@ -90,10 +90,11 @@ pub(super) fn build_command(compile: &ReapiCompile) -> remexec::Command {
             "rustc"
         }
         // The worker root differs per action, so objects name it as `.`.
-        (WorkerProgram::C, ToolchainKey::C(toolchain)) => {
+        (WorkerProgram::C, ToolchainKey::C(key)) => {
+            script.push_str(&c_toolchain_exports(key));
             script.push_str(&format!(
                 "exec \"$PWD\"/{TOOLCHAIN_DIR}{} \"$@\" -ffile-prefix-map=\"$PWD\"=.\n",
-                sh_quote(&toolchain.driver.to_string_lossy())
+                sh_quote(&key.driver.to_string_lossy())
             ));
             "cc"
         }
@@ -129,6 +130,42 @@ fn toolchain_library_path_exports() -> String {
     format!(
         "export LD_LIBRARY_PATH=\"$PWD\"/{TOOLCHAIN_DIR}/lib DYLD_LIBRARY_PATH=\"$PWD\"/{TOOLCHAIN_DIR}/lib\n"
     )
+}
+
+/// The dirs under [`TOOLCHAIN_DIR`] that a worker's `LD_LIBRARY_PATH` and `COMPILER_PATH`
+/// hold for `key`: those of its libraries and of the programs gcc runs.
+fn c_toolchain_path_vars(key: &CToolchainKey) -> [(&'static str, BTreeSet<String>); 2] {
+    let dirs = |paths: &mut dyn Iterator<Item = &PathBuf>| {
+        paths
+            .filter_map(|path| {
+                Some(format!(
+                    "{TOOLCHAIN_DIR}{}",
+                    path.parent()?.to_string_lossy()
+                ))
+            })
+            .collect()
+    };
+    let programs = key.internal_files.iter().filter(|file| file.is_program());
+    [
+        ("LD_LIBRARY_PATH", dirs(&mut key.libraries.iter())),
+        ("COMPILER_PATH", dirs(&mut programs.map(|file| &file.path))),
+    ]
+}
+
+/// Exports that make the input root's copy of the `key` toolchain load its own libraries and
+/// run its own internal programs. gcc finds `as` on `PATH` otherwise, and the worker's would
+/// run.
+fn c_toolchain_exports(key: &CToolchainKey) -> String {
+    let mut exports = "unset GCC_EXEC_PREFIX COMPILER_PATH\n".to_owned();
+    for (name, dirs) in c_toolchain_path_vars(key) {
+        if !dirs.is_empty() {
+            let dirs: Vec<String> = (dirs.iter())
+                .map(|dir| format!("\"$PWD\"/{}", sh_quote(dir)))
+                .collect();
+            exports.push_str(&format!("export {name}={}\n", dirs.join(":")));
+        }
+    }
+    exports
 }
 
 /// The command that prints the toolchain's `rustc -vV`, run the way compiles run rustc.
@@ -1119,19 +1156,14 @@ pub(super) mod test {
     #[cfg(unix)]
     #[test]
     fn test_the_command_runs_rustc_with_worker_paths() {
-        use std::os::unix::fs::PermissionsExt;
         let worker_root = tempfile::tempdir().unwrap();
         let worker_root = worker_root.path().canonicalize().unwrap();
-        let rustc = worker_root.join(".sccache-toolchain/bin/rustc");
-        std::fs::create_dir_all(rustc.parent().unwrap()).unwrap();
         // A fake rustc in a shell that doesn't set GIT_HASH itself, as bash does HOSTNAME.
-        std::fs::write(
-            &rustc,
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" \"OUT_DIR=$OUT_DIR\" \"GIT_HASH=${GIT_HASH-unset}\" \
+        crate::test::utils::write_executable(
+            &worker_root.join(".sccache-toolchain/bin/rustc"),
+            "printf '%s\\n' \"$@\" \"OUT_DIR=$OUT_DIR\" \"GIT_HASH=${GIT_HASH-unset}\" \
              \"LD_LIBRARY_PATH=$LD_LIBRARY_PATH\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let command = build_command(&reapi_compile_in("/home/a/ws"));
         let output = std::process::Command::new(&command.arguments[0])
             .args(&command.arguments[1..])
@@ -1164,35 +1196,57 @@ pub(super) mod test {
         }
     }
 
+    /// A gcc compile of `src/x.c` whose driver is `/usr/bin/gcc`.
+    fn gcc_compile() -> ReapiCompile {
+        let internal_files = vec![
+            internal_file("-print-prog-name=as", "/usr/bin/as"),
+            internal_file("-print-prog-name=cc1", "/usr/lib/gcc/12/cc1"),
+            internal_file("-print-file-name=specs", "/usr/lib/gcc/12/specs"),
+        ];
+        let libraries = vec!["/lib/x/libz.so.1".into(), "/usr/lib/libgmp.so.10.4".into()];
+        ReapiCompile {
+            arguments: vec!["-c".to_owned(), "src/x.c".to_owned()],
+            program: WorkerProgram::C,
+            toolchain: ToolchainKey::C(CToolchainKey::with_libraries(
+                CCompilerKind::Gcc,
+                "/usr/bin/gcc".into(),
+                internal_files,
+                libraries,
+            )),
+            ..reapi_compile_in("/home/a/ws")
+        }
+    }
+
+    /// Runs `command` in `worker_root` with `GCC_EXEC_PREFIX` set, as a worker's env could.
+    #[cfg(unix)]
+    fn run_in_worker_root(command: &remexec::Command, worker_root: &Path) -> process::Output {
+        std::process::Command::new(&command.arguments[0])
+            .args(&command.arguments[1..])
+            .current_dir(worker_root)
+            .env("GCC_EXEC_PREFIX", "/opt/gcc/")
+            .output()
+            .unwrap()
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_a_c_command_runs_the_driver_from_the_toolchain_dir() {
-        use std::os::unix::fs::PermissionsExt;
         let worker_root = tempfile::tempdir().unwrap();
         let worker_root = worker_root.path().canonicalize().unwrap();
-        let driver = worker_root.join(".sccache-toolchain/usr/bin/gcc");
-        std::fs::create_dir_all(driver.parent().unwrap()).unwrap();
-        std::fs::write(&driver, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
-        std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let compile = ReapiCompile {
-            arguments: vec!["-c".to_owned(), "src/x.c".to_owned()],
-            program: WorkerProgram::C,
-            toolchain: ToolchainKey::C(
-                CToolchainKey::new(CCompilerKind::Gcc, "/usr/bin/gcc".into(), vec![]).unwrap(),
-            ),
-            ..reapi_compile_in("/home/a/ws")
-        };
-        let command = build_command(&compile);
-        let output = std::process::Command::new(&command.arguments[0])
-            .args(&command.arguments[1..])
-            .current_dir(&worker_root)
-            .output()
-            .unwrap();
+        let script =
+            "printf '%s\\n' \"$@\" \"$LD_LIBRARY_PATH\" \"$COMPILER_PATH\" \"$GCC_EXEC_PREFIX\"\n";
+        crate::test::utils::write_executable(
+            &worker_root.join(".sccache-toolchain/usr/bin/gcc"),
+            script,
+        );
+        let output = run_in_worker_root(&build_command(&gcc_compile()), &worker_root);
         assert!(output.status.success(), "{output:?}");
+        let root = worker_root.display();
         assert_eq!(
             format!(
-                "-c\nsrc/x.c\n-ffile-prefix-map={}=.\n",
-                worker_root.display()
+                "-c\nsrc/x.c\n-ffile-prefix-map={root}=.\n\
+                 {root}/.sccache-toolchain/lib/x:{root}/.sccache-toolchain/usr/lib\n\
+                 {root}/.sccache-toolchain/usr/bin:{root}/.sccache-toolchain/usr/lib/gcc/12\n\n"
             ),
             String::from_utf8(output.stdout).unwrap()
         );
@@ -1686,6 +1740,60 @@ pub(super) mod test {
             &env_vars,
         );
         Some(key.unwrap())
+    }
+
+    /// Copies `toolchain`'s files into `worker_root`, as a worker does.
+    #[cfg(target_os = "linux")]
+    pub(in crate::reapi) fn put_in_worker_root(
+        toolchain: &[(InputRootFile, PathBuf)],
+        worker_root: &Path,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        for (file, local_path) in toolchain {
+            let path = worker_root.join(&file.path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::copy(local_path, &path).unwrap();
+            let mode = if file.is_executable { 0o755 } else { 0o644 };
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_a_worker_runs_the_toolchains_own_programs() {
+        let Some(key) = local_c_toolchain(&CCompilerKind::Gcc) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let worker_root = dir.path().canonicalize().unwrap().join("worker");
+        let digest_cache = DigestCache::load(dir.path().join("digests"));
+        let toolchain = c_toolchain_files(&key, &digest_cache).unwrap();
+        put_in_worker_root(&toolchain, &worker_root);
+        let compile = ReapiCompile {
+            program: WorkerProgram::C,
+            toolchain: ToolchainKey::C(key.clone()),
+            arguments: vec![],
+            ..reapi_compile_in("/ws")
+        };
+        let command = build_command(&compile);
+        for file in &key.internal_files {
+            let output = std::process::Command::new(&command.arguments[0])
+                .args(&command.arguments[1..])
+                .arg(&file.option)
+                .current_dir(&worker_root)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let in_worker_root = worker_root
+                .join(TOOLCHAIN_DIR)
+                .join(file.path.strip_prefix("/").unwrap());
+            // gcc prints a path relative to its driver's directory.
+            let printed = String::from_utf8(output.stdout).unwrap();
+            let printed = crate::reapi::lexically_normalize(Path::new(printed.trim_end()));
+            assert_eq!(in_worker_root, printed, "{}", file.option);
+        }
     }
 
     #[cfg(target_os = "linux")]
