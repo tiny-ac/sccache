@@ -63,10 +63,6 @@ pub(crate) struct PreprocessedSource {
     /// Removes the file when the CLI's compile ends. The daemon's copy of the compile has
     /// `None` here, so it leaves the file.
     #[serde(skip)]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "C misses don't compile as a worker yet")
-    )]
     pub(super) temp_path: Option<TempPath>,
 }
 

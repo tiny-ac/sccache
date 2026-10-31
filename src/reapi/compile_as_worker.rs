@@ -121,6 +121,18 @@ impl CompileAsWorker {
     }
 }
 
+/// Compiles with `as_worker`, when REAPI could run the compile, or else with `local_compile`.
+pub(crate) async fn run_as_worker_or_locally<T: CommandCreatorSync>(
+    as_worker: Option<&CompileAsWorker>,
+    local_compile: &LocalCompile<'_, T>,
+    out_pretty: &str,
+) -> Result<process::Output> {
+    match as_worker {
+        Some(as_worker) => as_worker.run(local_compile, out_pretty).await,
+        None => local_compile.run().await,
+    }
+}
+
 /// Moves `from` to `to`, through a copy next to `to` when they're on different filesystems.
 fn move_file(from: &Path, to: &Path) -> Result<()> {
     if std::fs::rename(from, to).is_ok() {

@@ -23,6 +23,7 @@ use super::client::{
     ConnectOptions, RPC_TIMEOUT, RUSTC_VERSION_MNEMONIC, check_connect_options,
     credential_helper_uri, loggable, rpc_code,
 };
+use super::compile_as_worker::{CompileAsWorker, run_as_worker_or_locally};
 use super::connection::{Connection, ServerApis};
 use super::credential_helper::{self, CredentialHelper};
 use super::digest::DigestCache;
@@ -919,7 +920,7 @@ impl<T: CommandCreatorSync> RemoteExecutor<T> for ReapiExecutor {
             local_compile_changed,
             ..
         } = job;
-        let mapped = map_miss(
+        let mut mapped = map_miss(
             compilation,
             cache_control,
             local_compile_changed,
@@ -927,12 +928,18 @@ impl<T: CommandCreatorSync> RemoteExecutor<T> for ReapiExecutor {
             &out_pretty,
         )
         .await;
+        let as_worker = mapped.as_mut().ok().and_then(CompileAsWorker::new);
         match self.compile_through_reapi(mapped, &out_pretty).await {
             Ok((outcome, output)) => Ok((DistType::Reapi(outcome), output)),
             Err(CompileLocally {
                 reason,
                 local_slot: _local_slot,
-            }) => Ok((compiled_locally(reason), local_compile.run().await?)),
+            }) => {
+                let output =
+                    run_as_worker_or_locally(as_worker.as_ref(), &local_compile, &out_pretty)
+                        .await?;
+                Ok((compiled_locally(reason), output))
+            }
         }
     }
 }
@@ -940,6 +947,7 @@ impl<T: CommandCreatorSync> RemoteExecutor<T> for ReapiExecutor {
 #[cfg(test)]
 pub(super) mod test {
     use super::*;
+    use crate::compiler::CCompilerKind;
     use crate::compiler::{
         CacheControl, Cacheable, CompileCommand, LocalArg, SingleCompileCommand,
     };
@@ -947,13 +955,14 @@ pub(super) mod test {
     use crate::mock_command::{MockChild, MockCommandCreator, exit_status};
     use crate::reapi::client::RUSTC_MNEMONIC;
     use crate::reapi::fake::FakeServer;
+    use crate::reapi::mapping::CToolchainKey;
     use crate::reapi::mapping::WorkerProgram;
     use crate::reapi::pause::FAILURES_TO_PAUSE;
     use crate::reapi::proto::build::bazel::remote::execution::v2 as remexec;
     use crate::reapi::remote_compile::test::{fake_sysroot, inline_output, worker_result};
-    use crate::reapi::{PathMapper, ToolchainKey};
+    use crate::reapi::{PathMapper, PreprocessedSource, ToolchainKey};
     use crate::server::SccacheService;
-    use crate::test::utils::{new_creator, next_command};
+    use crate::test::utils::{new_creator, next_command, next_command_calls};
     use std::ffi::OsString;
     use std::num::NonZeroUsize;
     use std::sync::Mutex;
@@ -964,6 +973,7 @@ pub(super) mod test {
     const TARGET_TRIPLE: &str = "x86_64-unknown-linux-gnu";
     const COMMIT_HASH: &str = "abc123";
     pub(in crate::reapi) const RLIB: &str = "target/debug/deps/libfoo.rlib";
+    pub(in crate::reapi) const C_OBJECT: &str = "target/debug/build/foo-1/out/x.o";
 
     #[derive(Clone, Copy)]
     pub(in crate::reapi) enum Eligibility {
@@ -972,6 +982,9 @@ pub(super) mod test {
         UsesProcMacro,
         Ineligible,
         Panics,
+        /// A C compile of `ws/src/x.c` into [`C_OBJECT`], whose compile as a worker writes
+        /// `object`.
+        EligibleC,
     }
 
     /// A compile of `dir/ws/src/lib.rs` into `dir/ws/target/debug/deps/libfoo.rlib` with the
@@ -997,14 +1010,35 @@ pub(super) mod test {
 
         fn map_for_reapi(
             &self,
-            _preprocessed_dir: &Path,
+            preprocessed_dir: &Path,
         ) -> std::result::Result<ReapiCompile, crate::reapi::NotEligible> {
+            let ws = self.dir.join("ws");
             match self.eligibility {
                 Eligibility::Eligible | Eligibility::UsesProcMacro => {}
                 Eligibility::Ineligible => return Err(CompileLocallyReason::Staticlib.into()),
                 Eligibility::Panics => panic!("map_for_reapi"),
+                Eligibility::EligibleC => {
+                    std::fs::create_dir_all(preprocessed_dir).unwrap();
+                    let source = tempfile::NamedTempFile::new_in(preprocessed_dir).unwrap();
+                    let driver = self.dir.join("gcc");
+                    std::fs::write(&driver, "#!/bin/sh\n").unwrap();
+                    return Ok(ReapiCompile {
+                        path_mapper: PathMapper::new(ws.clone(), ws.join("target")),
+                        arguments: vec!["-c".to_owned(), "src/x.c".to_owned()],
+                        program: WorkerProgram::C,
+                        toolchain: ToolchainKey::C(
+                            CToolchainKey::new(CCompilerKind::Gcc, driver, vec![]).unwrap(),
+                        ),
+                        env: Default::default(),
+                        input_root_files: vec![],
+                        preprocessed_source: Some(PreprocessedSource::new(
+                            source.into_temp_path(),
+                            "src/x.c".to_owned(),
+                        )),
+                        outputs: vec![ws.join(C_OBJECT)],
+                    });
+                }
             }
-            let ws = self.dir.join("ws");
             Ok(ReapiCompile {
                 path_mapper: PathMapper::new(ws.clone(), ws.join("target")),
                 arguments: vec![],
@@ -1096,8 +1130,10 @@ pub(super) mod test {
             let lib_rs = dir.path().join("ws/src/lib.rs");
             std::fs::create_dir_all(lib_rs.parent().unwrap()).unwrap();
             std::fs::write(&lib_rs, "pub fn f() {}").unwrap();
-            // Cargo creates the output directory before running rustc.
+            // Cargo creates the output directories before running rustc and build scripts.
             std::fs::create_dir_all(dir.path().join("ws/target/debug/deps")).unwrap();
+            let c_object = dir.path().join("ws").join(C_OBJECT);
+            std::fs::create_dir_all(c_object.parent().unwrap()).unwrap();
             Fixture {
                 runtime,
                 server,
@@ -1200,6 +1236,9 @@ pub(super) mod test {
             let creators: Vec<_> = (0..n).map(|_| new_creator()).collect();
             let compiles: Vec<_> = (creators.iter())
                 .map(|creator| {
+                    if let Eligibility::EligibleC = self.eligibility {
+                        next_command_calls(creator, write_object_as_worker);
+                    }
                     next_command(creator, Ok(MockChild::new(exit_status(0), "out", "err")));
                     let command = SingleCompileCommand {
                         executable: "rustc".into(),
@@ -1232,6 +1271,19 @@ pub(super) mod test {
                 .expect("the compiles didn't end");
             compiled.into_iter().map(Result::unwrap).collect()
         }
+    }
+
+    /// Writes `object` where a compile as a worker in the root that `args` map to `.` writes
+    /// [`C_OBJECT`].
+    fn write_object_as_worker(args: &[OsString]) -> Result<MockChild> {
+        let root = (args.iter())
+            .find_map(|arg| arg.to_str()?.strip_prefix("-ffile-prefix-map="))
+            .and_then(|map| map.strip_suffix("=."))
+            .expect("a prefix map of the root");
+        let object = Path::new(root).join(".sccache-build/debug/build/foo-1/out/x.o");
+        std::fs::create_dir_all(object.parent().unwrap())?;
+        std::fs::write(object, "object")?;
+        Ok(MockChild::new(exit_status(0), "worker out", ""))
     }
 
     /// Compiles with the config changed by `configure`, which gets the fixture's temp dir.
@@ -2004,6 +2056,16 @@ pub(super) mod test {
         fixture.config.salt = "2".to_owned();
         let (dist_type, _) = fixture.compile();
         assert_eq!(compiled_locally("not in the action cache"), dist_type);
+    }
+
+    #[test]
+    fn test_a_c_miss_compiles_locally_as_a_worker_does() {
+        let fixture = Fixture::new(Eligibility::EligibleC);
+        let (dist_type, output) = fixture.compile();
+        assert_eq!(compiled_locally("not in the action cache"), dist_type);
+        assert_eq!(b"worker out", output.stdout.as_slice());
+        let object = std::fs::read(fixture.dir.path().join("ws").join(C_OBJECT)).unwrap();
+        assert_eq!(b"object", object.as_slice());
     }
 
     #[test]
