@@ -63,7 +63,11 @@ pub(crate) struct PreprocessedSource {
     /// Removes the file when the CLI's compile ends. The daemon's copy of the compile has
     /// `None` here, so it leaves the file.
     #[serde(skip)]
-    _temp_path: Option<TempPath>,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "C misses don't compile as a worker yet")
+    )]
+    pub(super) temp_path: Option<TempPath>,
 }
 
 impl PreprocessedSource {
@@ -71,7 +75,7 @@ impl PreprocessedSource {
         PreprocessedSource {
             path: temp_path.to_path_buf(),
             mapped_path,
-            _temp_path: Some(temp_path),
+            temp_path: Some(temp_path),
         }
     }
 }
@@ -495,7 +499,7 @@ impl std::fmt::Display for CompileLocallyReason {
 }
 
 /// Maps local paths under the cwd and build root to input-root-relative paths.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct PathMapper {
     cwd: PathBuf,
     build_root: PathBuf,
