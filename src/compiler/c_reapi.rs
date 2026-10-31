@@ -64,9 +64,6 @@ const GCC_INTERNAL_FILES: &[&str] = &[
     "-print-file-name=specs",
 ];
 
-/// Off while workers can't run a C toolchain, which keeps every C compile local.
-const WORKERS_RUN_C_COMPILES: bool = false;
-
 /// The compile of `parsed_args` by `executable` in `cwd`, mapped for REAPI with its
 /// preprocessed source under `preprocessed_dir`, or why it runs locally. Runs the compiler, so
 /// call it from a blocking thread.
@@ -114,9 +111,6 @@ fn map_compile_for_workers(
     env_vars: &[(OsString, OsString)],
 ) -> Result<MappedCompile, NotEligible> {
     let mapped = map_compile(kind, parsed_args, cwd, env_vars)?;
-    if !WORKERS_RUN_C_COMPILES {
-        return Err(CompileLocallyReason::CToolchainUnsupported.into());
-    }
     // A non-Linux client's compiler doesn't run on Linux workers.
     if !cfg!(target_os = "linux") {
         return Err(CompileLocallyReason::NonLinuxToolchain.into());
@@ -752,7 +746,7 @@ mod test {
         let parsed_args = parse(&Gcc, Path::new(WS), &all_args);
         let env_vars = env_vars(BUILD_SCRIPT_ENV);
         let changes = reapi_local_compile_changes(&Gcc, &parsed_args, Path::new(WS), &env_vars);
-        let worker_could = WORKERS_RUN_C_COMPILES && cfg!(target_os = "linux") && args.is_empty();
+        let worker_could = cfg!(target_os = "linux") && args.is_empty();
         assert_eq!(
             worker_could,
             changes.is_some_and(|changes| changes.runs_remote_command)
@@ -1164,7 +1158,7 @@ const char *s = "/w\"s/src/x.c";
 
     #[test_case(CCompilerKind::Gcc ; "gcc")]
     #[test_case(CCompilerKind::Clang ; "clang")]
-    fn test_mapped_compiles_wait_for_the_c_toolchain(kind: CCompilerKind) {
+    fn test_only_a_linux_client_sends_c_compiles_to_workers(kind: CCompilerKind) {
         let dir = tempfile::tempdir().unwrap();
         let Some(c) = checkout(&kind, &dir.path().join("ws"), &[]) else {
             return;
@@ -1178,7 +1172,15 @@ const char *s = "/w\"s/src/x.c";
             &c.env_vars,
             &preprocessed,
         );
-        assert_eq!(CompileLocallyReason::CToolchainUnsupported, reason(mapped));
+        if cfg!(target_os = "linux") {
+            let compile = mapped.unwrap();
+            assert!(
+                matches!(compile.toolchain, ToolchainKey::C(_)),
+                "{compile:?}"
+            );
+        } else {
+            assert_eq!(CompileLocallyReason::NonLinuxToolchain, reason(mapped));
+        }
     }
 
     #[test_case(CCompilerKind::Gcc ; "gcc")]
