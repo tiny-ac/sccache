@@ -176,6 +176,16 @@ do not increment the aggregate error counters, even if the chain is exhausted.
 If the chain returns raw bytes that the CLI cannot open as an archive, the CLI
 reports a read error rather than trying another tier.
 
+With distributed compilation configured, the daemon also owns the dist client.
+The CLI asks with `Dist(DistIpcRequest::GetDistClientSetup)` whether the daemon has
+one, and for its settings that affect cache keys. On a cache miss the CLI
+packages the compile's inputs into a temporary file and sends
+`Dist(DistIpcRequest::CompileOnCluster)` with its path; the daemon runs the
+compile on the build cluster and writes the outputs where a local compile would.
+When the daemon has no toolchain archive for the compiler, it answers
+`NeedToolchain` and the CLI sends the request again with the toolchain packaged,
+or with the packaging error.
+
 Client-side mode is enabled with the `SCCACHE_CLIENT_SIDE` environment variable
 (or the `client_side_mode` config key). It is expected to become the only
 supported configuration in the future, with server-side mode eventually
@@ -183,7 +193,7 @@ removed. It is currently mutually exclusive with:
 
 - **logging** (`SCCACHE_LOG`): the client always logs to stderr, ignoring `SCCACHE_ERROR_LOG`
   (concurrent CLI processes would race on a shared log file), and
-- **distributed compilation** (a configured scheduler URL).
+- **REAPI** (`[dist.reapi]`), whose executor runs in the daemon.
 
 If either is in use, the setting is ignored and sccache stays in server-side
 mode.
