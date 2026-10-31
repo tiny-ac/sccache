@@ -14,7 +14,10 @@
 
 //! An in-memory REAPI server for tests.
 
-use super::client::{Client, ConnectOptions, REQUEST_METADATA_HEADER, RUSTC_MNEMONIC};
+use super::client::{
+    CPP_COMPILER_CHECK_MNEMONIC, Client, ConnectOptions, REQUEST_METADATA_HEADER, RUSTC_MNEMONIC,
+    RUSTC_VERSION_MNEMONIC,
+};
 use super::digest;
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use super::proto::google::bytestream::byte_stream_server::{ByteStream, ByteStreamServer};
@@ -97,6 +100,8 @@ pub(crate) struct FakeServer {
     /// The commit hash `rustc -vV` prints on the workers; `None` fails it, as on a worker
     /// that can't run the toolchain.
     pub(crate) worker_rustc_commit_hash: Mutex<Option<String>>,
+    /// What the check of a gcc or clang toolchain prints on the workers; `None` fails it.
+    pub(crate) worker_c_compiler_stdout: Mutex<Option<String>>,
     /// Forgets every blob at the next Execute, as a CAS that evicted them.
     pub(crate) forget_blobs_at_next_execute: AtomicBool,
     pub(crate) execute_calls: AtomicUsize,
@@ -222,16 +227,19 @@ impl FakeServer {
         }
     }
 
-    fn record_request_metadata<T>(&self, method: &'static str, request: &Request<T>) {
+    /// Records the request's `RequestMetadata`, and returns its action mnemonic.
+    fn record_request_metadata<T>(&self, method: &'static str, request: &Request<T>) -> String {
         let request_metadata = request
             .metadata()
             .get_bin(REQUEST_METADATA_HEADER)
             .map(|value| remexec::RequestMetadata::decode(value.to_bytes().unwrap()).unwrap())
             .unwrap_or_default();
+        let action_mnemonic = request_metadata.action_mnemonic.clone();
         self.request_metadata
             .lock()
             .unwrap()
             .push((method, request_metadata));
+        action_mnemonic
     }
 
     /// Serves on a new local port and returns its `grpc://` endpoint.
@@ -753,20 +761,25 @@ impl FakeServer {
         Ok(())
     }
 
-    /// Writes the outputs `command` declares that are in `worker_outputs`, or prints
-    /// `rustc -vV` into the CAS, as servers that don't inline stdout do.
-    fn run(&self, command: &remexec::Command) -> remexec::ActionResult {
+    /// Writes the outputs `command` declares that are in `worker_outputs`, or, for a toolchain
+    /// check's `action_mnemonic`, prints its answers into the CAS, as servers that don't inline
+    /// stdout do.
+    fn run(&self, command: &remexec::Command, action_mnemonic: &str) -> remexec::ActionResult {
         self.actions_run.fetch_add(1, Ordering::SeqCst);
-        if command
-            .arguments
-            .last()
-            .is_some_and(|script| script.ends_with("/bin/rustc -vV\n"))
-        {
-            return match &*self.worker_rustc_commit_hash.lock().unwrap() {
-                Some(commit_hash) => remexec::ActionResult {
-                    stdout_digest: Some(self.insert_blob(
-                        format!("rustc 1.0.0\ncommit-hash: {commit_hash}\n").as_bytes(),
-                    )),
+        let check_stdout = match action_mnemonic {
+            RUSTC_VERSION_MNEMONIC => Some(
+                (self.worker_rustc_commit_hash.lock().unwrap().as_ref())
+                    .map(|commit_hash| format!("rustc 1.0.0\ncommit-hash: {commit_hash}\n")),
+            ),
+            CPP_COMPILER_CHECK_MNEMONIC => {
+                Some(self.worker_c_compiler_stdout.lock().unwrap().clone())
+            }
+            _ => None,
+        };
+        if let Some(stdout) = check_stdout {
+            return match stdout {
+                Some(stdout) => remexec::ActionResult {
+                    stdout_digest: Some(self.insert_blob(stdout.as_bytes())),
                     ..Default::default()
                 },
                 None => remexec::ActionResult {
@@ -872,7 +885,7 @@ impl Execution for FakeServer {
         &self,
         request: Request<remexec::ExecuteRequest>,
     ) -> RpcResult<Self::ExecuteStream> {
-        self.record_request_metadata("Execute", &request);
+        let action_mnemonic = self.record_request_metadata("Execute", &request);
         self.execute_calls.fetch_add(1, Ordering::SeqCst);
         if take_one(&self.executes_to_refuse) {
             return Err(Status::unavailable("every worker is busy"));
@@ -949,7 +962,7 @@ impl Execution for FakeServer {
                 ..Default::default()
             },
             None => {
-                let result = self.run(&command);
+                let result = self.run(&command, &action_mnemonic);
                 // Servers commonly leave failed results out of the action cache.
                 if result.exit_code == 0 && !action.do_not_cache {
                     self.action_results

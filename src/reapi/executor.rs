@@ -20,20 +20,23 @@
 use super::auth_token::{self, AuthToken};
 use super::cas::UnreadableBlob;
 use super::client::{
-    ConnectOptions, RPC_TIMEOUT, RUSTC_VERSION_MNEMONIC, check_connect_options,
-    credential_helper_uri, loggable, rpc_code,
+    CPP_COMPILER_CHECK_MNEMONIC, ConnectOptions, RPC_TIMEOUT, RUSTC_VERSION_MNEMONIC,
+    check_connect_options, credential_helper_uri, loggable, rpc_code,
 };
 use super::compile_as_worker::{CompileAsWorker, run_as_worker_or_locally};
 use super::connection::{Connection, ServerApis};
 use super::credential_helper::{self, CredentialHelper};
 use super::digest::DigestCache;
 use super::execution::{Execution, MissingActionBlobs, QueuedTooLong};
-use super::mapping::{CompileLocallyReason, ReapiCompile, RustcToolchainKey, ToolchainKey};
+use super::mapping::{
+    CToolchainKey, CompileLocallyReason, ReapiCompile, RustcToolchainKey, ToolchainKey,
+};
 use super::pause::Pause;
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use super::remote_compile::{
-    ACTION_TIMEOUT, ActionBlobs, ActionOptions, action_blobs, digest_input_root_files,
-    download_stdout_or_stderr, materialize, materialize_failure_reason, rustc_version_action_blobs,
+    ACTION_TIMEOUT, ActionBlobs, ActionOptions, action_blobs, c_compiler_check_action_blobs,
+    digest_input_root_files, download_stdout_or_stderr, local_c_compiler_answers, materialize,
+    materialize_failure_reason, rustc_version_action_blobs, worker_c_compiler_answers,
 };
 use super::toolchains::{ToolchainFiles, Toolchains};
 use super::worker_toolchains::WorkerToolchains;
@@ -477,7 +480,10 @@ impl ReapiExecutor {
                 | CompileLocallyReason::HashingInputsFailed
                 | CompileLocallyReason::DownloadingOutputsFailed
                 | CompileLocallyReason::RustcFailsOnWorkers
-                | CompileLocallyReason::RustcCommitDiffersOnWorkers),
+                | CompileLocallyReason::RustcCommitDiffersOnWorkers
+                | CompileLocallyReason::CCompilerFailsLocally
+                | CompileLocallyReason::CCompilerFailsOnWorkers
+                | CompileLocallyReason::CCompilerDiffersOnWorkers),
             ) => {
                 return Err(reason);
             }
@@ -541,9 +547,10 @@ impl ReapiExecutor {
                         self.run_rustc_on_worker(apis, execution, key, toolchain, out_pretty)
                             .await
                     }
-                    ToolchainKey::C(_) => Ok(ToolchainOnWorkers::Unusable(
-                        CompileLocallyReason::CToolchainUnsupported,
-                    )),
+                    ToolchainKey::C(key) => {
+                        self.run_c_compiler_on_worker(apis, execution, key, toolchain, out_pretty)
+                            .await
+                    }
                 };
                 if let Err(reason) = checked {
                     *check.failures.lock().unwrap() = (failures + 1, Some(reason));
@@ -595,6 +602,65 @@ impl ReapiExecutor {
             );
             return Ok(ToolchainOnWorkers::Unusable(
                 CompileLocallyReason::RustcCommitDiffersOnWorkers,
+            ));
+        }
+        Ok(ToolchainOnWorkers::Matches)
+    }
+
+    /// Checks that the input root's copy of the `key` toolchain answers as the local one.
+    async fn run_c_compiler_on_worker(
+        &self,
+        apis: &ServerApis,
+        execution: &Execution,
+        key: &CToolchainKey,
+        toolchain: &ToolchainFiles,
+        out_pretty: &str,
+    ) -> std::result::Result<ToolchainOnWorkers, CompileLocallyReason> {
+        let driver = key.driver.display();
+        let local_key = key.clone();
+        let local = tokio::task::spawn_blocking(move || local_c_compiler_answers(&local_key))
+            .await
+            .map_err(Error::from)
+            .flatten();
+        let local = match local {
+            Ok(local) => local,
+            Err(e) => {
+                warn!(
+                    "REAPI: {driver} fails its check locally; compiling its misses locally: {e:#}"
+                );
+                return Ok(ToolchainOnWorkers::Unusable(
+                    CompileLocallyReason::CCompilerFailsLocally,
+                ));
+            }
+        };
+        let (files, worker_key, action_options) =
+            (toolchain.clone(), key.clone(), self.action_options.clone());
+        let stdout = self
+            .run_check_on_worker(
+                apis,
+                execution,
+                CPP_COMPILER_CHECK_MNEMONIC,
+                &format!("the check of {driver}"),
+                move || c_compiler_check_action_blobs(&worker_key, &files, &action_options),
+                out_pretty,
+            )
+            .await?;
+        let Some(stdout) = stdout else {
+            return Ok(ToolchainOnWorkers::Unusable(
+                CompileLocallyReason::CCompilerFailsOnWorkers,
+            ));
+        };
+        let worker = worker_c_compiler_answers(key, &String::from_utf8_lossy(&stdout));
+        if worker.as_ref() != Ok(&local) {
+            warn!(
+                "REAPI: {driver} answers {} on the workers and {local:?} locally; compiling its \
+                 misses locally",
+                loggable(&stdout)
+            );
+            return Ok(ToolchainOnWorkers::Unusable(
+                worker
+                    .err()
+                    .unwrap_or(CompileLocallyReason::CCompilerDiffersOnWorkers),
             ));
         }
         Ok(ToolchainOnWorkers::Matches)
@@ -976,16 +1042,15 @@ pub(super) mod test {
     };
     use crate::dist;
     use crate::mock_command::{MockChild, MockCommandCreator, exit_status};
-    use crate::reapi::client::RUSTC_MNEMONIC;
+    use crate::reapi::client::{CPP_COMPILE_MNEMONIC, RUSTC_MNEMONIC};
     use crate::reapi::fake::FakeServer;
-    use crate::reapi::mapping::CToolchainKey;
-    use crate::reapi::mapping::WorkerProgram;
+    use crate::reapi::mapping::{CToolchainKey, InternalFile, WorkerProgram};
     use crate::reapi::pause::FAILURES_TO_PAUSE;
     use crate::reapi::proto::build::bazel::remote::execution::v2 as remexec;
     use crate::reapi::remote_compile::test::{fake_sysroot, inline_output, worker_result};
     use crate::reapi::{PathMapper, PreprocessedSource, ToolchainKey};
     use crate::server::SccacheService;
-    use crate::test::utils::{new_creator, next_command, next_command_calls};
+    use crate::test::utils::{new_creator, next_command, next_command_calls, write_executable};
     use std::ffi::OsString;
     use std::num::NonZeroUsize;
     use std::sync::Mutex;
@@ -997,6 +1062,17 @@ pub(super) mod test {
     const COMMIT_HASH: &str = "abc123";
     pub(in crate::reapi) const RLIB: &str = "target/debug/deps/libfoo.rlib";
     pub(in crate::reapi) const C_OBJECT: &str = "target/debug/build/foo-1/out/x.o";
+    /// The script of a gcc driver for [`Eligibility::EligibleC`] that answers its check with
+    /// `version`.
+    fn c_driver_script(version: &str) -> String {
+        format!(
+            "case $1 in\n\
+             -dumpmachine) echo x86_64-linux-gnu ;;\n\
+             --version) printf 'gcc {version}\\nCopyright\\n' ;;\n\
+             *) exit 1 ;;\n\
+             esac\n"
+        )
+    }
 
     #[derive(Clone, Copy)]
     pub(in crate::reapi) enum Eligibility {
@@ -1005,8 +1081,8 @@ pub(super) mod test {
         UsesProcMacro,
         Ineligible,
         Panics,
-        /// A C compile of `ws/src/x.c` into [`C_OBJECT`], whose compile as a worker writes
-        /// `object`.
+        /// A C compile of `ws/src/x.c` into [`C_OBJECT`] by `gcc-<c_version>`, whose compile
+        /// as a worker writes `object`.
         EligibleC,
     }
 
@@ -1016,6 +1092,7 @@ pub(super) mod test {
         eligibility: Eligibility,
         dir: PathBuf,
         commit_hash: String,
+        c_version: &'static str,
     }
 
     impl Compilation<Creator> for FakeCompilation {
@@ -1043,14 +1120,27 @@ pub(super) mod test {
                 Eligibility::EligibleC => {
                     std::fs::create_dir_all(preprocessed_dir).unwrap();
                     let source = tempfile::NamedTempFile::new_in(preprocessed_dir).unwrap();
-                    let driver = self.dir.join("gcc");
-                    std::fs::write(&driver, "#!/bin/sh\n").unwrap();
+                    let driver = self.dir.join(format!("gcc-{}", self.c_version));
+                    let cc1 = self.dir.join("cc1");
+                    // Writing them again would change the toolchain key.
+                    if !driver.exists() {
+                        write_executable(&driver, &c_driver_script(self.c_version));
+                        std::fs::write(&cc1, "cc1").unwrap();
+                    }
                     return Ok(ReapiCompile {
                         path_mapper: PathMapper::new(ws.clone(), ws.join("target")),
                         arguments: vec!["-c".to_owned(), "src/x.c".to_owned()],
                         program: WorkerProgram::C,
                         toolchain: ToolchainKey::C(
-                            CToolchainKey::new(CCompilerKind::Gcc, driver, vec![]).unwrap(),
+                            CToolchainKey::new(
+                                CCompilerKind::Gcc,
+                                driver,
+                                vec![InternalFile {
+                                    option: "-print-prog-name=cc1".to_owned(),
+                                    path: cc1,
+                                }],
+                            )
+                            .unwrap(),
                         ),
                         env: Default::default(),
                         input_root_files: vec![],
@@ -1137,6 +1227,8 @@ pub(super) mod test {
         local_compile_changed: bool,
         /// The local rustc's, which makes the toolchain key.
         commit_hash: String,
+        /// The version of the C compile's gcc, which makes its toolchain key.
+        c_version: &'static str,
     }
 
     impl Fixture {
@@ -1166,6 +1258,7 @@ pub(super) mod test {
                 cache_control: CacheControl::Default,
                 local_compile_changed: true,
                 commit_hash: COMMIT_HASH.to_owned(),
+                c_version: "12",
             }
         }
 
@@ -1174,6 +1267,7 @@ pub(super) mod test {
                 eligibility: self.eligibility,
                 dir: self.dir.path().to_owned(),
                 commit_hash: self.commit_hash.clone(),
+                c_version: self.c_version,
             }
         }
 
@@ -1362,6 +1456,116 @@ pub(super) mod test {
         assert_eq!(3, fixture.server.execute_calls.load(Ordering::SeqCst));
     }
 
+    /// A fixture whose C misses execute, whose workers run the toolchain's gcc and write the
+    /// object.
+    fn executing_c_fixture() -> Fixture {
+        let mut fixture = Fixture::with_server(
+            Eligibility::EligibleC,
+            FakeServer {
+                executes_actions: true,
+                ..Default::default()
+            },
+        );
+        fixture.config.on_miss = ReapiOnMiss::Execute;
+        let object = ".sccache-build/debug/build/foo-1/out/x.o".to_owned();
+        (fixture.server.worker_outputs.lock().unwrap()).insert(object, b"object".to_vec());
+        *fixture.server.worker_c_compiler_stdout.lock().unwrap() = Some(c_compiler_check_stdout(
+            &fixture,
+            "x86_64-linux-gnu",
+            "gcc 12",
+        ));
+        fixture
+    }
+
+    /// What the fixture's gcc prints for its check on a worker, with `machine` and `version`.
+    fn c_compiler_check_stdout(fixture: &Fixture, machine: &str, version: &str) -> String {
+        let cc1 = fixture.dir.path().join("cc1");
+        format!(
+            "/worker\n{machine}\n/worker/.sccache-toolchain{}\n{version}\nCopyright\n",
+            cc1.display()
+        )
+    }
+
+    #[test]
+    fn test_a_c_compiler_is_checked_on_a_worker_once() {
+        let fixture = executing_c_fixture();
+        let executor = fixture.executor();
+        let (dist_type, _) = fixture.compile_with(&executor);
+        assert_eq!(DistType::Reapi(ReapiOutcome::Executed), dist_type);
+        let object = std::fs::read(fixture.dir.path().join("ws").join(C_OBJECT)).unwrap();
+        assert_eq!(b"object", object.as_slice());
+        fixture.server.action_results.lock().unwrap().clear();
+        let (dist_type, _) = fixture.compile_with(&executor);
+        assert_eq!(DistType::Reapi(ReapiOutcome::Executed), dist_type);
+        let execute_mnemonics: Vec<_> = (fixture.server.request_metadata.lock().unwrap())
+            .iter()
+            .filter(|(method, _)| *method == "Execute")
+            .map(|(_, request_metadata)| request_metadata.action_mnemonic.clone())
+            .collect();
+        assert_eq!(
+            vec![
+                CPP_COMPILER_CHECK_MNEMONIC,
+                CPP_COMPILE_MNEMONIC,
+                CPP_COMPILE_MNEMONIC
+            ],
+            execute_mnemonics
+        );
+    }
+
+    #[test_case::test_case(None, "gcc or clang fails its check on the workers" ; "fails")]
+    #[test_case::test_case(
+        Some(("aarch64-linux-gnu", "gcc 12")),
+        "gcc or clang on the workers differs from the local one" ;
+        "another target"
+    )]
+    #[test_case::test_case(
+        Some(("x86_64-linux-gnu", "gcc 13")),
+        "gcc or clang on the workers differs from the local one" ;
+        "another version"
+    )]
+    fn test_a_toolchain_whose_c_compiler_check_fails_compiles_locally(
+        answers: Option<(&str, &str)>,
+        reason: &str,
+    ) {
+        let fixture = executing_c_fixture();
+        *fixture.server.worker_c_compiler_stdout.lock().unwrap() =
+            answers.map(|(machine, version)| c_compiler_check_stdout(&fixture, machine, version));
+        let executor = fixture.executor();
+        for _ in 0..2 {
+            assert_eq!(compiled_locally(reason), fixture.compile_with(&executor).0);
+        }
+        // Only the check ran, once.
+        assert_eq!(1, fixture.server.execute_calls.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_a_c_compiler_that_runs_the_workers_own_program_compiles_locally() {
+        let fixture = executing_c_fixture();
+        // The worker's own cc1, at the client's path.
+        let cc1 = fixture.dir.path().join("cc1");
+        let stdout = format!(
+            "/worker\nx86_64-linux-gnu\n{}\ngcc 12\nCopyright\n",
+            cc1.display()
+        );
+        *fixture.server.worker_c_compiler_stdout.lock().unwrap() = Some(stdout);
+        assert_eq!(
+            compiled_locally("gcc or clang on the workers differs from the local one"),
+            fixture.compile().0
+        );
+    }
+
+    #[test]
+    fn test_a_c_compiler_that_fails_its_check_locally_compiles_locally() {
+        let fixture = executing_c_fixture();
+        write_executable(&fixture.dir.path().join("gcc-12"), "exit 1\n");
+        std::fs::write(fixture.dir.path().join("cc1"), "cc1").unwrap();
+        assert_eq!(
+            compiled_locally("gcc or clang fails its check locally"),
+            fixture.compile().0
+        );
+        assert_eq!(0, fixture.server.execute_calls.load(Ordering::SeqCst));
+    }
+
     #[test_case::test_case(None, "rustc -vV fails on the workers" ; "rustc fails")]
     #[test_case::test_case(
         Some("def456"),
@@ -1448,6 +1652,91 @@ pub(super) mod test {
             fixture.compile_with(&executor).0
         );
         fixture.commit_hash = COMMIT_HASH.to_owned();
+        assert_eq!(
+            DistType::Reapi(ReapiOutcome::Executed),
+            fixture.compile_with(&executor).0
+        );
+    }
+
+    #[test]
+    fn test_a_toolchain_known_to_fail_its_c_compiler_check_leaves_the_call_after_a_pause() {
+        let mut fixture = executing_c_fixture();
+        let executor = fixture.executor();
+        fixture.c_version = "13";
+        let c_differs = compiled_locally("gcc or clang on the workers differs from the local one");
+        assert_eq!(c_differs, fixture.compile_with(&executor).0);
+        fixture.c_version = "12";
+        pause_executions(&fixture, &executor);
+        fixture.c_version = "13";
+        assert_eq!(c_differs, fixture.compile_with(&executor).0);
+        fixture.c_version = "12";
+        assert_eq!(
+            DistType::Reapi(ReapiOutcome::Executed),
+            fixture.compile_with(&executor).0
+        );
+    }
+
+    #[test_case::test_case(false, "gcc or clang fails its check on the workers" ; "fails")]
+    #[test_case::test_case(
+        true,
+        "gcc or clang on the workers differs from the local one" ;
+        "differs"
+    )]
+    fn test_a_c_compiler_check_the_workers_answer_ends_a_pause(worker_answers: bool, reason: &str) {
+        let mut fixture = executing_c_fixture();
+        let executor = fixture.executor();
+        pause_executions(&fixture, &executor);
+        let gcc_13 = c_compiler_check_stdout(&fixture, "x86_64-linux-gnu", "gcc 13");
+        *fixture.server.worker_c_compiler_stdout.lock().unwrap() =
+            worker_answers.then(|| gcc_13.clone());
+        assert_eq!(compiled_locally(reason), fixture.compile_with(&executor).0);
+        *fixture.server.worker_c_compiler_stdout.lock().unwrap() = Some(gcc_13);
+        fixture.c_version = "13";
+        assert_eq!(
+            DistType::Reapi(ReapiOutcome::Executed),
+            fixture.compile_with(&executor).0
+        );
+    }
+
+    #[test_case::test_case(true, true, "gcc or clang fails its check locally" ; "fails locally")]
+    #[test_case::test_case(
+        false,
+        false,
+        "gcc or clang fails its check on the workers" ;
+        "fails on the workers"
+    )]
+    #[test_case::test_case(
+        false,
+        true,
+        "gcc or clang on the workers differs from the local one" ;
+        "differs"
+    )]
+    fn test_a_c_compiler_check_that_fails_doesnt_pause_executions(
+        fails_locally: bool,
+        worker_answers: bool,
+        reason: &str,
+    ) {
+        let mut fixture = executing_c_fixture();
+        let executor = fixture.executor();
+        let gcc_12 = (fixture.server.worker_c_compiler_stdout.lock().unwrap()).clone();
+        *fixture.server.worker_c_compiler_stdout.lock().unwrap() =
+            gcc_12.clone().filter(|_| worker_answers);
+        // A toolchain runs its check once, so only failures of several toolchains could pause.
+        let versions = ["13", "14", "15", "16"];
+        assert!(versions.len() > FAILURES_TO_PAUSE as usize);
+        for version in versions {
+            if fails_locally {
+                write_executable(
+                    &fixture.dir.path().join(format!("gcc-{version}")),
+                    "exit 1\n",
+                );
+                std::fs::write(fixture.dir.path().join("cc1"), "cc1").unwrap();
+            }
+            fixture.c_version = version;
+            assert_eq!(compiled_locally(reason), fixture.compile_with(&executor).0);
+        }
+        *fixture.server.worker_c_compiler_stdout.lock().unwrap() = gcc_12;
+        fixture.c_version = "12";
         assert_eq!(
             DistType::Reapi(ReapiOutcome::Executed),
             fixture.compile_with(&executor).0
@@ -2361,6 +2650,7 @@ pub(super) mod test {
                 eligibility: Eligibility::Eligible,
                 dir: "/".into(),
                 commit_hash: COMMIT_HASH.to_owned(),
+                c_version: "12",
             },
         );
         let mut expected = OsString::from("--sysroot=");

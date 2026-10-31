@@ -372,6 +372,8 @@ pub enum CompileLocallyReason {
     WorkerStdDiffers,
     RustcFailsOnWorkers,
     RustcCommitDiffersOnWorkers,
+    CCompilerFailsLocally,
+    CCompilerFailsOnWorkers,
     CCompilerDiffersOnWorkers,
     ExecutionsPaused,
     LocalSlotFree,
@@ -458,6 +460,8 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::WorkerStdDiffers => "worker toolchain's std differs from the local one",
             Self::RustcFailsOnWorkers => "rustc -vV fails on the workers",
             Self::RustcCommitDiffersOnWorkers => "rustc on the workers reports another commit hash",
+            Self::CCompilerFailsLocally => "gcc or clang fails its check locally",
+            Self::CCompilerFailsOnWorkers => "gcc or clang fails its check on the workers",
             Self::CCompilerDiffersOnWorkers => {
                 "gcc or clang on the workers differs from the local one"
             }

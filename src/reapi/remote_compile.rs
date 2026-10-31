@@ -198,7 +198,6 @@ fn c_compiler_check_options(key: &CToolchainKey) -> Vec<&str> {
 
 /// The [`ActionBlobs`] of [`c_compiler_check_command`]'s action. Servers neither answer it
 /// from their action cache nor cache its result, so it runs on a worker each time.
-#[expect(dead_code, reason = "the check doesn't run on workers yet")]
 pub(super) fn c_compiler_check_action_blobs(
     key: &CToolchainKey,
     toolchain: &[(InputRootFile, PathBuf)],
@@ -248,7 +247,6 @@ fn c_compiler_check_command(key: &CToolchainKey) -> remexec::Command {
 /// The local `key` toolchain's answers to [`c_compiler_check_options`], one line each, with
 /// the paths of its internal files from `key`. Runs the compiler, so call it from a blocking
 /// thread.
-#[expect(dead_code, reason = "the check doesn't run on workers yet")]
 pub(super) fn local_c_compiler_answers(key: &CToolchainKey) -> Result<Vec<String>> {
     (c_compiler_check_options(key).into_iter())
         .map(|option| {
@@ -271,10 +269,6 @@ pub(super) fn local_c_compiler_answers(key: &CToolchainKey) -> Result<Vec<String
 /// The answers in the `stdout` of [`c_compiler_check_action_blobs`]'s action, as
 /// [`local_c_compiler_answers`] has them. Fails for a worker root with a `:` or `=`, and for
 /// an internal file outside the toolchain dir.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the check doesn't run on workers yet")
-)]
 pub(super) fn worker_c_compiler_answers(
     key: &CToolchainKey,
     stdout: &str,
