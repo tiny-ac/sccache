@@ -26,8 +26,8 @@ use super::mapping::{CompileLocallyReason, ReapiCompile, ToolchainKey};
 use super::pause::Pause;
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use super::remote_compile::{
-    ActionBlobs, ActionOptions, action_blobs, digest_input_root_files, download_stdout_or_stderr,
-    materialize, materialize_failure_reason, rustc_version_action_blobs,
+    ACTION_TIMEOUT, ActionBlobs, ActionOptions, action_blobs, digest_input_root_files,
+    download_stdout_or_stderr, materialize, materialize_failure_reason, rustc_version_action_blobs,
 };
 use super::toolchains::{ToolchainFiles, Toolchains};
 use crate::compiler::{
@@ -49,8 +49,9 @@ use std::time::{Duration, Instant};
 const SYSROOT_COPIES_DIR: &str = "reapi-sysroot-copies";
 /// File under the dist cache dir that keeps toolchain file digests across restarts.
 const DIGEST_CACHE_FILE: &str = "reapi-digests.json";
-/// Bounds an execution, with its reattaches and its retry after uploading again.
-const EXECUTE_TIMEOUT: Duration = Duration::from_secs(600);
+/// Bounds an execution, with its reattaches and its retry after uploading again. Longer than
+/// the action's own timeout, so that the server reports an action that runs out of time.
+const EXECUTE_TIMEOUT: Duration = Duration::from_secs(ACTION_TIMEOUT.as_secs() + 60);
 /// How long a miss the server reports queued waits for a worker without `queue_timeout_secs`.
 const DEFAULT_QUEUE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Caps `ready_wait_secs`, since `Instant::now() + ready_wait` panics on overflow.
@@ -335,11 +336,13 @@ impl ReapiExecutor {
                 }
                 return Err(CompileLocallyReason::ExecutionsRefused);
             }
-            // An input that can't be read or hashed says nothing about the server. The rustc
-            // check already counted the server's answer, even if its stdout then failed to
-            // download. Refused credentials make the connection check them again instead.
+            // An input that can't be read or hashed says nothing about the server, nor does an
+            // action that runs out of time. The rustc check already counted the server's
+            // answer, even if its stdout then failed to download. Refused credentials make the
+            // connection check them again instead.
             Err(
                 reason @ (CompileLocallyReason::UnreadableInput
+                | CompileLocallyReason::ExecutionTimedOut
                 | CompileLocallyReason::CredentialsRefused
                 | CompileLocallyReason::HashingInputsFailed
                 | CompileLocallyReason::DownloadingOutputsFailed
@@ -576,6 +579,7 @@ async fn upload_and_execute(
             // PERMISSION_DENIED on Execute comes from credentials that may look actions up but
             // not execute them.
             Some(tonic::Code::PermissionDenied) => CompileLocallyReason::ExecutionsRefused,
+            Some(tonic::Code::DeadlineExceeded) => CompileLocallyReason::ExecutionTimedOut,
             // Including FAILED_PRECONDITION without missing blobs, which servers also answer
             // while no worker is available, as when a pool scales up from zero.
             _ => CompileLocallyReason::ExecutionFailed,
@@ -1360,6 +1364,21 @@ mod test {
             FAILURES_TO_PAUSE as usize,
             fixture.server.execute_calls.load(Ordering::SeqCst)
         );
+    }
+
+    #[test]
+    fn test_actions_that_run_out_of_time_dont_pause_executions() {
+        let fixture = executing_fixture(FakeServer {
+            actions_time_out: true,
+            ..Default::default()
+        });
+        let executor = fixture.executor();
+        for _ in 0..=FAILURES_TO_PAUSE {
+            assert_eq!(
+                compiled_locally("REAPI action ran out of time on a worker"),
+                fixture.compile_with(&executor).0
+            );
+        }
     }
 
     #[test]

@@ -110,6 +110,9 @@ pub(crate) struct FakeServer {
     pub(crate) stage_interval: Duration,
     /// Finishes each Execute with an operation error.
     pub(crate) fail_operations: bool,
+    /// Finishes each Execute with DEADLINE_EXCEEDED in the ExecuteResponse, as for an action
+    /// that ran past its timeout.
+    pub(crate) actions_time_out: bool,
     /// Breaks this many Execute and WaitExecution streams, after a first, unfinished
     /// operation unless `break_before_operation`.
     pub(crate) streams_to_break: AtomicUsize,
@@ -861,6 +864,19 @@ impl Execution for FakeServer {
         if self.missing_blobs_in_response {
             let response = remexec::ExecuteResponse {
                 status: Some(missing_blob_rpc_status(&action_digest)),
+                ..Default::default()
+            };
+            return Ok(Response::new(operation_stream(vec![Ok(
+                response_operation(response),
+            )])));
+        }
+        if self.actions_time_out {
+            let response = remexec::ExecuteResponse {
+                status: Some(rpc::Status {
+                    code: tonic::Code::DeadlineExceeded as i32,
+                    message: "the action timed out".to_owned(),
+                    details: vec![],
+                }),
                 ..Default::default()
             };
             return Ok(Response::new(operation_stream(vec![Ok(
