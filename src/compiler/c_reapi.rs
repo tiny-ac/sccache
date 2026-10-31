@@ -487,6 +487,79 @@ fn is_absolute_path_arg(arg: &str) -> bool {
     path.starts_with('/')
 }
 
+/// `preprocessed` with the paths under the cwd and build root in its line markers written as
+/// a worker's compile names them. A path that `kind` escapes differently from
+/// [`escape_line_marker_path`] stays local, which costs only cache hits across checkouts.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "C compiles don't reach workers without their toolchain"
+    )
+)]
+fn rewrite_line_markers(
+    preprocessed: &[u8],
+    path_mapper: &PathMapper,
+    kind: &CCompilerKind,
+) -> Vec<u8> {
+    // The build root, often inside the cwd, is matched first.
+    let prefixes: Vec<(Vec<u8>, &str)> = path_mapper
+        .input_root_prefixes()
+        .into_iter()
+        .rev()
+        .map(|(local, mapped)| {
+            let local = escape_line_marker_path(local.as_os_str().as_encoded_bytes(), kind);
+            (local, mapped)
+        })
+        .collect();
+    let mut rewritten = Vec::with_capacity(preprocessed.len());
+    let mut start = 0;
+    while start < preprocessed.len() {
+        let end = memchr::memchr(b'\n', &preprocessed[start..])
+            .map_or(preprocessed.len(), |newline| start + newline + 1);
+        let line = &preprocessed[start..end];
+        let path_start = super::c::is_line_marker_at(preprocessed, start)
+            .then(|| memchr::memchr(b'"', line))
+            .flatten()
+            .map(|quote| quote + 1);
+        let mapped = path_start.and_then(|path_start| {
+            prefixes.iter().find_map(|(local, mapped)| {
+                let rest = line[path_start..].strip_prefix(local.as_slice())?;
+                matches!(rest.first(), Some(b'/' | b'"')).then_some((path_start, *mapped, rest))
+            })
+        });
+        match mapped {
+            Some((path_start, mapped, rest)) => {
+                rewritten.extend_from_slice(&line[..path_start]);
+                rewritten.extend_from_slice(mapped.as_bytes());
+                rewritten.extend_from_slice(rest);
+            }
+            None => rewritten.extend_from_slice(line),
+        }
+        start = end;
+    }
+    rewritten
+}
+
+/// `path` as `kind`'s preprocessor writes it between the quotes of a line marker.
+fn escape_line_marker_path(path: &[u8], kind: &CCompilerKind) -> Vec<u8> {
+    let mut escaped = Vec::with_capacity(path.len());
+    for &byte in path {
+        match byte {
+            b'\\' | b'"' => escaped.extend_from_slice(&[b'\\', byte]),
+            b'\n' => escaped.extend_from_slice(b"\\n"),
+            b'\t' if *kind == CCompilerKind::Clang => escaped.extend_from_slice(b"\\t"),
+            // clang writes every other byte that isn't printable ASCII, UTF-8 included, in
+            // octal.
+            _ if *kind == CCompilerKind::Clang && !(b' '..=b'~').contains(&byte) => {
+                escaped.extend_from_slice(format!("\\{byte:03o}").as_bytes());
+            }
+            _ => escaped.push(byte),
+        }
+    }
+    escaped
+}
+
 #[cfg(all(test, unix))]
 mod test {
     use super::*;
@@ -829,6 +902,42 @@ mod test {
                 "/home/b/.cargo/registry/src/index-1/foo-1.0.0",
                 "/srv/b/target"
             )
+        );
+    }
+
+    #[test]
+    fn test_line_markers_name_paths_as_a_worker_does() {
+        let path_mapper = PathMapper::new("/w\"s".into(), "/w\"s/target".into());
+        let preprocessed = br#"# 1 "/w\"s/src/x.c"
+# 1 "/w\"s//"
+# 5 "/w\"s/target/out/gen.h" 1
+#line 2 "/w\"sx/y.h"
+const char *s = "/w\"s/src/x.c";
+# 3 "/usr/include/stdio.h" 3 4
+"#;
+        let expected = br#"# 1 "./src/x.c"
+# 1 ".//"
+# 5 ".sccache-build/out/gen.h" 1
+#line 2 "/w\"sx/y.h"
+const char *s = "/w\"s/src/x.c";
+# 3 "/usr/include/stdio.h" 3 4
+"#;
+        let rewritten = rewrite_line_markers(preprocessed, &path_mapper, &CCompilerKind::Gcc);
+        assert_eq!(
+            String::from_utf8_lossy(expected),
+            String::from_utf8_lossy(&rewritten)
+        );
+    }
+
+    #[test]
+    fn test_clang_escapes_non_ascii_paths_in_octal() {
+        assert_eq!(
+            br#"/caf\303\251/\"x\""#.as_slice(),
+            escape_line_marker_path("/caf\u{e9}/\"x\"".as_bytes(), &CCompilerKind::Clang)
+        );
+        assert_eq!(
+            "/caf\u{e9}/\\\"x\\\"".as_bytes(),
+            escape_line_marker_path("/caf\u{e9}/\"x\"".as_bytes(), &CCompilerKind::Gcc)
         );
     }
 }

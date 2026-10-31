@@ -777,15 +777,7 @@ fn process_preprocessed_file(
         //
         // Note that there may be other lines starting with '#' left after
         // preprocessing as well, for instance "#    pragma".
-        if slice[0] == b'#'
-        // GCC:
-        && ((slice[1] == b' ' && slice[2] >= b'0' && slice[2] <= b'9')
-            // GCC precompiled header:
-            || slice[1..].starts_with(PRAGMA_GCC_PCH_PREPROCESS)
-            // HP/AIX:
-            || slice[1..].starts_with(b"line "))
-        && (start == 0 || bytes[start - 1] == b'\n')
-        {
+        if is_line_marker_at(bytes, start) {
             match process_preprocessor_line(
                 input_file,
                 cwd,
@@ -851,6 +843,19 @@ fn process_preprocessed_file(
     digest.update(&bytes[hash_start..]);
 
     Ok(true)
+}
+
+/// Whether a line marker that may name a file starts at `start` in preprocessor output.
+pub(super) fn is_line_marker_at(bytes: &[u8], start: usize) -> bool {
+    let slice = &bytes[start..];
+    slice.first() == Some(&b'#')
+        // GCC:
+        && (matches!(slice.get(1..3), Some([b' ', b'0'..=b'9']))
+            // GCC precompiled header:
+            || slice[1..].starts_with(PRAGMA_GCC_PCH_PREPROCESS)
+            // HP/AIX:
+            || slice[1..].starts_with(b"line "))
+        && (start == 0 || bytes[start - 1] == b'\n')
 }
 
 /// What to do after handling a preprocessor number line.

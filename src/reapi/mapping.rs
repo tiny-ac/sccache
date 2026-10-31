@@ -512,21 +512,32 @@ impl PathMapper {
         }
     }
 
+    /// The cwd and the build root, each with the path a worker's compile names it by. The
+    /// build root, often inside the cwd, comes last.
+    pub(crate) fn input_root_prefixes(&self) -> [(&Path, &str); 2] {
+        [(&self.cwd, "."), (&self.build_root, BUILD_ROOT_DIR)]
+    }
+
+    /// `<option><local path>=<path in the input root>` arguments for
+    /// [`Self::input_root_prefixes`], in their order, for compilers that apply the last
+    /// matching mapping.
+    pub(crate) fn prefix_map_args(&self, option: &str) -> Vec<OsString> {
+        self.input_root_prefixes()
+            .into_iter()
+            .map(|(from, to)| {
+                let mut arg = OsString::from(option);
+                arg.push(from);
+                arg.push("=");
+                arg.push(to);
+                arg
+            })
+            .collect()
+    }
+
     /// `--remap-path-prefix` arguments that make a local compile name its paths as a
-    /// worker's compile does. rustc applies the last matching mapping, so the build root,
-    /// often inside the cwd, comes last.
+    /// worker's compile does.
     pub(crate) fn input_root_remap_args(&self) -> Vec<OsString> {
-        let remap = |from: &Path, to: &str| {
-            let mut arg = OsString::from("--remap-path-prefix=");
-            arg.push(from);
-            arg.push("=");
-            arg.push(to);
-            arg
-        };
-        vec![
-            remap(&self.cwd, "."),
-            remap(&self.build_root, BUILD_ROOT_DIR),
-        ]
+        self.prefix_map_args("--remap-path-prefix=")
     }
 
     /// Maps paths under `worker_root`, and input-root-relative paths under
