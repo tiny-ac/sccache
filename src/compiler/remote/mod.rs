@@ -26,6 +26,11 @@ mod dist;
 
 #[cfg(feature = "dist-client")]
 pub use self::dist::DistExecutor;
+#[cfg(feature = "dist-client")]
+pub(crate) use self::dist::{
+    DistClientSetup, DistIpcRequest, DistIpcResponse, PendingDistToolchains,
+    handle_dist_ipc_request,
+};
 
 /// A cache miss, for an executor to compile.
 pub struct RemoteJob<T: CommandCreatorSync> {

@@ -14,14 +14,14 @@
 
 use crate::cache::readonly::ReadOnlyStorage;
 use crate::cache::{CacheMode, Storage, storage_from_config};
-#[cfg(feature = "dist-client")]
-use crate::compiler::DistExecutor;
 use crate::compiler::PreprocessorCacheEntry;
 use crate::compiler::{
     CacheControl, CompileResult, Compiler, CompilerArguments, CompilerHasher, CompilerKind,
     CompilerProxy, DistType, Language, MissType, NO_CRATE_TYPE_PASSED, ReapiOutcome,
     RemoteExecutor, get_compiler_info,
 };
+#[cfg(feature = "dist-client")]
+use crate::compiler::{DistClientSetup, DistExecutor, PendingDistToolchains};
 #[cfg(feature = "dist-client")]
 use crate::config;
 use crate::config::Config;
@@ -187,6 +187,23 @@ pub struct DistClientConfig {
 }
 
 #[cfg(feature = "dist-client")]
+impl DistClientConfig {
+    fn mock(pool: tokio::runtime::Handle) -> Self {
+        DistClientConfig {
+            pool,
+            scheduler_url: None,
+            auth: config::DistAuth::Token {
+                token: String::new(),
+            },
+            cache_dir: "".into(),
+            toolchain_cache_size: 0,
+            toolchains: vec![],
+            rewrite_includes_only: false,
+        }
+    }
+}
+
+#[cfg(feature = "dist-client")]
 pub enum DistClientState {
     #[cfg(feature = "dist-client")]
     Some(Box<DistClientConfig>, Arc<dyn dist::Client>),
@@ -289,6 +306,40 @@ impl DistClientContainer {
         }
     }
 
+    pub(crate) async fn client_setup(&self) -> DistClientSetup {
+        // One lock, so a reset can't come between the client and its config.
+        let mut state = self.state.lock().await;
+        if let Err(e) = Self::client_in(&mut state).await {
+            return DistClientSetup::Misconfigured(format!("{e:#}"));
+        }
+        match &*state {
+            DistClientState::Some(config, client) => DistClientSetup::Ready {
+                rewrite_includes_only: client.rewrite_includes_only(),
+                custom_toolchains: config
+                    .toolchains
+                    .iter()
+                    .filter_map(|toolchain| match toolchain {
+                        config::DistToolchainConfig::PathOverride {
+                            compiler_executable,
+                            archive,
+                            ..
+                        } => Some((compiler_executable.clone(), archive.clone())),
+                        config::DistToolchainConfig::NoDist { .. } => None,
+                    })
+                    .collect(),
+            },
+            _ => DistClientSetup::NoDistClient,
+        }
+    }
+
+    /// A container holding `client`, for tests.
+    pub(crate) fn mock(client: Arc<dyn dist::Client>, pool: tokio::runtime::Handle) -> Self {
+        Self::new_with_state(DistClientState::Some(
+            Box::new(DistClientConfig::mock(pool)),
+            client,
+        ))
+    }
+
     pub fn new_disabled() -> Self {
         Self {
             state: futures::lock::Mutex::new(DistClientState::Disabled),
@@ -347,9 +398,12 @@ impl DistClientContainer {
         }
     }
 
-    async fn get_client(&self) -> Result<Option<Arc<dyn dist::Client>>> {
-        let mut guard = self.state.lock().await;
-        let state = &mut *guard;
+    pub(crate) async fn get_client(&self) -> Result<Option<Arc<dyn dist::Client>>> {
+        Self::client_in(&mut *self.state.lock().await).await
+    }
+
+    /// The dist client in `state`, recreating it when a retry is due.
+    async fn client_in(state: &mut DistClientState) -> Result<Option<Arc<dyn dist::Client>>> {
         Self::maybe_recreate_state(state).await;
         let res = match state {
             DistClientState::Some(_, dc) => Ok(Some(dc.clone())),
@@ -886,6 +940,10 @@ where
     /// Distributed sccache client
     dist_client: Arc<DistClientContainer>,
 
+    /// Shared by the daemon's connections.
+    #[cfg(feature = "dist-client")]
+    pending_dist_toolchains: Arc<PendingDistToolchains>,
+
     /// Cache storage.
     storage: Arc<dyn Storage>,
 
@@ -1018,6 +1076,17 @@ where
                     };
                     Ok(Message::WithoutBody(Response::StorageHandshake(info)))
                 }
+                #[cfg(feature = "dist-client")]
+                Request::Dist(request) => {
+                    debug!("handle_client: dist");
+                    let response = crate::compiler::handle_dist_ipc_request(
+                        &me.dist_client,
+                        &me.pending_dist_toolchains,
+                        request,
+                    )
+                    .await;
+                    Ok(Message::WithoutBody(Response::Dist(response)))
+                }
                 Request::StorageGetPath { key } => {
                     debug!("handle_client: storage_get_path key={}", key);
                     Ok(Message::WithoutBody(Response::StorageGetPath(
@@ -1120,6 +1189,8 @@ where
             tx,
             info,
             notification_tx: None,
+            #[cfg(feature = "dist-client")]
+            pending_dist_toolchains: Arc::default(),
         }
     }
 
@@ -1143,6 +1214,8 @@ where
             tx,
             info,
             notification_tx: None,
+            #[cfg(feature = "dist-client")]
+            pending_dist_toolchains: Arc::default(),
         }
     }
 
@@ -1157,20 +1230,7 @@ where
         let client = Client::new_num(1);
         SccacheService {
             stats: Arc::default(),
-            dist_client: Arc::new(DistClientContainer::new_with_state(DistClientState::Some(
-                Box::new(DistClientConfig {
-                    pool: rt.clone(),
-                    scheduler_url: None,
-                    auth: config::DistAuth::Token {
-                        token: String::new(),
-                    },
-                    cache_dir: "".into(),
-                    toolchain_cache_size: 0,
-                    toolchains: vec![],
-                    rewrite_includes_only: false,
-                }),
-                dist_client,
-            ))),
+            dist_client: Arc::new(DistClientContainer::mock(dist_client, rt.clone())),
             storage,
             effective_cache_mode: CacheMode::ReadWrite,
             compilers: Arc::default(),
@@ -1180,6 +1240,8 @@ where
             tx,
             info,
             notification_tx: None,
+            #[cfg(feature = "dist-client")]
+            pending_dist_toolchains: Arc::default(),
         }
     }
 
@@ -2761,6 +2823,99 @@ mod tests {
         let status = runtime.block_on(container.get_status());
 
         assert!(matches!(status, DistInfo::Disabled(_)));
+    }
+
+    #[cfg(feature = "dist-client")]
+    mod client_setup {
+        use super::*;
+
+        /// A dist client with `rewrite_includes_only` on. That's the only setting `client_setup`
+        /// needs from it.
+        struct RewriteIncludesOnlyClient;
+
+        #[async_trait::async_trait]
+        impl dist::Client for RewriteIncludesOnlyClient {
+            async fn do_alloc_job(&self, _: dist::Toolchain) -> Result<dist::AllocJobResult> {
+                unreachable!()
+            }
+            async fn do_get_status(&self) -> Result<dist::SchedulerStatusResult> {
+                unreachable!()
+            }
+            async fn do_submit_toolchain(
+                &self,
+                _: dist::JobAlloc,
+                _: dist::Toolchain,
+            ) -> Result<dist::SubmitToolchainResult> {
+                unreachable!()
+            }
+            async fn do_run_job(
+                &self,
+                _: dist::JobAlloc,
+                _: dist::CompileCommand,
+                _: Vec<String>,
+                _: Box<dyn dist::pkg::InputsPackager>,
+            ) -> Result<(dist::RunJobResult, dist::PathTransformer)> {
+                unreachable!()
+            }
+            async fn put_toolchain(
+                &self,
+                _: PathBuf,
+                _: String,
+                _: Box<dyn dist::pkg::ToolchainPackager>,
+            ) -> Result<(dist::Toolchain, Option<(String, PathBuf)>)> {
+                unreachable!()
+            }
+            fn rewrite_includes_only(&self) -> bool {
+                true
+            }
+            fn get_custom_toolchain(&self, _: &std::path::Path) -> Option<PathBuf> {
+                unreachable!()
+            }
+        }
+
+        /// The dist client setup carries `rewrite_includes_only` and the custom toolchains,
+        /// the dist settings that affect cache keys.
+        #[test]
+        fn test_client_setup_has_the_settings_that_affect_cache_keys() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let config = DistClientConfig {
+                toolchains: vec![
+                    config::DistToolchainConfig::PathOverride {
+                        compiler_executable: "/usr/bin/cc".into(),
+                        archive: "/tc.tar.gz".into(),
+                        archive_compiler_executable: "/bin/cc".to_owned(),
+                    },
+                    config::DistToolchainConfig::NoDist {
+                        compiler_executable: "/usr/bin/c++".into(),
+                    },
+                ],
+                ..DistClientConfig::mock(runtime.handle().clone())
+            };
+            let container = DistClientContainer::new_with_state(DistClientState::Some(
+                Box::new(config),
+                Arc::new(RewriteIncludesOnlyClient),
+            ));
+
+            match runtime.block_on(container.client_setup()) {
+                DistClientSetup::Ready {
+                    rewrite_includes_only,
+                    custom_toolchains,
+                } => {
+                    assert!(rewrite_includes_only);
+                    assert_eq!(
+                        HashMap::from([(
+                            PathBuf::from("/usr/bin/cc"),
+                            PathBuf::from("/tc.tar.gz")
+                        )]),
+                        custom_toolchains
+                    );
+                }
+                other => panic!("expected Ready, got {other:?}"),
+            }
+        }
     }
 
     #[cfg(feature = "reapi")]

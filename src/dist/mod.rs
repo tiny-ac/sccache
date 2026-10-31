@@ -55,6 +55,7 @@ mod pkg {
 
 #[cfg(target_os = "windows")]
 mod path_transform {
+    use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
     use std::path::{Component, Components, Path, PathBuf, Prefix, PrefixComponent};
     use std::str;
@@ -92,7 +93,7 @@ mod path_transform {
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Clone, Debug, Serialize, Deserialize)]
     pub struct PathTransformer {
         dist_to_local_path: HashMap<String, PathBuf>,
     }
@@ -266,10 +267,11 @@ mod path_transform {
 
 #[cfg(unix)]
 mod path_transform {
+    use serde::{Deserialize, Serialize};
     use std::iter;
     use std::path::{Path, PathBuf};
 
-    #[derive(Debug)]
+    #[derive(Clone, Debug, Serialize, Deserialize)]
     pub struct PathTransformer;
 
     impl PathTransformer {

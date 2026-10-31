@@ -310,6 +310,48 @@ mod client {
 
         use super::ClientToolchains;
 
+        /// The daemon's dist client asks a CLI for the toolchain when its packager fails with
+        /// its own error type, so that error must survive `put_toolchain`'s context.
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        #[test]
+        fn test_a_packaging_error_keeps_its_type() {
+            #[derive(Debug)]
+            struct NotPackaged;
+
+            impl std::fmt::Display for NotPackaged {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("not packaged")
+                }
+            }
+
+            impl std::error::Error for NotPackaged {}
+
+            struct FailingToolchainPackager;
+
+            impl crate::dist::pkg::ToolchainPackager for FailingToolchainPackager {
+                fn write_pkg(self: Box<Self>, _: fs_err::File) -> crate::errors::Result<()> {
+                    Err(NotPackaged.into())
+                }
+            }
+
+            let td = tempfile::Builder::new()
+                .prefix("sccache")
+                .tempdir()
+                .unwrap();
+            let client = ClientToolchains::new(&td.path().join("cache"), 1024 * 1024, &[]).unwrap();
+            let error = client
+                .put_toolchain(
+                    "/my/compiler".as_ref(),
+                    "weak_key",
+                    Box::new(FailingToolchainPackager),
+                )
+                .unwrap_err();
+            assert!(error.is::<NotPackaged>(), "{error:#}");
+        }
+
         #[cfg(all(
             target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")

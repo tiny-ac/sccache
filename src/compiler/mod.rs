@@ -42,6 +42,11 @@ pub(crate) use crate::compiler::remote::DistExecutor;
 #[cfg(all(test, feature = "reapi"))]
 pub(crate) use crate::compiler::remote::LocalArg;
 pub use crate::compiler::remote::RemoteExecutor;
+#[cfg(feature = "dist-client")]
+pub(crate) use crate::compiler::remote::{
+    DistClientSetup, DistIpcRequest, DistIpcResponse, PendingDistToolchains,
+    handle_dist_ipc_request,
+};
 #[cfg(feature = "reapi")]
 pub(crate) use crate::compiler::remote::{
     DistInputOptions, LocalCompile, LocalCompileChanges, RemoteJob,
