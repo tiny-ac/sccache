@@ -224,6 +224,45 @@ fn test_server_unsupported_compiler() {
     child.join().unwrap();
 }
 
+/// Makes the server's mock processes detect GCC and compile `file.c` to `file.o` in `f`'s
+/// directory, printing `stdout` and `stderr`.
+fn mock_gcc_compile(
+    f: &TestFixture,
+    server_creator: &Arc<Mutex<MockCommandCreator>>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+) {
+    const PREPROCESSOR_STDOUT: &[u8] = b"preprocessor stdout";
+    const PREPROCESSOR_STDERR: &[u8] = b"preprocessor stderr";
+    // Write a dummy input file so the preprocessor cache mode can work
+    std::fs::write(f.tempdir.path().join("file.c"), "whatever").unwrap();
+    let mut c = server_creator.lock().unwrap();
+    // The server will check the compiler. Pretend it's GCC.
+    c.next_command_spawns(Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")));
+    // The assembler version and path probes.
+    c.next_command_spawns(Ok(MockChild::new(
+        exit_status(0),
+        "GNU assembler (GNU Binutils) 2.42",
+        "",
+    )));
+    c.next_command_spawns(Ok(MockChild::new(exit_status(0), "as", "")));
+    // Preprocessor invocation.
+    c.next_command_spawns(Ok(MockChild::new(
+        exit_status(0),
+        PREPROCESSOR_STDOUT,
+        PREPROCESSOR_STDERR,
+    )));
+    // Compiler invocation.
+    //TODO: wire up a way to get data written to stdin.
+    let obj = f.tempdir.path().join("file.o");
+    c.next_command_calls(move |_| {
+        // Pretend to compile something.
+        let mut f = File::create(&obj)?;
+        f.write_all(b"file contents")?;
+        Ok(MockChild::new(exit_status(0), &stdout, &stderr))
+    });
+}
+
 #[test]
 fn test_server_compile() {
     let _ = env_logger::try_init();
@@ -231,40 +270,10 @@ fn test_server_compile() {
     let gcc = f.mk_bin("gcc").unwrap();
     let (addr, sender, server_creator, child) = run_server_thread(f.tempdir.path(), None);
     // Connect to the server.
-    const PREPROCESSOR_STDOUT: &[u8] = b"preprocessor stdout";
-    const PREPROCESSOR_STDERR: &[u8] = b"preprocessor stderr";
     const STDOUT: &[u8] = b"some stdout";
     const STDERR: &[u8] = b"some stderr";
     let conn = connect_to_server(&addr).unwrap();
-    // Write a dummy input file so the preprocessor cache mode can work
-    std::fs::write(f.tempdir.path().join("file.c"), "whatever").unwrap();
-    {
-        let mut c = server_creator.lock().unwrap();
-        // The server will check the compiler. Pretend it's GCC.
-        c.next_command_spawns(Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")));
-        // The assembler version and path probes.
-        c.next_command_spawns(Ok(MockChild::new(
-            exit_status(0),
-            "GNU assembler (GNU Binutils) 2.42",
-            "",
-        )));
-        c.next_command_spawns(Ok(MockChild::new(exit_status(0), "as", "")));
-        // Preprocessor invocation.
-        c.next_command_spawns(Ok(MockChild::new(
-            exit_status(0),
-            PREPROCESSOR_STDOUT,
-            PREPROCESSOR_STDERR,
-        )));
-        // Compiler invocation.
-        //TODO: wire up a way to get data written to stdin.
-        let obj = f.tempdir.path().join("file.o");
-        c.next_command_calls(move |_| {
-            // Pretend to compile something.
-            let mut f = File::create(&obj)?;
-            f.write_all(b"file contents")?;
-            Ok(MockChild::new(exit_status(0), STDOUT, STDERR))
-        });
-    }
+    mock_gcc_compile(&f, &server_creator, STDOUT.to_vec(), STDERR.to_vec());
     // Ask the server to compile something.
     //TODO: MockCommand should validate these!
     let exe = &gcc;
@@ -300,6 +309,50 @@ fn test_server_compile() {
     // Shut down the server.
     sender.send(ServerMessage::Shutdown).ok().unwrap();
     // Ensure that it shuts down.
+    child.join().unwrap();
+}
+
+#[test]
+fn test_server_closes_the_connection_when_a_response_is_too_large_to_send() {
+    let _ = env_logger::try_init();
+    let f = TestFixture::new();
+    let gcc = f.mk_bin("gcc").unwrap();
+    let (addr, sender, server_creator, child) = run_server_thread(f.tempdir.path(), None);
+    // Over the default 8 MiB frame limit.
+    mock_gcc_compile(&f, &server_creator, vec![b'x'; 9 << 20], vec![]);
+    let crate::net::SocketAddr::Net(addr) = addr else {
+        unreachable!("the test server listens on TCP");
+    };
+    let stream = std::net::TcpStream::connect(addr).unwrap();
+    // A client that waits for the response fails instead of hanging the test.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    let conn = crate::client::ServerConnection::new(Box::new(stream)).unwrap();
+    // The client compiles locally when the server closes the connection.
+    let client_creator = new_creator();
+    next_command(&client_creator, Ok(MockChild::new(exit_status(0), "", "")));
+    let mut stdout = Cursor::new(Vec::new());
+    let mut stderr = Cursor::new(Vec::new());
+    let mut runtime = Runtime::new().unwrap();
+    assert_eq!(
+        0,
+        do_compile(
+            client_creator.clone(),
+            &mut runtime,
+            conn,
+            &gcc,
+            vec!["-c".into(), "file.c".into(), "-o".into(), "file.o".into()],
+            f.tempdir.path(),
+            Some(f.paths.clone()),
+            vec![],
+            &mut stdout,
+            &mut stderr
+        )
+        .unwrap()
+    );
+    assert_eq!(0, client_creator.lock().unwrap().children.len());
+    sender.send(ServerMessage::Shutdown).ok().unwrap();
     child.join().unwrap();
 }
 
