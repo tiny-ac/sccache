@@ -86,6 +86,14 @@ on_miss = "execute"
 # how long a miss that the server reports queued waits for a worker before it
 # compiles locally
 queue_timeout_secs = 60
+# the most compiles that run locally at once, C and C++ ones included; a miss
+# compiles locally while fewer run, and then doesn't reach the action cache.
+# Unset doesn't limit them, and a miss compiles locally only when it can't
+# execute
+#local_slots = 8
+# the most compiles that execute on workers at once; a miss that waits longer
+# than queue_timeout_secs for one compiles locally. Unset doesn't limit them
+#remote_slots = 64
 # platform properties set on every action; a name can't repeat
 #[dist.reapi.platform]
 #OSFamily = "linux"

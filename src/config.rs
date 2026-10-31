@@ -28,6 +28,7 @@ use serde::{
 use serial_test::serial;
 use std::env;
 use std::io::{Read, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
 use std::str::FromStr;
@@ -820,6 +821,13 @@ pub struct ReapiConfig {
     /// How long a miss that the server reports queued waits for a worker before compiling
     /// locally; 60 if unset.
     pub queue_timeout_secs: Option<u64>,
+    /// The most compiles that run locally at once, C and C++ ones included. A miss compiles
+    /// locally while fewer run, and executes otherwise. Unset doesn't limit them, and a miss
+    /// compiles locally only when it can't execute.
+    pub local_slots: Option<NonZeroUsize>,
+    /// The most compiles that execute on workers at once; a miss that waits longer than
+    /// `queue_timeout_secs` for one compiles locally. Unset doesn't limit them.
+    pub remote_slots: Option<NonZeroUsize>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2935,6 +2943,8 @@ ready_wait_secs = 5
 salt = "1"
 on_miss = "local"
 queue_timeout_secs = 120
+local_slots = 4
+remote_slots = 64
 
 [dist.reapi.platform]
 OSFamily = "linux"
@@ -3133,6 +3143,8 @@ key_prefix = "cosprefix"
                     headers: [("x-api-key".to_owned(), "key".to_owned())].into(),
                     on_miss: ReapiOnMiss::Local,
                     queue_timeout_secs: Some(120),
+                    local_slots: NonZeroUsize::new(4),
+                    remote_slots: NonZeroUsize::new(64),
                 }),
             },
             server_startup_timeout_ms: Some(10000),
@@ -3689,6 +3701,8 @@ endpoint = "grpcs://farm.example.com:443"
             headers: BTreeMap::new(),
             on_miss: ReapiOnMiss::Execute,
             queue_timeout_secs: None,
+            local_slots: None,
+            remote_slots: None,
         }),
         config.dist.reapi
     );
