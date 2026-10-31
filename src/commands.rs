@@ -759,7 +759,15 @@ where
         ))),
         None => service,
     };
-    #[cfg(not(feature = "dist-client"))]
+    #[cfg(feature = "reapi")]
+    let service = match dist.reapi {
+        Some(_) => service.with_reapi_ipc_executor(Arc::new(crate::reapi::ReapiIpcExecutor::new(
+            conn_arc.clone(),
+            &dist.cache_dir,
+        ))),
+        None => service,
+    };
+    #[cfg(not(any(feature = "dist-client", feature = "reapi")))]
     let _ = dist;
     let compile = Compile {
         exe: exe_path.as_os_str().to_owned(),

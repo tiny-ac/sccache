@@ -54,7 +54,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::transport::{Certificate, Identity};
 
 /// Directory under the dist cache dir for the sysroot copies local compiles use.
-const SYSROOT_COPIES_DIR: &str = "reapi-sysroot-copies";
+pub(super) const SYSROOT_COPIES_DIR: &str = "reapi-sysroot-copies";
 const WORKER_TOOLCHAINS_DIR: &str = "reapi-worker-toolchains";
 /// File under the dist cache dir that keeps toolchain file digests across restarts.
 const DIGEST_CACHE_FILE: &str = "reapi-digests.json";
@@ -1138,14 +1138,17 @@ pub(super) mod test {
         }
 
         /// Like `compile`, through `executor`.
-        fn compile_with(&self, executor: &ReapiExecutor) -> (DistType, process::Output) {
+        pub(in crate::reapi) fn compile_with(
+            &self,
+            executor: &dyn RemoteExecutor<Creator>,
+        ) -> (DistType, process::Output) {
             self.compile_at_once(executor, 1).pop().unwrap()
         }
 
         /// Runs `n` compiles through `executor` at once.
         fn compile_at_once(
             &self,
-            executor: &ReapiExecutor,
+            executor: &dyn RemoteExecutor<Creator>,
             n: usize,
         ) -> Vec<(DistType, process::Output)> {
             self.compile_at_once_while(executor, n, |_| async {})
@@ -1155,7 +1158,7 @@ pub(super) mod test {
         /// compiles, whose commands are left until they run.
         fn compile_at_once_while<F: Future<Output = ()>>(
             &self,
-            executor: &ReapiExecutor,
+            executor: &dyn RemoteExecutor<Creator>,
             n: usize,
             meanwhile: impl FnOnce(Vec<Creator>) -> F,
         ) -> Vec<(DistType, process::Output)> {
