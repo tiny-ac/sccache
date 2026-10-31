@@ -2,7 +2,8 @@
 # Builds tests/integration/reapi/fixture with sccache and REAPI, each build with empty local
 # caches, and checks:
 # - on_miss = "execute": checkout A executes each compile it can on the server's workers, and
-#   checkout B, at another path, hits the action cache for each one and links the rlibs;
+#   checkout B, at another path, hits the action cache for each one and links the rlibs, in
+#   server-side mode and again in client-side mode;
 # - on_miss = "local": a build executes nothing and writes no action result, so a later build
 #   with the same salt still executes every compile, and writes the same rlibs;
 # - an unreachable server: the build compiles everything locally.
@@ -35,7 +36,10 @@ build() {
     "$SCCACHE" --stop-server >/dev/null 2>&1 || true
     export SCCACHE_DIR="$work/cache-${1//\//-}" SCCACHE_DIST_CLIENT_CACHE_DIR="$work/dist-cache-${1//\//-}"
     "$SCCACHE" --start-server >/dev/null || return 1
-    (cd "$work/$1" && cargo build -q --locked >&2) || return 1
+    # SCCACHE_LOG turns client-side mode off, so cargo runs without it there. The daemon keeps
+    # it, for the log line execute_on_miss looks for.
+    (cd "$work/$1" && ${SCCACHE_CLIENT_SIDE:+env -u SCCACHE_LOG} cargo build -q --locked >&2) ||
+        return 1
     stats=$("$SCCACHE" --show-stats --stats-format=json) || return 1
     echo "$stats"
     "$SCCACHE" --stop-server >/dev/null || { echo "the sccache daemon didn't stop" >&2; return 1; }
@@ -91,10 +95,12 @@ check_links() {
     [ -z "$rebuilt" ] || fail "cargo test rebuilt crates in checkout B's target directory: $rebuilt"
 }
 
+# Runs the on_miss = "execute" builds, in client-side mode if $1 is "client-side".
 execute_on_miss() {
     # Compiles wait for the connection and the toolchain, so none compiles locally while either
     # is getting ready.
-    setup "on_miss execute" "$ENDPOINT" 300
+    setup "on_miss execute ${1:-server-side}" "$ENDPOINT" 300
+    [ "${1:-}" != client-side ] || export SCCACHE_CLIENT_SIDE=1
     local stats_a stats_b
     stats_a=$(build checkout-a) || fail "checkout A didn't build"
     stats_b=$(build elsewhere/checkout-b) || fail "checkout B didn't build"
@@ -106,6 +112,12 @@ execute_on_miss() {
     [ "$(reapi_stat action_cache_hits "$stats_b")" -eq "$(reapi_stat executions "$stats_a")" ] ||
         fail "checkout B didn't hit every action checkout A executed"
     [ "$(reapi_stat executions "$stats_b")" -eq 0 ] || fail "checkout B executed actions"
+    if [ -n "${SCCACHE_CLIENT_SIDE:-}" ]; then
+        # A debug line of the daemon's, which the compose file's SCCACHE_LOG=sccache=debug logs.
+        grep -q 'handle_client: reapi' "$SCCACHE_ERROR_LOG" ||
+            fail "no CLI sent the daemon a REAPI request, so the builds didn't run in client-side mode"
+        unset SCCACHE_CLIENT_SIDE
+    fi
     check_links
     echo "✓ PASS: checkout B hit every action checkout A executed, and links them"
     rm -rf "$work"
@@ -150,6 +162,7 @@ unreachable_server() {
 }
 
 execute_on_miss
+execute_on_miss client-side
 local_on_miss
 unreachable_server
 echo "All REAPI tests completed successfully!"
