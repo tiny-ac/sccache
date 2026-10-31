@@ -15,6 +15,8 @@ sccache includes support for caching the compilation of Assembler, C/C++ code, [
 
 sccache also provides [icecream](https://github.com/icecc/icecream)-style distributed compilation (automatic packaging of local toolchains) for all supported compilers (including Rust). The distributed compilation system includes several security features that icecream lacks such as authentication, transport layer encryption, and sandboxed compiler execution on build servers. See [the distributed quickstart](docs/DistributedQuickstart.md) guide for more information.
 
+Experimentally, sccache can also look Rust compiles up in a [Remote Execution API server](docs/Reapi.md)'s action cache, and run misses on its workers.
+
 sccache is also available as a [GitHub Actions](https://github.com/marketplace/actions/sccache-action) to facilitate the deployment using GitHub Actions cache.
 
 ---
