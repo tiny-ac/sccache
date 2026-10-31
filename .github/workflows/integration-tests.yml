@@ -37,7 +37,7 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       matrix:
-        type: [backends, tools, reapi]
+        type: [backends, tools, reapi, reapi-buildbarn]
 
     steps:
       - name: Clone repository
@@ -54,6 +54,10 @@ jobs:
           else
             echo "No sccache log was produced."
           fi
+
+      - name: Show the services' logs
+        if: failure()
+        run: cd tests/integration && docker compose --profile '*' logs
 
       - name: Build report
         run: |

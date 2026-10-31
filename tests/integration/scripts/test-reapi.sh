@@ -1,7 +1,7 @@
 #!/bin/bash
 # Builds tests/integration/reapi/fixture with sccache and REAPI, each build with empty local
 # caches, and checks:
-# - on_miss = "execute": checkout A executes each compile it can on NativeLink's worker, and
+# - on_miss = "execute": checkout A executes each compile it can on the server's workers, and
 #   checkout B, at another path, hits the action cache for each one and links the rlibs;
 # - on_miss = "local": a build executes nothing and writes no action result, so a later build
 #   with the same salt still executes every compile, and writes the same rlibs;
@@ -10,6 +10,9 @@ set -euo pipefail
 
 SCCACHE="${SCCACHE_PATH:-/sccache/target/debug/sccache}"
 ENDPOINT="${REAPI_ENDPOINT:-grpc://nativelink:50051}"
+# REAPI_PLATFORM is a TOML line such as `OSFamily = "linux"`, added under [dist.reapi.platform].
+PLATFORM="${REAPI_PLATFORM:+[dist.reapi.platform]
+$REAPI_PLATFORM}"
 export CARGO_INCREMENTAL=0
 
 # Prints REAPI stat $1 from the JSON stats in $2, or 0 if `reapi` is null.
@@ -64,6 +67,7 @@ endpoint = "$2"
 salt = "${mode// /-}-$(date +%s%N)"
 ready_wait_secs = $3
 ${4:-}
+$PLATFORM
 TOML
     export SCCACHE_CONF="$work/sccache.toml"
 
