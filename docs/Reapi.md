@@ -12,7 +12,7 @@ cargo install sccache --features reapi
 
 ## Configuration
 
-`[dist.reapi]` in the client config turns it on, and turns sccache-dist and client-side mode off (see [Configuration](Configuration.md) for every key). A minimal config:
+`[dist.reapi]` in the client config turns it on, and turns sccache-dist off (see [Configuration](Configuration.md) for every key). A minimal config:
 
 ```toml
 [dist.reapi]
@@ -63,6 +63,10 @@ With it, that rustc's lookups and executions use the Linux toolchain, unless the
 ## Slots
 
 `local_slots` is the most compiles sccache runs locally at once, C and C++ ones included, and also while the server can't be reached. A miss that could execute compiles locally while fewer run, so it never reaches the server's action cache: for other clients to get hits, keep `local_slots` below cargo's `-j`. A miss that finds no free local slot executes once one of `remote_slots` is free, or compiles locally if a local slot frees first, or after `queue_timeout_secs` without a free slot. Without `local_slots`, a miss executes whenever it can, and local compiles run as cargo starts them. Without `remote_slots`, executions aren't limited.
+
+## Client-side mode
+
+In [client-side mode](Architecture.md#client-side-mode-sccache_client_side), each sccache CLI maps its compile for REAPI, and the sccache daemon looks it up or executes it with its own connection to the server, so the slots and the pauses after failures cover every CLI. A CLI sends compiles to the daemon only with `[dist.reapi]` in its own config, and compiles locally if the daemon can't answer.
 
 ## Credentials
 

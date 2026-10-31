@@ -170,14 +170,21 @@ When the daemon has no toolchain archive for the compiler, it answers
 `NeedToolchain` and the CLI sends the request again with the toolchain packaged,
 or with the packaging error.
 
+With REAPI configured, the daemon also owns the REAPI executor: the connection
+to the REAPI server, the pauses after failures, the slots and the digest cache.
+The CLI asks with `Reapi(ReapiIpcRequest::GetReapiExecutorSetup)` whether the
+daemon has one. On a cache miss the CLI maps the compile for REAPI, or finds why
+it can't run through REAPI, and sends either with
+`Reapi(ReapiIpcRequest::CompileThroughReapi)`. The daemon looks the compile up
+or executes it and writes the outputs where a local compile would, or takes a
+local slot and answers that the CLI compiles locally. The CLI sends
+`Reapi(ReapiIpcRequest::ReleaseLocalSlot)` when its local compile ends, and a
+closed connection releases the slot too.
+
 Client-side mode is enabled with the `SCCACHE_CLIENT_SIDE` environment variable
 (or the `client_side_mode` config key). It is expected to become the only
 supported configuration in the future, with server-side mode eventually
-removed. It is currently mutually exclusive with:
-
-- **logging** (`SCCACHE_LOG`): the client always logs to stderr, ignoring `SCCACHE_ERROR_LOG`
-  (concurrent CLI processes would race on a shared log file), and
-- **REAPI** (`[dist.reapi]`), whose executor runs in the daemon.
-
-If either is in use, the setting is ignored and sccache stays in server-side
-mode.
+removed. It is currently mutually exclusive with logging (`SCCACHE_LOG`): the
+client always logs to stderr, ignoring `SCCACHE_ERROR_LOG` (concurrent CLI
+processes would race on a shared log file). With `SCCACHE_LOG` set, the setting
+is ignored and sccache stays in server-side mode.

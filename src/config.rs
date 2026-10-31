@@ -1490,9 +1490,7 @@ impl Config {
             // SCCACHE_ERROR_LOG; Even if SCCACHE_ERROR_LOG was handled, there would
             // be write races from multiple processes. Until those are addressed, we
             // can't leave the client mode enabled alongside logging.
-            && std::env::var_os(crate::LOGGING_ENV).is_none()
-            // Client-side mode is not compatible with REAPI, whose executor runs in the server.
-            && !(cfg!(feature = "reapi") && dist.reapi.is_some());
+            && std::env::var_os(crate::LOGGING_ENV).is_none();
 
         let (caches, fallback_cache) = conf_caches.clone().into_fallback();
         Ok(Self {
@@ -3721,32 +3719,25 @@ enpoint = "x"
 
 #[cfg(feature = "reapi")]
 #[test]
-fn test_reapi_turns_client_side_mode_off() {
-    let client_side_mode = |reapi: Option<ReapiConfig>| {
-        let env_conf = EnvConfig {
-            cache: Default::default(),
-            basedirs: None,
-            dist_cache_dir: None,
-            client_side_mode: Some(true),
-        };
-        let file_conf = FileConfig {
-            dist: DistConfig {
-                reapi,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        Config::from_env_and_file_configs(env_conf, file_conf)
-            .unwrap()
-            .client_side_mode
+fn config_client_side_mode_stays_on_with_reapi() {
+    let env_conf = EnvConfig {
+        cache: Default::default(),
+        basedirs: None,
+        dist_cache_dir: None,
+        client_side_mode: Some(true),
     };
-    let reapi = toml::from_str("endpoint = \"grpc://farm:8980\"").unwrap();
-    assert!(!client_side_mode(Some(reapi)));
-    // SCCACHE_LOG also turns client-side mode off.
-    assert_eq!(
-        std::env::var_os(crate::LOGGING_ENV).is_none(),
-        client_side_mode(None)
-    );
+    let file_conf = FileConfig {
+        dist: DistConfig {
+            reapi: Some(toml::from_str("endpoint = \"grpc://farm:8980\"").unwrap()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let config = temp_env::with_var_unset(crate::LOGGING_ENV, || {
+        Config::from_env_and_file_configs(env_conf, file_conf).unwrap()
+    });
+    assert!(config.client_side_mode);
 }
 
 #[test]

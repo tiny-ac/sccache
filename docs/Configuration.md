@@ -50,7 +50,7 @@ token = "secrettoken"
 
 # Experimental, needs sccache built with the reapi feature: a Remote
 # Execution API (REAPI) server for Rust compiles. Setting it turns
-# sccache-dist (even with scheduler_url set) and client-side mode off.
+# sccache-dist off, even with scheduler_url set.
 # See docs/Reapi.md.
 #[dist.reapi]
 # grpc://host:port, or grpcs://host:port for TLS (required)
@@ -253,7 +253,7 @@ Note that some env variables may need sccache server restart to take effect.
 * `SCCACHE_STARTUP_NOTIFY` specify a path to a socket which will be used for server completion notification
 * `SCCACHE_MAX_FRAME_LENGTH` how much data can be transferred between client and server
 * `SCCACHE_NO_DAEMON` set to `1` to disable putting the server to the background
-* `SCCACHE_CLIENT_SIDE` set to `1` to run the compile in the client process and use the daemon for cache storage and sccache-dist (see [the architecture doc](Architecture.md#client-side-mode-sccache_client_side)). This is the recommended mode and is expected to become the only supported configuration in the future. Ignored when `SCCACHE_LOG` or `[dist.reapi]` is in use.
+* `SCCACHE_CLIENT_SIDE` set to `1` to run the compile in the client process and use the daemon for cache storage, sccache-dist and REAPI (see [the architecture doc](Architecture.md#client-side-mode-sccache_client_side)). This is the recommended mode and is expected to become the only supported configuration in the future. Ignored when `SCCACHE_LOG` is set.
 * `SCCACHE_CACHE_READ_TIMEOUT_SECS` how long, in seconds, a cache lookup may take before sccache gives up on it and compiles locally. Defaults to `60`. A lower value helps when the storage backend is slow or unresponsive rather than failing outright, for example in CI.
 * `SCCACHE_SKIP_CACHE_CHECK` set to `true`, `on`, or `1` to skip remote cache capability checks. The configured backend `rw_mode` is used without reading or writing `.sccache_check`. The user is responsible for ensuring that the cache is reachable and grants the configured access.
 * `SCCACHE_CACHE_MULTIARCH` set (to any value, even `0`) to enable caching of builds with several different `-arch` flags, which are not cached by default. See [the caching doc](Caching.md#cc-compiler).
