@@ -27,7 +27,7 @@ use super::connection::{Connection, ServerApis};
 use super::credential_helper::{self, CredentialHelper};
 use super::digest::DigestCache;
 use super::execution::{Execution, MissingActionBlobs, QueuedTooLong};
-use super::mapping::{CompileLocallyReason, ReapiCompile, ToolchainKey};
+use super::mapping::{CompileLocallyReason, ReapiCompile, RustcToolchainKey, ToolchainKey};
 use super::pause::Pause;
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use super::remote_compile::{
@@ -83,7 +83,7 @@ pub(crate) struct ReapiExecutor {
     is_linux_client: bool,
     /// The toolchains workers run for a client that doesn't run Linux.
     worker_toolchains: WorkerToolchains,
-    rustc_checks: Mutex<HashMap<ToolchainKey, Arc<RustcCheck>>>,
+    toolchain_checks: Mutex<HashMap<ToolchainKey, Arc<ToolchainCheck>>>,
     /// Set when the server refuses an execution, so misses compile locally until the sccache
     /// server restarts.
     executions_refused: AtomicBool,
@@ -100,17 +100,17 @@ enum Slot {
     Local(OwnedSemaphorePermit),
 }
 
-/// The check, once per toolchain, that the workers run its rustc.
+/// The check, once per toolchain, that the workers run its compiler.
 #[derive(Default)]
-struct RustcCheck {
-    outcome: tokio::sync::OnceCell<RustcOnWorkers>,
+struct ToolchainCheck {
+    outcome: tokio::sync::OnceCell<ToolchainOnWorkers>,
     /// How many checks failed to reach a worker, and the last one's reason, so a compile that
     /// waited for a check that failed doesn't start another.
     failures: Mutex<(u64, Option<CompileLocallyReason>)>,
 }
 
 #[derive(Clone, Copy)]
-enum RustcOnWorkers {
+enum ToolchainOnWorkers {
     Matches,
     /// Compiles with the toolchain compile locally, for this reason.
     Unusable(CompileLocallyReason),
@@ -174,7 +174,7 @@ impl ReapiExecutor {
                 dist_toolchains,
                 dist_cache_dir.join(WORKER_TOOLCHAINS_DIR),
             ),
-            rustc_checks: Default::default(),
+            toolchain_checks: Default::default(),
             executions_refused: AtomicBool::new(false),
             local_slots: config
                 .local_slots
@@ -397,15 +397,15 @@ impl ReapiExecutor {
         if self.executions_refused.load(Ordering::Relaxed) {
             return compile_locally(out_pretty, CompileLocallyReason::ExecutionsRefused);
         }
-        let rustc_check = self
-            .rustc_checks
+        let toolchain_check = self
+            .toolchain_checks
             .lock()
             .unwrap()
             .entry(reapi_compile.toolchain.clone())
             .or_default()
             .clone();
         // Without a call to make, the compile mustn't take the one a pause lets through.
-        if let Some(RustcOnWorkers::Unusable(reason)) = rustc_check.outcome.get() {
+        if let Some(ToolchainOnWorkers::Unusable(reason)) = toolchain_check.outcome.get() {
             return compile_locally(out_pretty, *reason);
         }
         // Bounded like a queued execution, since slots stay taken while executions wait for
@@ -423,8 +423,8 @@ impl ReapiExecutor {
             return compile_locally(out_pretty, CompileLocallyReason::ExecutionsPaused);
         }
         let executed = async {
-            self.check_rustc_on_workers(
-                &rustc_check,
+            self.check_toolchain_on_workers(
+                &toolchain_check,
                 &apis,
                 execution,
                 &reapi_compile.toolchain,
@@ -505,13 +505,13 @@ impl ReapiExecutor {
         Ok((outcome, output))
     }
 
-    /// Runs the `rustc -vV` of toolchain `key` on a worker, once per `key`. Fails when the
-    /// workers can't run that rustc, or when it prints another commit hash than the local one.
-    /// A check that fails to reach a worker isn't kept, so the next miss checks again, but
-    /// compiles that waited for it compile locally.
-    async fn check_rustc_on_workers(
+    /// Runs the compiler of toolchain `key` on a worker, once per `key`. Fails when the workers
+    /// can't run it, or when it reports another version than the local one. A check that fails
+    /// to reach a worker isn't kept, so the next miss checks again, but compiles that waited
+    /// for it compile locally.
+    async fn check_toolchain_on_workers(
         &self,
-        check: &RustcCheck,
+        check: &ToolchainCheck,
         apis: &ServerApis,
         execution: &Execution,
         key: &ToolchainKey,
@@ -528,9 +528,15 @@ impl ReapiExecutor {
                 {
                     return Err(reason);
                 }
-                let checked = self
-                    .run_rustc_on_worker(apis, execution, key, toolchain, out_pretty)
-                    .await;
+                let checked = match key {
+                    ToolchainKey::Rustc(key) => {
+                        self.run_rustc_on_worker(apis, execution, key, toolchain, out_pretty)
+                            .await
+                    }
+                    ToolchainKey::C(_) => Ok(ToolchainOnWorkers::Unusable(
+                        CompileLocallyReason::CToolchainUnsupported,
+                    )),
+                };
                 if let Err(reason) = checked {
                     *check.failures.lock().unwrap() = (failures + 1, Some(reason));
                 }
@@ -538,8 +544,8 @@ impl ReapiExecutor {
             })
             .await?;
         match outcome {
-            RustcOnWorkers::Unusable(reason) => compile_locally(out_pretty, *reason),
-            RustcOnWorkers::Matches => Ok(()),
+            ToolchainOnWorkers::Unusable(reason) => compile_locally(out_pretty, *reason),
+            ToolchainOnWorkers::Matches => Ok(()),
         }
     }
 
@@ -547,10 +553,10 @@ impl ReapiExecutor {
         &self,
         apis: &ServerApis,
         execution: &Execution,
-        key: &ToolchainKey,
+        key: &RustcToolchainKey,
         toolchain: &ToolchainFiles,
         out_pretty: &str,
-    ) -> std::result::Result<RustcOnWorkers, CompileLocallyReason> {
+    ) -> std::result::Result<ToolchainOnWorkers, CompileLocallyReason> {
         let (files, action_options) = (toolchain.clone(), self.action_options.clone());
         let action = tokio::task::spawn_blocking(move || {
             rustc_version_action_blobs(&files, &action_options)
@@ -588,7 +594,7 @@ impl ReapiExecutor {
                 "REAPI: rustc -vV of {sysroot} printed on stderr: {}",
                 loggable(&result.stderr_raw)
             );
-            return Ok(RustcOnWorkers::Unusable(
+            return Ok(ToolchainOnWorkers::Unusable(
                 CompileLocallyReason::RustcFailsOnWorkers,
             ));
         }
@@ -614,11 +620,11 @@ impl ReapiExecutor {
                 loggable(commit_hash.unwrap_or_default().as_bytes()),
                 key.commit_hash
             );
-            return Ok(RustcOnWorkers::Unusable(
+            return Ok(ToolchainOnWorkers::Unusable(
                 CompileLocallyReason::RustcCommitDiffersOnWorkers,
             ));
         }
-        Ok(RustcOnWorkers::Matches)
+        Ok(ToolchainOnWorkers::Matches)
     }
 }
 
@@ -987,7 +993,7 @@ pub(super) mod test {
                 path_mapper: PathMapper::new(ws.clone(), ws.join("target")),
                 arguments: vec![],
                 mapped_crate_root: None,
-                toolchain: ToolchainKey::new(
+                toolchain: ToolchainKey::rustc(
                     self.commit_hash.clone(),
                     self.dir.join("sysroot"),
                     TARGET_TRIPLE.to_owned(),
@@ -1466,8 +1472,8 @@ pub(super) mod test {
         assert_eq!(DistType::Reapi(ReapiOutcome::Executed), dist_type);
         assert!(fixture.server.has_blob(b"linux rustc"));
         // So that a changed archive has its rustc checked again.
-        let checked: Vec<_> = (executor.rustc_checks.lock().unwrap().keys())
-            .map(|toolchain| toolchain.sysroot.clone())
+        let checked: Vec<_> = (executor.toolchain_checks.lock().unwrap().keys())
+            .map(|toolchain| toolchain.as_rustc().sysroot.clone())
             .collect();
         assert!(
             matches!(&checked[..], [sysroot] if sysroot.ends_with("toolchain")),

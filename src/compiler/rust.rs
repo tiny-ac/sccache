@@ -2632,7 +2632,7 @@ mod reapi_mapping {
             path_mapper,
             arguments,
             mapped_crate_root,
-            toolchain: ToolchainKey::new(commit_hash, compilation.sysroot.clone(), target_triple),
+            toolchain: ToolchainKey::rustc(commit_hash, compilation.sysroot.clone(), target_triple),
             env,
             input_root_files,
             outputs,
@@ -5785,12 +5785,15 @@ foo.rs:
         #[test]
         fn test_passes_the_target_triple() {
             let compile = map_for_reapi(&compilation(&[])).unwrap();
-            assert_eq!(HOST, compile.toolchain.target_triple);
+            assert_eq!(HOST, compile.toolchain.as_rustc().target_triple);
             assert!(compile.arguments.contains(&format!("--target={HOST}")));
 
             let compile =
                 map_for_reapi(&compilation(&["--target", "aarch64-unknown-linux-gnu"])).unwrap();
-            assert_eq!("aarch64-unknown-linux-gnu", compile.toolchain.target_triple);
+            assert_eq!(
+                "aarch64-unknown-linux-gnu",
+                compile.toolchain.as_rustc().target_triple
+            );
             assert!(!compile.arguments.contains(&format!("--target={HOST}")));
             assert!(
                 compile

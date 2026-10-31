@@ -102,6 +102,10 @@ impl WorkerToolchains {
         local: &ToolchainKey,
         deadline: Instant,
     ) -> std::result::Result<Option<ToolchainKey>, CompileLocallyReason> {
+        // The archives hold rustc toolchains.
+        let ToolchainKey::Rustc(local) = local else {
+            return Ok(None);
+        };
         let rustc = local.sysroot.join("bin/rustc");
         let Some(archive) = self.archives.get(&rustc) else {
             debug!(
@@ -134,7 +138,7 @@ impl WorkerToolchains {
                 return Err(CompileLocallyReason::WorkerStdDiffers);
             }
             // The key reads the sysroot's stamps.
-            Ok(Some(ToolchainKey::new(
+            Ok(Some(ToolchainKey::rustc(
                 local.commit_hash,
                 sysroot,
                 local.target_triple,
@@ -403,7 +407,7 @@ mod test {
     }
 
     fn local_toolchain(sysroot: &Path) -> ToolchainKey {
-        ToolchainKey::new("abc".to_owned(), sysroot.to_owned(), TARGET.to_owned())
+        ToolchainKey::rustc("abc".to_owned(), sysroot.to_owned(), TARGET.to_owned())
     }
 
     fn in_secs(secs: u64) -> Instant {
@@ -430,10 +434,11 @@ mod test {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!("abc", toolchain.commit_hash);
-        assert_eq!(TARGET, toolchain.target_triple);
-        assert!(toolchain.sysroot.ends_with("opt/toolchain"));
-        assert!(toolchain.sysroot.join("bin/rustc").is_file());
+        let rustc = toolchain.as_rustc();
+        assert_eq!("abc", rustc.commit_hash);
+        assert_eq!(TARGET, rustc.target_triple);
+        assert!(rustc.sysroot.ends_with("opt/toolchain"));
+        assert!(rustc.sysroot.join("bin/rustc").is_file());
         let version = &versions(dir.path())[0];
         assert!(
             !version.join("etc").exists(),
@@ -467,6 +472,7 @@ mod test {
             .await
             .unwrap()
             .unwrap();
+        let (first, second) = (first.as_rustc(), second.as_rustc());
         assert_ne!(first.sysroot, second.sysroot);
         assert!(second.sysroot.join("lib/librustc_driver.so").is_file());
         assert_eq!(

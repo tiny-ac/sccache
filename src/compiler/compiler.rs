@@ -1013,7 +1013,7 @@ where
     fn map_for_reapi(
         &self,
     ) -> std::result::Result<crate::reapi::ReapiCompile, crate::reapi::NotEligible> {
-        Err(crate::reapi::CompileLocallyReason::NotRust.into())
+        Err(crate::reapi::CompileLocallyReason::UnsupportedCompiler.into())
     }
 
     /// Changes that make the local compile write the same outputs as a REAPI worker. May
