@@ -15,8 +15,8 @@
 //! Executes actions on a REAPI server's workers.
 
 use super::client::{
-    AuthChannel, Client, MAX_ACTION_RESULT_RESPONSE_BYTES, RPC_TIMEOUT, RpcError, rpc_code,
-    with_timeout,
+    AuthChannel, Client, MAX_ACTION_RESULT_RESPONSE_BYTES, RPC_TIMEOUT, RpcError, loggable,
+    rpc_code, with_timeout,
 };
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use super::proto::google::longrunning::{Operation, operation};
@@ -297,7 +297,10 @@ fn execute_response(result: Option<operation::Result>) -> Result<remexec::Execut
         return Err(if response.message.is_empty() {
             e
         } else {
-            e.context(format!("the REAPI server says: {}", response.message))
+            e.context(format!(
+                "the REAPI server says: {}",
+                loggable(response.message.as_bytes())
+            ))
         });
     }
     if response.result.is_none() {

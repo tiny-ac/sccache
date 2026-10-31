@@ -317,8 +317,15 @@ pub(crate) struct RpcError {
 
 impl std::fmt::Display for RpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}: {}", self.code, self.message)
+        write!(f, "{:?}: {}", self.code, loggable(self.message.as_bytes()))
     }
+}
+
+/// Text from the server for an error or a log line: escaped, so that it can't fake log lines
+/// or send terminal controls, and cut to 200 chars.
+pub(super) fn loggable(text: &[u8]) -> String {
+    let text: String = String::from_utf8_lossy(text).chars().take(200).collect();
+    format!("{text:?}")
 }
 
 impl std::error::Error for RpcError {}
@@ -510,6 +517,12 @@ mod test {
             minor,
             ..Default::default()
         })
+    }
+
+    #[test]
+    fn test_a_status_message_is_escaped() {
+        let e = status_error(tonic::Status::internal("ok\nINFO forged\x1b[2J"));
+        assert_eq!(r#"Internal: "ok\nINFO forged\u{1b}[2J""#, e.to_string());
     }
 
     #[tokio::test]
@@ -766,7 +779,7 @@ mod test {
         )));
         assert!(status.to_string().contains("reapi.example.com"));
         let e = status_error(status);
-        assert_eq!("Unavailable: transport error", e.to_string());
+        assert_eq!(r#"Unavailable: "transport error""#, e.to_string());
         assert_eq!(Some(tonic::Code::Unavailable), rpc_code(&e));
     }
 
