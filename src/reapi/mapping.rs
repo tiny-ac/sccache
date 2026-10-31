@@ -375,6 +375,7 @@ pub enum CompileLocallyReason {
     CToolchainUnsupported,
     MissingGccProgram,
     SharedLibrariesNotListed,
+    ClangConfigFile,
 }
 
 impl std::fmt::Display for CompileLocallyReason {
@@ -456,6 +457,7 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::CToolchainUnsupported => "C toolchain unsupported on workers",
             Self::MissingGccProgram => "gcc without its cc1, cc1plus or as",
             Self::SharedLibrariesNotListed => "failed to list the compiler's shared libraries",
+            Self::ClangConfigFile => "clang config file",
         })
     }
 }
