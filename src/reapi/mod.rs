@@ -42,7 +42,7 @@ pub(crate) use ipc::{
     ReapiIpcExecutor, ReapiIpcRequest, ReapiIpcResponse, handle_reapi_ipc_request,
 };
 pub(crate) use mapping::{
-    ActionEnv, CToolchainKey, CompileLocallyReason, NotEligible, PathMapper, ReapiCompile,
-    ToolchainKey, WorkerProgram, lexically_normalize,
+    ActionEnv, CToolchainKey, CompileLocallyReason, InternalFile, NotEligible, PathMapper,
+    ReapiCompile, ToolchainKey, WorkerProgram, lexically_normalize,
 };
 pub(crate) use sysroot::sysroot_copy;

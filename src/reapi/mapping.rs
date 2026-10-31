@@ -22,6 +22,7 @@
 //! build root (cargo's target dir) go under [`BUILD_ROOT_DIR`], and the toolchain goes
 //! under [`TOOLCHAIN_DIR`].
 
+use crate::compiler::CCompilerKind;
 use crate::errors::*;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -126,19 +127,49 @@ impl RustcToolchainKey {
     }
 }
 
-/// A local gcc or clang. The key includes the stamp of its driver, which changes when the
-/// compiler is updated in place.
+/// A local gcc or clang: its driver's canonical path, and the files besides the driver that
+/// it runs or reads to compile. The key includes their stamps, which change when one of them
+/// is updated in place.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct CToolchainKey {
+    pub(crate) kind: CCompilerKind,
     pub(crate) driver: PathBuf,
-    stamp: Option<Stamp>,
+    pub(crate) internal_files: Vec<InternalFile>,
+    stamps: Vec<Option<Stamp>>,
 }
 
 impl CToolchainKey {
-    /// Reads the stamp, so call it from a blocking thread.
-    pub(crate) fn new(driver: PathBuf) -> Self {
-        let stamp = stamp(&driver);
-        CToolchainKey { driver, stamp }
+    /// Reads the stamps, so call it from a blocking thread.
+    pub(crate) fn new(
+        kind: CCompilerKind,
+        driver: PathBuf,
+        internal_files: Vec<InternalFile>,
+    ) -> Self {
+        let stamps = std::iter::once(&driver)
+            .chain(internal_files.iter().map(|file| &file.path))
+            .map(|path| stamp(path))
+            .collect();
+        CToolchainKey {
+            kind,
+            driver,
+            internal_files,
+            stamps,
+        }
+    }
+}
+
+/// A file that gcc runs or reads to compile.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct InternalFile {
+    /// The driver option that prints its path, such as `-print-prog-name=cc1`.
+    pub(crate) option: String,
+    pub(crate) path: PathBuf,
+}
+
+impl InternalFile {
+    /// Whether the driver runs the file, rather than reading it.
+    pub(crate) fn is_program(&self) -> bool {
+        self.option.starts_with("-print-prog-name=")
     }
 }
 
@@ -265,6 +296,7 @@ pub enum CompileLocallyReason {
     ExtraOutput,
     NonUtf8Argument,
     CToolchainUnsupported,
+    MissingGccProgram,
 }
 
 impl std::fmt::Display for CompileLocallyReason {
@@ -343,6 +375,7 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::ExtraOutput => "output besides the object and the depfile",
             Self::NonUtf8Argument => "non-UTF-8 argument",
             Self::CToolchainUnsupported => "C toolchain unsupported on workers",
+            Self::MissingGccProgram => "gcc without its cc1, cc1plus or as",
         })
     }
 }

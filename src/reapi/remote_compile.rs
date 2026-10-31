@@ -764,6 +764,7 @@ fn exit_status_from_code(exit_code: u8) -> process::ExitStatus {
 #[cfg(test)]
 pub(super) mod test {
     use super::*;
+    use crate::compiler::CCompilerKind;
     use crate::reapi::fake::FakeServer;
     use crate::reapi::mapping::CToolchainKey;
     use crate::reapi::{ActionEnv, PathMapper};
@@ -1133,7 +1134,11 @@ pub(super) mod test {
         let compile = ReapiCompile {
             arguments: vec!["-c".to_owned(), "src/x.c".to_owned()],
             program: WorkerProgram::C,
-            toolchain: ToolchainKey::C(CToolchainKey::new("/usr/bin/gcc".into())),
+            toolchain: ToolchainKey::C(CToolchainKey::new(
+                CCompilerKind::Gcc,
+                "/usr/bin/gcc".into(),
+                vec![],
+            )),
             ..reapi_compile_in("/home/a/ws")
         };
         let command = build_command(&compile);

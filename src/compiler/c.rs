@@ -31,6 +31,7 @@ use crate::util::{
 };
 use async_trait::async_trait;
 use fs_err as fs;
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -170,7 +171,7 @@ struct CCompilation<I: CCompilerImpl> {
 }
 
 /// Supported C compilers.
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Hash, Serialize, Deserialize)]
 pub enum CCompilerKind {
     /// GCC
     Gcc,
