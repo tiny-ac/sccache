@@ -170,6 +170,15 @@ impl DistClientContainer {
     pub(crate) fn reapi_executor(&self) -> Option<&crate::reapi::ReapiExecutor> {
         self.reapi.as_deref()
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_reapi_executor(
+        mut self,
+        executor: Arc<crate::reapi::ReapiExecutor>,
+    ) -> Self {
+        self.reapi = Some(executor);
+        self
+    }
 }
 
 #[cfg(not(feature = "reapi"))]
@@ -964,6 +973,11 @@ where
     #[cfg(feature = "dist-client")]
     pending_dist_toolchains: Arc<PendingDistToolchains>,
 
+    /// The local slot the daemon holds while the connection's CLI compiles a REAPI build's
+    /// miss locally.
+    #[cfg(feature = "reapi")]
+    reapi_local_slot: Arc<Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
+
     /// Cache storage.
     storage: Arc<dyn Storage>,
 
@@ -1112,6 +1126,7 @@ where
                     debug!("handle_client: reapi");
                     let response = crate::reapi::handle_reapi_ipc_request(
                         me.dist_client.reapi_executor(),
+                        &mut *me.reapi_local_slot.lock().await,
                         request,
                     )
                     .await;
@@ -1223,6 +1238,8 @@ where
             dist_ipc_executor: None,
             #[cfg(feature = "dist-client")]
             pending_dist_toolchains: Arc::default(),
+            #[cfg(feature = "reapi")]
+            reapi_local_slot: Arc::default(),
         }
     }
 
@@ -1281,6 +1298,8 @@ where
             dist_ipc_executor: None,
             #[cfg(feature = "dist-client")]
             pending_dist_toolchains: Arc::default(),
+            #[cfg(feature = "reapi")]
+            reapi_local_slot: Arc::default(),
         }
     }
 
@@ -1309,6 +1328,8 @@ where
             dist_ipc_executor: None,
             #[cfg(feature = "dist-client")]
             pending_dist_toolchains: Arc::default(),
+            #[cfg(feature = "reapi")]
+            reapi_local_slot: Arc::default(),
         }
     }
 
@@ -1334,6 +1355,14 @@ where
 
         let (reqs_tx, mut reqs_rx) = tokio::sync::mpsc::unbounded_channel();
 
+        // The connection's own local slot. Closing the connection releases it, as when the CLI
+        // exits mid-compile.
+        #[cfg(feature = "reapi")]
+        let me = Arc::new(Self {
+            reapi_local_slot: Arc::default(),
+            ..self
+        });
+        #[cfg(not(feature = "reapi"))]
         let me = Arc::new(self);
 
         // The reader loop below feeds requests into `reqs_tx`; this task drains

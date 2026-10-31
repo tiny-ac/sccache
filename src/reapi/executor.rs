@@ -212,7 +212,7 @@ impl ReapiExecutor {
 
     /// The next free local slot, so that local compiles don't oversubscribe the cores while
     /// other compiles execute on workers; `None` without `local_slots`.
-    async fn local_slot(&self) -> Option<OwnedSemaphorePermit> {
+    pub(super) async fn local_slot(&self) -> Option<OwnedSemaphorePermit> {
         let local_slots = self.local_slots.clone()?;
         Some(local_slots.acquire_owned().await.expect(SLOTS_NEVER_CLOSE))
     }
