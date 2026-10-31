@@ -16,7 +16,7 @@
 mod args;
 mod c;
 #[cfg(feature = "reapi")]
-mod c_reapi;
+pub(crate) mod c_reapi;
 mod cicc;
 mod clang;
 #[macro_use]
