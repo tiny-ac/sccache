@@ -208,11 +208,31 @@ impl DigestCache {
         Ok(digest)
     }
 
+    /// How long to wait before hashing files with `stamps`, so that their digests can be kept
+    /// for as long as the stamps stay the same. An edit soon after a file's last change can
+    /// leave its stamp unchanged, as [`MIN_AGE_TO_CACHE`] says.
+    pub(crate) fn settling_time<'a>(
+        &self,
+        stamps: impl IntoIterator<Item = &'a FileStamp>,
+    ) -> Duration {
+        let latest_settled_change = Timestamp::from(SystemTime::now() - self.min_age_to_cache);
+        if (stamps.into_iter()).any(|stamp| stamp.last_change() > latest_settled_change) {
+            self.min_age_to_cache
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_min_age_to_cache(mut self, min_age_to_cache: Duration) -> Self {
+        self.min_age_to_cache = min_age_to_cache;
+        self
+    }
+
     /// Caches files however recently they changed.
     #[cfg(test)]
-    pub(super) fn caching_new_files(mut self) -> Self {
-        self.min_age_to_cache = Duration::ZERO;
-        self
+    pub(super) fn caching_new_files(self) -> Self {
+        self.with_min_age_to_cache(Duration::ZERO)
     }
 
     pub(crate) fn save(&self) -> Result<()> {
@@ -248,9 +268,7 @@ mod test {
     use test_case::test_case;
 
     fn load_without_min_age(save_file: PathBuf) -> DigestCache {
-        let mut cache = DigestCache::load(save_file);
-        cache.min_age_to_cache = Duration::ZERO;
-        cache
+        DigestCache::load(save_file).caching_new_files()
     }
 
     fn set_mtime(path: &Path, unix_time: i64) {
