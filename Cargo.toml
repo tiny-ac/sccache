@@ -124,6 +124,11 @@ tonic = { version = "0.14.6", optional = true, default-features = false, feature
   "tls-native-roots",
 ] }
 tonic-prost = { version = "0.14.6", optional = true }
+# The REAPI client reads the names out of rustls' certificate errors. tonic already depends on
+# rustls for TLS.
+rustls = { version = "0.23.31", optional = true, default-features = false, features = [
+  "std",
+] }
 tower-service = "0.3"
 typed-path = "0.13.0"
 unit-prefix = "0.5"
@@ -292,6 +297,7 @@ reapi = [
   "flate2",
   "prost",
   "prost-types",
+  "dep:rustls",
   "sha2",
   "tonic",
   # For the tests' fake REAPI servers; a dev-dependency can't be optional.
