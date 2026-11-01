@@ -23,12 +23,12 @@
 //! under [`TOOLCHAIN_DIR`].
 
 use super::client::{CPP_COMPILE_MNEMONIC, RUSTC_MNEMONIC};
+use super::digest::FileStamp;
 use crate::compiler::CCompilerKind;
 use crate::errors::*;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
-use std::time::SystemTime;
 use tempfile::TempPath;
 
 /// The input root's directory for files under the local build root.
@@ -140,7 +140,7 @@ pub(crate) struct RustcToolchainKey {
     pub(crate) commit_hash: String,
     pub(crate) sysroot: PathBuf,
     pub(crate) target_triple: String,
-    stamps: Vec<Option<Stamp>>,
+    stamps: Vec<Option<FileStamp>>,
 }
 
 impl RustcToolchainKey {
@@ -152,7 +152,7 @@ impl RustcToolchainKey {
             sysroot.join("lib/rustlib").join(&target_triple).join("lib"),
         ]
         .iter()
-        .map(|path| stamp(path))
+        .map(|path| FileStamp::of(path).ok())
         .collect();
         RustcToolchainKey {
             commit_hash,
@@ -172,7 +172,7 @@ pub(crate) struct CToolchainKey {
     pub(crate) driver: PathBuf,
     pub(crate) internal_files: Vec<InternalFile>,
     pub(crate) libraries: Vec<PathBuf>,
-    stamps: Vec<Option<Stamp>>,
+    stamps: Vec<Option<FileStamp>>,
 }
 
 impl CToolchainKey {
@@ -209,7 +209,7 @@ impl CToolchainKey {
         let stamps = std::iter::once(&driver)
             .chain(internal_files.iter().map(|file| &file.path))
             .chain(&libraries)
-            .map(|path| stamp(path))
+            .map(|path| FileStamp::of(path).ok())
             .collect();
         CToolchainKey {
             kind,
@@ -273,14 +273,6 @@ fn shared_libraries(program: &Path) -> Result<Vec<PathBuf>> {
 #[cfg(not(target_os = "linux"))]
 fn shared_libraries(_program: &Path) -> Result<Vec<PathBuf>> {
     Ok(vec![])
-}
-
-/// A file's size and modification time.
-type Stamp = (u64, SystemTime);
-
-fn stamp(path: &Path) -> Option<Stamp> {
-    let metadata = std::fs::metadata(path).ok()?;
-    Some((metadata.len(), metadata.modified().ok()?))
 }
 
 /// The environment a compile's action runs with.
@@ -712,6 +704,26 @@ mod test {
 
         std::fs::write(&library, b"gmp 1.1").unwrap();
         assert_ne!(original, key(), "the library changed");
+    }
+
+    // Windows stamps have no inode, only a creation time.
+    #[cfg(unix)]
+    #[test]
+    fn test_a_toolchain_key_changes_with_a_file_replaced_by_one_of_the_same_size_and_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let (driver, replacement) = (dir.path().join("gcc"), dir.path().join("gcc.new"));
+        std::fs::write(&driver, b"gcc 1").unwrap();
+        std::fs::write(&replacement, b"gcc 2").unwrap();
+        let mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        for file in [&driver, &replacement] {
+            filetime::set_file_mtime(file, mtime).unwrap();
+        }
+        let key =
+            || CToolchainKey::with_libraries(CCompilerKind::Gcc, driver.clone(), vec![], vec![]);
+        let original = key();
+        // As when an archive that keeps its files' mtimes is unpacked over the toolchain.
+        std::fs::rename(&replacement, &driver).unwrap();
+        assert_ne!(original, key());
     }
 
     fn path_mapper() -> PathMapper {
