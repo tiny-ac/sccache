@@ -821,7 +821,7 @@ pub struct ReapiConfig {
     pub platform: BTreeMap<String, String>,
     /// Headers sent with every request, such as a proxy's API key.
     #[serde(default)]
-    pub headers: BTreeMap<String, String>,
+    pub headers: BTreeMap<String, ReapiHeaderValue>,
     /// What a compile that misses the action cache does.
     #[serde(default)]
     pub on_miss: ReapiOnMiss,
@@ -835,6 +835,30 @@ pub struct ReapiConfig {
     /// The most compiles that execute on workers at once; a miss that waits longer than
     /// `queue_timeout_secs` for one compiles locally. Unset doesn't limit them.
     pub remote_slots: Option<NonZeroUsize>,
+}
+
+/// A `[dist.reapi.headers]` value, which `Debug` leaves out, since it may be a credential.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ReapiHeaderValue(String);
+
+impl ReapiHeaderValue {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl From<&str> for ReapiHeaderValue {
+    fn from(value: &str) -> Self {
+        ReapiHeaderValue(value.to_owned())
+    }
+}
+
+impl fmt::Debug for ReapiHeaderValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ReapiHeaderValue(<redacted>)")
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3204,7 +3228,7 @@ key_prefix = "cosprefix"
                     ready_wait_secs: 5,
                     salt: "1".to_owned(),
                     platform: [("OSFamily".to_owned(), "linux".to_owned())].into(),
-                    headers: [("x-api-key".to_owned(), "key".to_owned())].into(),
+                    headers: [("x-api-key".to_owned(), "key".into())].into(),
                     on_miss: ReapiOnMiss::Local,
                     queue_timeout_secs: Some(120),
                     local_slots: NonZeroUsize::new(4),
@@ -3767,6 +3791,30 @@ endpoint = "grpcs://farm.example.com:443"
         }),
         config.dist.reapi
     );
+}
+
+#[test]
+fn test_reapi_header_values_are_left_out_of_debug_and_kept_by_serialize() {
+    let config: FileConfig = toml::from_str(
+        r#"
+[dist.reapi]
+endpoint = "grpcs://farm.example.com:443"
+
+[dist.reapi.headers]
+x-api-key = "secret-key"
+"#,
+    )
+    .unwrap();
+    for debug in [format!("{config:?}"), format!("{config:#?}")] {
+        assert!(
+            debug.contains("x-api-key") && !debug.contains("secret-key"),
+            "{debug}"
+        );
+    }
+    let reapi = config.dist.reapi.unwrap();
+    assert_eq!("secret-key", reapi.headers["x-api-key"].as_str());
+    let written = toml::to_string(&reapi).unwrap();
+    assert_eq!(reapi, toml::from_str(&written).unwrap());
 }
 
 #[test]
