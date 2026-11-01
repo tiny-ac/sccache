@@ -29,6 +29,7 @@ mod executor;
 mod fake;
 mod input_root;
 mod ipc;
+mod jitter;
 mod mapping;
 mod pause;
 pub(crate) mod proto;
