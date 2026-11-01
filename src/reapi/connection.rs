@@ -178,7 +178,7 @@ impl Connection {
 
     /// How many times the auth token or the credential helper's headers changed; 0 without
     /// either. Only one of them can be configured, so the sum counts the changes of that one.
-    fn credentials_version(&self) -> u64 {
+    pub(super) fn credentials_version(&self) -> u64 {
         let auth_token = self.options.auth_token.as_ref();
         let credential_helper = self.options.credential_helper.as_ref();
         auth_token.map_or(0, |auth_token| auth_token.version())

@@ -503,7 +503,7 @@ mod test {
     #[tokio::test]
     async fn test_a_failed_precondition_without_missing_blobs_keeps_its_code() {
         let e = execute(FakeServer {
-            execute_error: Some(tonic::Code::FailedPrecondition),
+            execute_error: Some(tonic::Code::FailedPrecondition).into(),
             ..writing_server()
         })
         .await

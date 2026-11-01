@@ -51,7 +51,6 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -91,9 +90,9 @@ pub(crate) struct ReapiExecutor {
     /// The toolchains workers run for a client that doesn't run Linux.
     worker_toolchains: WorkerToolchains,
     toolchain_checks: Mutex<HashMap<ToolchainKey, Arc<ToolchainCheck>>>,
-    /// Set when the server refuses an execution, so misses compile locally until the sccache
-    /// server restarts.
-    executions_refused: AtomicBool,
+    /// The version of the credentials the server refused an execution or an upload for, so
+    /// that misses compile locally until the credentials change.
+    executions_refused_credentials_version: Mutex<Option<u64>>,
     /// `None` without `local_slots`.
     local_slots: Option<Arc<Semaphore>>,
     /// `None` without `remote_slots`.
@@ -183,7 +182,7 @@ impl ReapiExecutor {
                 dist_cache_dir.join(WORKER_TOOLCHAINS_DIR),
             ),
             toolchain_checks: Default::default(),
-            executions_refused: AtomicBool::new(false),
+            executions_refused_credentials_version: Default::default(),
             local_slots: config
                 .local_slots
                 .map(|slots| Arc::new(Semaphore::new(slots.get()))),
@@ -415,7 +414,8 @@ impl ReapiExecutor {
         let Some(execution) = &apis.execution else {
             return compile_locally(out_pretty, CompileLocallyReason::ExecutionUnsupported);
         };
-        if self.executions_refused.load(Ordering::Relaxed) {
+        let credentials_version = self.credentials_version();
+        if self.executions_refused(credentials_version) {
             return compile_locally(out_pretty, CompileLocallyReason::ExecutionsRefused);
         }
         let toolchain_check = self
@@ -470,12 +470,7 @@ impl ReapiExecutor {
                 response
             }
             Err(CompileLocallyReason::ExecutionsRefused) => {
-                if !self.executions_refused.swap(true, Ordering::Relaxed) {
-                    warn!(
-                        "REAPI: the server refused an execution; compiling misses locally until \
-                         the sccache server restarts"
-                    );
-                }
+                self.refuse_executions(credentials_version);
                 return Err(CompileLocallyReason::ExecutionsRefused);
             }
             // A toolchain file can change without changing the key's stamps, if edited soon
@@ -547,6 +542,43 @@ impl ReapiExecutor {
             ReapiOutcome::Executed
         };
         Ok((outcome, output))
+    }
+
+    /// How many times the credentials changed; 0 without a connection.
+    fn credentials_version(&self) -> u64 {
+        (self.connection.as_ref()).map_or(0, |connection| connection.credentials_version())
+    }
+
+    /// Whether the server refused an execution or an upload for credentials of
+    /// `credentials_version`. New credentials end the refusal.
+    fn executions_refused(&self, credentials_version: u64) -> bool {
+        let mut refused = self.executions_refused_credentials_version.lock().unwrap();
+        match *refused {
+            Some(refused_version) if refused_version == credentials_version => true,
+            Some(_) => {
+                info!("REAPI: the credentials changed; executing misses again");
+                *refused = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Makes misses compile locally while the credentials keep `credentials_version`, which
+    /// they had before the refused execution.
+    fn refuse_executions(&self, credentials_version: u64) {
+        // The refused calls may have carried the earlier credentials; the new ones get their
+        // own execution.
+        if self.credentials_version() != credentials_version {
+            return;
+        }
+        let mut refused = self.executions_refused_credentials_version.lock().unwrap();
+        if refused.replace(credentials_version) != Some(credentials_version) {
+            warn!(
+                "REAPI: the server refused an execution; compiling misses locally until the \
+                 sccache server restarts or the credentials change"
+            );
+        }
     }
 
     /// Runs the compiler of toolchain `key` on a worker, once per `key`. Fails when the workers
@@ -1266,7 +1298,7 @@ pub(super) mod test {
     /// toolchain and `ws/src/lib.rs`.
     pub(in crate::reapi) struct Fixture {
         pub(in crate::reapi) runtime: tokio::runtime::Runtime,
-        server: Arc<FakeServer>,
+        pub(in crate::reapi) server: Arc<FakeServer>,
         pub(in crate::reapi) dir: tempfile::TempDir,
         pub(in crate::reapi) config: ReapiConfig,
         eligibility: Eligibility,
@@ -2152,7 +2184,7 @@ pub(super) mod test {
     )]
     #[test_case::test_case(
         FakeServer {
-            execute_error: Some(tonic::Code::PermissionDenied),
+            execute_error: Some(tonic::Code::PermissionDenied).into(),
             ..Default::default()
         } ;
         "execute permission denied"
@@ -2164,25 +2196,145 @@ pub(super) mod test {
             compiled_locally("REAPI server refused executions"),
             fixture.compile_with(&executor).0
         );
-        let calls = |server: &FakeServer| {
-            (
-                server.find_missing_blobs_calls.load(Ordering::SeqCst),
-                server.execute_calls.load(Ordering::SeqCst),
-            )
-        };
-        let calls_before = calls(&fixture.server);
+        let calls_before = execution_calls(&fixture.server);
         for _ in 0..=FAILURES_TO_PAUSE {
             assert_eq!(
                 compiled_locally("REAPI server refused executions"),
                 fixture.compile_with(&executor).0
             );
         }
-        assert_eq!(calls_before, calls(&fixture.server));
+        assert_eq!(calls_before, execution_calls(&fixture.server));
         fixture.put_result_in_action_cache(|_| {});
         assert_eq!(
             DistType::Reapi(ReapiOutcome::ActionCacheHit),
             fixture.compile_with(&executor).0
         );
+    }
+
+    /// The fixture's executor, connecting with `credentials` instead of the config's.
+    pub(in crate::reapi) fn executor_with_credentials(
+        fixture: &Fixture,
+        credentials: impl FnOnce(&mut ConnectOptions),
+    ) -> ReapiExecutor {
+        let mut options = read_connect_options(&fixture.config).unwrap();
+        credentials(&mut options);
+        let mut executor = fixture.executor();
+        executor.connection = Some(Connection::new(options));
+        executor
+    }
+
+    /// FindMissingBlobs and Execute calls, which every execution starts with.
+    fn execution_calls(server: &FakeServer) -> (usize, usize) {
+        (
+            server.find_missing_blobs_calls.load(Ordering::SeqCst),
+            server.execute_calls.load(Ordering::SeqCst),
+        )
+    }
+
+    fn refused_credentials_version(executor: &ReapiExecutor) -> Option<u64> {
+        *executor
+            .executions_refused_credentials_version
+            .lock()
+            .unwrap()
+    }
+
+    #[test_case::test_case(|server| &server.upload_error ; "upload")]
+    #[test_case::test_case(|server| &server.execute_error ; "execute")]
+    fn test_a_new_auth_token_lifts_refused_executions(
+        refused_calls: fn(&FakeServer) -> &Mutex<Option<tonic::Code>>,
+    ) {
+        let fixture = executing_fixture(FakeServer::default());
+        let refuse = |code| *refused_calls(&fixture.server).lock().unwrap() = code;
+        refuse(Some(tonic::Code::PermissionDenied));
+        let (auth_token, write_token) =
+            auth_token::test::token_file(fixture.dir.path(), Duration::ZERO);
+        let executor = executor_with_credentials(&fixture, |options| {
+            options.auth_token = Some(auth_token.clone());
+        });
+        let read_again_now = || {
+            (fixture.runtime).block_on(auth_token::test::read_again_now(&auth_token));
+        };
+        let refused = compiled_locally("REAPI server refused executions");
+        assert_eq!(refused, fixture.compile_with(&executor).0);
+        read_again_now();
+        let calls_before = execution_calls(&fixture.server);
+        assert_eq!(refused, fixture.compile_with(&executor).0, "the same token");
+        assert_eq!(calls_before, execution_calls(&fixture.server));
+
+        write_token("second");
+        read_again_now();
+        assert_eq!(refused, fixture.compile_with(&executor).0);
+        assert_ne!(calls_before, execution_calls(&fixture.server));
+        // The second token is refused too.
+        let calls_before = execution_calls(&fixture.server);
+        assert_eq!(refused, fixture.compile_with(&executor).0);
+        assert_eq!(calls_before, execution_calls(&fixture.server));
+
+        write_token("third");
+        read_again_now();
+        refuse(None);
+        assert_eq!(
+            DistType::Reapi(ReapiOutcome::Executed),
+            fixture.compile_with(&executor).0
+        );
+        assert_eq!(None, refused_credentials_version(&executor));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_new_credential_helper_headers_lift_refused_executions() {
+        use crate::reapi::credential_helper::test::script_helper;
+        let fixture = executing_fixture(FakeServer {
+            execute_error: Some(tonic::Code::PermissionDenied).into(),
+            ..Default::default()
+        });
+        let helper_dir = fixture.dir.path().join("helper");
+        std::fs::create_dir(&helper_dir).unwrap();
+        let helper = Arc::new(script_helper(
+            &helper_dir,
+            r#"{"headers": {"x": ["first"]}}"#,
+        ));
+        let executor = executor_with_credentials(&fixture, |options| {
+            options.credential_helper = Some(helper.clone());
+        });
+        let run_helper_now = |output| {
+            // Writes the helper's script again, to print `output`.
+            script_helper(&helper_dir, output);
+            helper.expire();
+            fixture.runtime.block_on(helper.renew()).unwrap();
+        };
+        let refused = compiled_locally("REAPI server refused executions");
+        assert_eq!(refused, fixture.compile_with(&executor).0);
+        run_helper_now(r#"{"headers": {"x": ["first"]}}"#);
+        assert_eq!(
+            refused,
+            fixture.compile_with(&executor).0,
+            "the same headers"
+        );
+        assert_eq!(1, fixture.server.execute_calls.load(Ordering::SeqCst));
+
+        run_helper_now(r#"{"headers": {"x": ["second"]}}"#);
+        *fixture.server.execute_error.lock().unwrap() = None;
+        assert_eq!(
+            DistType::Reapi(ReapiOutcome::Executed),
+            fixture.compile_with(&executor).0
+        );
+    }
+
+    #[test]
+    fn test_a_refused_execution_that_started_with_earlier_credentials_isnt_kept() {
+        let fixture = executing_fixture(FakeServer::default());
+        let (auth_token, write_token) =
+            auth_token::test::token_file(fixture.dir.path(), Duration::ZERO);
+        let executor = executor_with_credentials(&fixture, |options| {
+            options.auth_token = Some(auth_token.clone());
+        });
+        write_token("second");
+        (fixture.runtime).block_on(auth_token::test::read_again_now(&auth_token));
+        executor.refuse_executions(0);
+        assert_eq!(None, refused_credentials_version(&executor));
+        executor.refuse_executions(1);
+        assert_eq!(Some(1), refused_credentials_version(&executor));
     }
 
     /// Compiles twice, refused both times, then once more with the server answering and the
@@ -2230,7 +2382,7 @@ pub(super) mod test {
     )]
     #[test_case::test_case(
         FakeServer {
-            execute_error: Some(tonic::Code::Unauthenticated),
+            execute_error: Some(tonic::Code::Unauthenticated).into(),
             ..Default::default()
         } ;
         "execute unauthenticated"
@@ -2281,7 +2433,7 @@ pub(super) mod test {
     )]
     #[test_case::test_case(
         FakeServer {
-            execute_error: Some(tonic::Code::FailedPrecondition),
+            execute_error: Some(tonic::Code::FailedPrecondition).into(),
             ..Default::default()
         } ;
         "no worker available"
@@ -2496,7 +2648,7 @@ pub(super) mod test {
     )]
     #[test_case::test_case(
         FakeServer {
-            execute_error: Some(tonic::Code::PermissionDenied),
+            execute_error: Some(tonic::Code::PermissionDenied).into(),
             ..Default::default()
         },
         |fixture| fixture.executor(),
@@ -2507,7 +2659,7 @@ pub(super) mod test {
         FakeServer::default(),
         |fixture| {
             let executor = fixture.executor();
-            executor.executions_refused.store(true, Ordering::Relaxed);
+            *executor.executions_refused_credentials_version.lock().unwrap() = Some(0);
             executor
         },
         "REAPI server refused executions" ;
