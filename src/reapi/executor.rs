@@ -1088,11 +1088,26 @@ mod test {
 
         /// An executor on a Linux client.
         fn executor(&self) -> ReapiExecutor {
-            let mut executor = ReapiExecutor::new(&self.config, &[], &self.dir.path().join("dist"));
+            let dist_cache_dir = self.dir.path().join("dist");
+            let mut executor = ReapiExecutor::new(&self.config, &[], &dist_cache_dir);
             executor.is_linux_client = true;
-            executor
+            without_settling_wait(executor, &dist_cache_dir)
         }
+    }
 
+    /// `executor` with a digest cache that caches files however recently they changed, so a
+    /// test's new toolchain is hashed without waiting for it to settle.
+    pub(in crate::reapi) fn without_settling_wait(
+        mut executor: ReapiExecutor,
+        dist_cache_dir: &Path,
+    ) -> ReapiExecutor {
+        let digest_cache = DigestCache::load(dist_cache_dir.join(DIGEST_CACHE_FILE));
+        executor.digest_cache = Arc::new(digest_cache.caching_new_files());
+        executor.toolchains = Toolchains::new(executor.digest_cache.clone());
+        executor
+    }
+
+    impl Fixture {
         /// Runs the compile through a new executor. A local compile writes `out` to stdout and
         /// `err` to stderr.
         fn compile(&self) -> (DistType, process::Output) {
@@ -1404,6 +1419,7 @@ mod test {
             )
             .unwrap();
         builder.into_inner().unwrap().finish().unwrap();
+        let dist_cache_dir = fixture.dir.path().join("dist");
         let mut executor = ReapiExecutor::new(
             &fixture.config,
             &[DistToolchainConfig::PathOverride {
@@ -1411,10 +1427,10 @@ mod test {
                 archive,
                 archive_compiler_executable: "/toolchain/bin/rustc".to_owned(),
             }],
-            &fixture.dir.path().join("dist"),
+            &dist_cache_dir,
         );
         executor.is_linux_client = false;
-        executor
+        without_settling_wait(executor, &dist_cache_dir)
     }
 
     #[test]

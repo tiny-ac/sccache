@@ -75,6 +75,12 @@ impl ToolchainKey {
             files,
         }
     }
+
+    pub(super) fn stamps(&self) -> Vec<&FileStamp> {
+        (self.files.iter().flatten())
+            .map(|file| &file.stamp)
+            .collect()
+    }
 }
 
 /// A local toolchain file that workers get.
