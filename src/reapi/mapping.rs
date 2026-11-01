@@ -22,10 +22,10 @@
 //! build root (cargo's target dir) go under [`BUILD_ROOT_DIR`], and the toolchain goes
 //! under [`TOOLCHAIN_DIR`].
 
+use super::digest::FileStamp;
 use crate::errors::*;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
-use std::time::SystemTime;
 
 /// The input root's directory for files under the local build root.
 pub(super) const BUILD_ROOT_DIR: &str = ".sccache-build";
@@ -59,7 +59,7 @@ pub(crate) struct ToolchainKey {
     pub(crate) commit_hash: String,
     pub(crate) sysroot: PathBuf,
     pub(crate) target_triple: String,
-    stamps: Vec<Option<(u64, SystemTime)>>,
+    stamps: Vec<Option<FileStamp>>,
 }
 
 impl ToolchainKey {
@@ -71,10 +71,7 @@ impl ToolchainKey {
             sysroot.join("lib/rustlib").join(&target_triple).join("lib"),
         ]
         .iter()
-        .map(|path| {
-            let metadata = std::fs::metadata(path).ok()?;
-            Some((metadata.len(), metadata.modified().ok()?))
-        })
+        .map(|path| FileStamp::of(path).ok())
         .collect();
         ToolchainKey {
             commit_hash,
@@ -428,6 +425,32 @@ mod test {
 
         std::fs::create_dir_all(sysroot.join("lib/rustlib/wasm32-unknown-unknown/lib")).unwrap();
         assert_ne!(updated, key(), "target added");
+    }
+
+    // Windows stamps have no inode, only a creation time.
+    #[cfg(unix)]
+    #[test]
+    fn test_a_toolchain_key_changes_with_a_file_replaced_by_one_of_the_same_size_and_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("bin")).unwrap();
+        let (rustc, replacement) = (dir.path().join("bin/rustc"), dir.path().join("rustc.new"));
+        std::fs::write(&rustc, b"rustc 1").unwrap();
+        std::fs::write(&replacement, b"rustc 2").unwrap();
+        let mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        for file in [&rustc, &replacement] {
+            filetime::set_file_mtime(file, mtime).unwrap();
+        }
+        let key = || {
+            ToolchainKey::new(
+                "abc".to_owned(),
+                dir.path().to_owned(),
+                "x86_64-unknown-linux-gnu".to_owned(),
+            )
+        };
+        let original = key();
+        // As when an archive that keeps its files' mtimes is unpacked over the toolchain.
+        std::fs::rename(&replacement, &rustc).unwrap();
+        assert_ne!(original, key());
     }
 
     fn path_mapper() -> PathMapper {
