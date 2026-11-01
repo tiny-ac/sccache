@@ -725,10 +725,15 @@ impl ReapiExecutor {
     }
 }
 
-/// How the stats count a compile that ran locally for `reason`. They count reasons by their
-/// text, as they do non-cacheable ones.
-pub(super) fn compiled_locally(reason: CompileLocallyReason) -> DistType {
-    DistType::Reapi(ReapiOutcome::CompiledLocally(reason.to_string()))
+/// How the stats count a compile of `out_pretty` that ran locally for `reason`. They count
+/// reasons by their text, as they do non-cacheable ones. A worker root in an output comes from
+/// the crate's own code, such as `env!("CARGO_MANIFEST_DIR")`, so that text names the crate.
+pub(super) fn compiled_locally(reason: CompileLocallyReason, out_pretty: &str) -> DistType {
+    let reason = match reason {
+        CompileLocallyReason::WorkerRootInOutput => format!("{reason} ({out_pretty})"),
+        _ => reason.to_string(),
+    };
+    DistType::Reapi(ReapiOutcome::CompiledLocally(reason))
 }
 
 /// `compilation` mapped for REAPI, with its preprocessed source under `preprocessed_dir`, or
@@ -1027,7 +1032,7 @@ impl<T: CommandCreatorSync> RemoteExecutor<T> for ReapiExecutor {
                 let output =
                     run_as_worker_or_locally(as_worker.as_ref(), &local_compile, &out_pretty)
                         .await?;
-                Ok((compiled_locally(reason), output))
+                Ok((compiled_locally(reason, &out_pretty), output))
             }
         }
     }
@@ -2444,7 +2449,7 @@ pub(super) mod test {
             let path = result.output_files[0].path.clone();
             result.output_files[0] = inline_output(&path, b"built in /w/1");
         },
-        "worker root in an output" ;
+        "worker root in an output (lib.rs)" ;
         "worker root in the rlib"
     )]
     #[test_case::test_case(

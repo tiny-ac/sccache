@@ -275,14 +275,14 @@ impl<T: CommandCreatorSync> RemoteExecutor<T> for ReapiIpcExecutor {
             Err(e) => {
                 warn!("[{out_pretty}]: REAPI compile request failed, compiling locally: {e:#}");
                 let reason = CompileLocallyReason::DaemonFailed;
-                return Ok((compiled_locally(reason), run_locally().await?));
+                return Ok((compiled_locally(reason, &out_pretty), run_locally().await?));
             }
         };
         let output = run_locally().await;
         if let Err(e) = self.request(ReapiIpcRequest::ReleaseLocalSlot).await {
             warn!("[{out_pretty}]: Could not release the daemon's local slot: {e:#}");
         }
-        Ok((compiled_locally(reason), output?))
+        Ok((compiled_locally(reason, &out_pretty), output?))
     }
 }
 
@@ -290,6 +290,7 @@ impl<T: CommandCreatorSync> RemoteExecutor<T> for ReapiIpcExecutor {
 mod test {
     use super::*;
     use crate::reapi::executor::test::{C_OBJECT, Eligibility, Fixture, RLIB};
+    use crate::reapi::remote_compile::test::inline_output;
     use std::num::NonZeroUsize;
     use std::time::Duration;
 
@@ -587,13 +588,34 @@ mod test {
     }
 
     #[test]
+    fn test_a_cli_names_the_crate_whose_output_holds_the_worker_root() {
+        let fixture = Fixture::new(Eligibility::Eligible);
+        fixture.put_result_in_action_cache(|result| {
+            let path = result.output_files[0].path.clone();
+            result.output_files[0] = inline_output(&path, b"built in /w/1");
+        });
+        let daemon = TestDaemon::start(fixture.executor(), fixture.dir.path().join("daemon"));
+        let executor = cli_executor(&fixture, &daemon.addr);
+        let (dist_type, output) = fixture.compile_with(&executor);
+        assert_eq!(
+            DistType::Reapi(ReapiOutcome::CompiledLocally(
+                "worker root in an output (lib.rs)".to_owned()
+            )),
+            dist_type
+        );
+        assert_eq!(b"out", output.stdout.as_slice());
+        drop(executor);
+        daemon.stop();
+    }
+
+    #[test]
     fn test_a_cli_compiles_a_c_miss_as_a_worker_does() {
         let fixture = Fixture::new(Eligibility::EligibleC);
         let daemon = TestDaemon::start(fixture.executor(), fixture.dir.path().join("daemon"));
         let executor = cli_executor(&fixture, &daemon.addr);
         let (dist_type, output) = fixture.compile_with(&executor);
         assert_eq!(
-            compiled_locally(CompileLocallyReason::NotInActionCache),
+            compiled_locally(CompileLocallyReason::NotInActionCache, "lib.rs"),
             dist_type
         );
         assert_eq!(b"worker out", output.stdout.as_slice());
@@ -610,7 +632,10 @@ mod test {
         let daemon = TestDaemon::start(fixture.executor(), fixture.dir.path().join("daemon"));
         let executor = cli_executor(&fixture, &daemon.addr);
         let (dist_type, output) = fixture.compile_with(&executor);
-        assert_eq!(compiled_locally(CompileLocallyReason::Staticlib), dist_type);
+        assert_eq!(
+            compiled_locally(CompileLocallyReason::Staticlib, "lib.rs"),
+            dist_type
+        );
         assert_eq!(b"out", output.stdout.as_slice());
         // The CLI's connection stays open, so only a release frees the slot.
         let mut other = daemon.connect();
@@ -655,7 +680,7 @@ mod test {
         assert!(fixture.runtime.block_on(executor.has_reapi_executor()));
         let (dist_type, output) = fixture.compile_with(&executor);
         assert_eq!(
-            compiled_locally(CompileLocallyReason::DaemonFailed),
+            compiled_locally(CompileLocallyReason::DaemonFailed, "lib.rs"),
             dist_type
         );
         assert_eq!(b"out", output.stdout.as_slice());
