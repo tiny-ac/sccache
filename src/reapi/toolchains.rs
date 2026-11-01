@@ -99,6 +99,14 @@ impl Toolchains {
         }
     }
 
+    /// Makes the next compile with `key` hash its files again.
+    pub(super) async fn forget(&self, key: &ToolchainKey) {
+        let mut states = self.states.lock().await;
+        if let Some(State::Hashed(_)) = states.get(key) {
+            states.remove(key);
+        }
+    }
+
     fn spawn_hash(self: &Arc<Self>, key: ToolchainKey) {
         let this = self.clone();
         tokio::spawn(async move {
