@@ -112,6 +112,7 @@ Each call carries a `RequestMetadata` with sccache's name and version and an ID 
 - A server older than REAPI v2.1 isn't used until sccache restarts.
 - A server that refuses the credentials when sccache connects isn't used until sccache restarts or the credentials change: a new auth token, or new headers from the credential helper. A server that refuses them later, with UNAUTHENTICATED, or with PERMISSION_DENIED to a lookup or a download, is connected to again, and if it refuses them again, the same applies.
 - A server that answers PERMISSION_DENIED to an upload or an execution, as for credentials that may only read, is used only for lookups until sccache restarts.
+- A file that changed after sccache hashed it isn't uploaded: a compile that would upload it runs locally, and the next one hashes the file again.
 - A toolchain without rustc or std isn't used until it changes. A rustc whose `rustc -vV` prints `commit-hash: unknown` always compiles locally.
 
 ## Limits
