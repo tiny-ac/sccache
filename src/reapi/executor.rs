@@ -2468,7 +2468,7 @@ pub(super) mod test {
         let executor = fixture.executor();
         for _ in 0..=FAILURES_TO_PAUSE {
             assert_eq!(
-                compiled_locally("failed to download the outputs"),
+                compiled_locally("outputs not in the REAPI CAS"),
                 fixture.compile_with(&executor).0
             );
         }
@@ -2495,7 +2495,7 @@ pub(super) mod test {
     #[test_case::test_case(
         // Without inline contents, the client downloads the rlib from the CAS, which lacks it.
         |result| result.output_files[0].contents.clear(),
-        "failed to download the outputs" ;
+        "outputs not in the REAPI CAS" ;
         "rlib missing from the cas"
     )]
     fn test_a_result_that_cant_be_used_compiles_locally(
