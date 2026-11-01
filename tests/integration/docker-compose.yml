@@ -372,6 +372,32 @@ services:
       - test
       - reapi
 
+  # Not in the test profile: `make bench-reapi` runs it.
+  bench-reapi:
+    # The worker's image, which has the nativelink the script starts as its server.
+    image: sccache-test-nativelink
+    build:
+      context: reapi
+    pull_policy: build
+    entrypoint: /sccache/tests/integration/scripts/bench-reapi.sh
+    volumes:
+      - ../../:/sccache:ro
+      - ../../target/bench-reapi:/results:rw
+      # rust-analyzer's target dirs don't fit in a tmpfs.
+      - bench-reapi-work:/bench
+    environment:
+      SCCACHE_PATH: /sccache/target/release/sccache
+      CARGO_HOME: /bench/cargo-home
+      BENCH_WORK: /bench
+      BENCH_RESULTS: /results
+      BENCH_RUNS: ${BENCH_RUNS:-}
+      BENCH_PROJECTS: ${BENCH_PROJECTS:-}
+      REAPI_ENDPOINT: ${REAPI_ENDPOINT:-}
+      HOST_UID: ${UID:-}
+      HOST_GID: ${GID:-}
+    profiles:
+      - bench-reapi
+
   # Buildbarn, as in https://github.com/buildbarn/bb-deployments, with one storage that is
   # also the frontend and a worker that hardlinks inputs.
   bb-storage:
@@ -533,6 +559,7 @@ volumes:
   webdav-data:
   bb-runner-install:
   bb-worker-dirs:
+  bench-reapi-work:
 
 networks:
   default:
