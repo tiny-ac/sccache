@@ -18,6 +18,7 @@
 //! every call, running it again before they expire.
 
 use super::client::{header_key, sensitive_ascii_value};
+use super::jitter::jittered;
 use crate::errors::*;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -58,8 +59,8 @@ pub(super) struct CredentialHelper {
     current: RwLock<CurrentHeaders>,
     /// Held while the helper runs, so that concurrent compiles run it once.
     running: Arc<tokio::sync::Mutex<()>>,
-    /// When the helper failed, if it failed the last time it ran.
-    failed_at: Mutex<Option<Instant>>,
+    /// When the helper may run again in the background, if it failed the last time it ran.
+    retry_at: Mutex<Option<Instant>>,
 }
 
 struct CurrentHeaders {
@@ -90,7 +91,7 @@ impl CredentialHelper {
                 version: 0,
             }),
             running: Default::default(),
-            failed_at: Mutex::new(None),
+            retry_at: Mutex::new(None),
         }
     }
 
@@ -122,11 +123,11 @@ impl CredentialHelper {
     }
 
     /// Starts [`renew`](Self::renew), if the headers are due, no run is in progress, and the
-    /// helper didn't fail in the last [`RETRY_AFTER_FAILURE`]. The first failure in a row is
-    /// logged.
+    /// helper didn't fail in the last [`RETRY_AFTER_FAILURE`], jittered. The first failure in a
+    /// row is logged.
     pub(super) fn renew_in_background(self: &Arc<Self>) -> Option<JoinHandle<()>> {
-        let failed_at = *self.failed_at.lock().unwrap();
-        if !self.due() || failed_at.is_some_and(|at| at.elapsed() < RETRY_AFTER_FAILURE) {
+        let retry_at = *self.retry_at.lock().unwrap();
+        if !self.due() || retry_at.is_some_and(|at| Instant::now() < at) {
             return None;
         }
         let running = self.running.clone().try_lock_owned().ok()?;
@@ -135,7 +136,7 @@ impl CredentialHelper {
             let renewed = this.renew_while_running().await;
             drop(running);
             if let Err(e) = renewed
-                && failed_at.is_none()
+                && retry_at.is_none()
             {
                 warn!("REAPI: {e:#}; keeping the headers it printed before");
             }
@@ -148,9 +149,9 @@ impl CredentialHelper {
             return Ok(());
         }
         let (headers, lifetime) = self.run().await.inspect_err(|_| {
-            *self.failed_at.lock().unwrap() = Some(Instant::now());
+            *self.retry_at.lock().unwrap() = Some(Instant::now() + jittered(RETRY_AFTER_FAILURE));
         })?;
-        *self.failed_at.lock().unwrap() = None;
+        *self.retry_at.lock().unwrap() = None;
         let mut current = self.current.write().unwrap();
         if headers[..] != current.headers[..] {
             current.headers = headers.into();
@@ -254,6 +255,7 @@ fn parse_response(
 #[cfg(test)]
 pub(super) mod test {
     use super::*;
+    use crate::reapi::jitter::test::WAITS;
     use test_case::test_case;
 
     fn now() -> DateTime<Utc> {
@@ -387,9 +389,33 @@ pub(super) mod test {
         );
         renewal.await.unwrap();
         assert!(helper.renew_in_background().is_none(), "it just failed");
-        *helper.failed_at.lock().unwrap() = Some(Instant::now() - RETRY_AFTER_FAILURE);
+        *helper.retry_at.lock().unwrap() = Some(Instant::now());
         helper.renew_in_background().unwrap().await.unwrap();
         assert_eq!(2, runs(dir.path()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_the_wait_after_a_failure_is_jittered() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper = script_helper(dir.path(), "not json");
+        let mut waits = Vec::new();
+        for _ in 0..WAITS {
+            let before = Instant::now();
+            assert!(helper.renew().await.is_err());
+            let retry_at = helper.retry_at.lock().unwrap().unwrap();
+            assert!(before + RETRY_AFTER_FAILURE / 2 <= retry_at);
+            assert!(retry_at <= Instant::now() + RETRY_AFTER_FAILURE * 3 / 2);
+            waits.push(retry_at - before);
+        }
+        // `waits` also hold the helper's run time, so the bounds are checked above instead of
+        // with `assert_jittered`.
+        let spread = waits
+            .iter()
+            .max()
+            .unwrap()
+            .saturating_sub(*waits.iter().min().unwrap());
+        assert!(spread >= RETRY_AFTER_FAILURE / 10, "{waits:?}");
     }
 
     #[cfg(unix)]
