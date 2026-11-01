@@ -103,6 +103,9 @@ pub(crate) struct FakeServer {
     pub(crate) early_committed_size: Option<i64>,
     /// The files each execution writes, by output path; only declared ones count.
     pub(crate) worker_outputs: Mutex<HashMap<String, Vec<u8>>>,
+    /// Leaves the files each execution writes out of the CAS, as a CAS that evicts them at
+    /// once.
+    pub(crate) worker_outputs_not_in_cas: bool,
     pub(crate) worker_exit_code: i32,
     /// The commit hash `rustc -vV` prints on the workers; `None` fails it, as on a worker
     /// that can't run the toolchain.
@@ -811,9 +814,14 @@ impl FakeServer {
             .iter()
             .filter_map(|path| {
                 let data = worker_outputs.get(path)?;
+                let digest = if self.worker_outputs_not_in_cas {
+                    digest::of_bytes(data)
+                } else {
+                    self.insert_blob(data)
+                };
                 Some(remexec::OutputFile {
                     path: path.clone(),
-                    digest: Some(self.insert_blob(data)),
+                    digest: Some(digest),
                     ..Default::default()
                 })
             })
