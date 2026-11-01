@@ -119,6 +119,12 @@ Each call carries a `RequestMetadata` with sccache's name and version and an ID 
 - A C or C++ compile run through REAPI names its sources relative to the package or the target dir in its warnings and errors, and doesn't show macro expansions in them. The workers' messages come in the C locale. Compiling the preprocessed source can warn where the original didn't, such as on macro expansions: cargo then shows the extra warnings, and with `-Werror` the compile fails on the worker and as a worker before the compile's own command runs, at every miss.
 - A proc macro that reads env vars or files that rustc doesn't record in the dep-info gets the worker's, not the client's, and they aren't part of the action's key.
 
+## Benchmark
+
+`make bench-reapi` in `tests/integration` builds ripgrep and rust-analyzer, at the commits pinned in `scripts/bench-reapi.sh`, with plain cargo, with sccache's local cache, cold and warm, and through REAPI, cold and warm. A cold REAPI build runs against a NativeLink with empty stores in the same container, and a warm one builds a second checkout at another path, with empty local caches. The wall times, sccache's counts and the cache sizes go to `target/bench-reapi/results.md` and `results.csv`. `BENCH_RUNS` (3 by default) and `BENCH_PROJECTS` change what runs.
+
+To run it against another server, set `REAPI_ENDPOINT`, and `REAPI_CONFIG_DIR` to a directory with a `reapi.toml` that holds the rest of the `[dist.reapi]` config, such as `auth_token_file = "/reapi-config/token"`. Each run then uses a new salt, so the action cache starts empty, and the CAS keeps what it holds.
+
 ## Trust
 
 Clients never write to the action cache: only the server does, from its workers' results. Anyone who can write to the server's action cache or CAS, run its workers, or, with `grpc://`, read and change the traffic, can put code into every client's rlibs and the binaries linked from them. Use `grpcs://` and a server whose action cache only its workers write to.
