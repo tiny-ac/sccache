@@ -50,6 +50,8 @@ The client preprocesses the source again, with its paths relative to the package
 
 Other compiles run locally. `sccache --show-stats` counts the action cache hits and the executions, and lists, by reason, the compiles that ran locally.
 
+A crate whose rlib holds the path it's built at, such as one with `env!("CARGO_MANIFEST_DIR")` in its code, compiles locally, since a worker's rlib would hold the worker's path. The stats name it, as in `worker root in an output (test_utils)`. Its local rlib holds the checkout's path, so the crates that depend on it get hits only from builds at the same path, such as CI runners that all check out at one path. To share those hits across paths, the crate can read the path when it runs, with `std::env::var("CARGO_MANIFEST_DIR")`, which cargo sets for the tests and binaries it runs, or embed the files it reads with `include_str!` or `include_bytes!`. cargo's `trim-paths` doesn't change what `env!` returns. A proc macro from the workspace has the same effect: sccache doesn't cache proc macros, so their compiles keep the checkout's path, and the crates that use one get hits only from builds at the same path.
+
 ## Lookups and execution
 
 sccache connects to the server and hashes each toolchain's files once while it runs. The digests are kept in `<dist cache_dir>/reapi-digests.json`, so after a restart only changed files are hashed again. On a hit, sccache writes the compile's outputs and caches them as it would a local compile's.
