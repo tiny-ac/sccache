@@ -18,6 +18,7 @@ use super::client::{
     Client, MAX_ACTION_RESULT_RESPONSE_BYTES, RPC_TIMEOUT, ReapiChannel, RpcError, action_request,
     loggable, rpc_code, status_message, with_timeout,
 };
+use super::jitter::jittered;
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use super::proto::google::longrunning::{Operation, operation};
 use super::proto::google::rpc;
@@ -183,7 +184,7 @@ impl Execution {
                 "REAPI: reattaching to action {}/{} after: {last_error:#}",
                 action_digest.hash, action_digest.size_bytes
             );
-            tokio::time::sleep(REATTACH_BACKOFF * (1 << reattaches_without_progress)).await;
+            tokio::time::sleep(reattach_wait(reattaches_without_progress)).await;
             reattaches_without_progress += 1;
         }
     }
@@ -238,6 +239,12 @@ impl Execution {
         })
         .await
     }
+}
+
+/// The wait before a reattach: [`REATTACH_BACKOFF`], doubled for each earlier reattach without
+/// progress, and jittered.
+fn reattach_wait(reattaches_without_progress: u32) -> Duration {
+    jittered(REATTACH_BACKOFF * 2u32.pow(reattaches_without_progress))
 }
 
 /// Whether reattaching or executing again may get past `e`, as after a dropped connection,
@@ -344,6 +351,7 @@ mod test {
     use crate::reapi::client::test::certificate_name_error;
     use crate::reapi::digest;
     use crate::reapi::fake::{FakeServer, StreamBreak};
+    use crate::reapi::jitter::test::{WAITS, assert_jittered};
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     use test_case::test_case;
@@ -619,6 +627,19 @@ mod test {
         assert_eq!(finishes, executed.is_ok(), "{executed:?}");
         if let Err(e) = executed {
             assert_eq!(Some(tonic::Code::Unavailable), rpc_code(&e));
+        }
+    }
+
+    #[test]
+    fn test_the_waits_before_reattaches_double_and_are_jittered() {
+        for reattaches_without_progress in 0..MAX_REATTACHES {
+            let waits: Vec<_> = (0..WAITS)
+                .map(|_| reattach_wait(reattaches_without_progress))
+                .collect();
+            assert_jittered(
+                REATTACH_BACKOFF * 2u32.pow(reattaches_without_progress),
+                &waits,
+            );
         }
     }
 
