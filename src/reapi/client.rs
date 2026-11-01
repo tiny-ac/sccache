@@ -14,6 +14,7 @@
 
 use super::auth_token::AuthToken;
 use super::credential_helper::CredentialHelper;
+use super::jitter::jittered;
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use crate::errors::*;
 use prost::Message;
@@ -145,8 +146,7 @@ where
     F: FnMut() -> U,
     U: Future<Output = Result<T>>,
 {
-    let mut backoff = RETRY_BACKOFF;
-    for _ in 0..RETRIES {
+    for earlier_retries in 0..RETRIES {
         let started = tokio::time::Instant::now();
         match call().await {
             Err(e)
@@ -156,14 +156,19 @@ where
                         Some(tonic::Code::Unavailable | tonic::Code::ResourceExhausted)
                     ) =>
             {
-                debug!("REAPI: {e:#}; trying again in {backoff:?}");
-                tokio::time::sleep(backoff).await;
-                backoff *= 2;
+                let wait = retry_wait(earlier_retries);
+                debug!("REAPI: {e:#}; trying again in {wait:.1?}");
+                tokio::time::sleep(wait).await;
             }
             result => return result,
         }
     }
     call().await
+}
+
+/// The wait before a retry: [`RETRY_BACKOFF`], doubled for each earlier retry, and jittered.
+fn retry_wait(earlier_retries: u32) -> Duration {
+    jittered(RETRY_BACKOFF * 2u32.pow(earlier_retries))
 }
 
 /// Adds `description` to the error if `future` fails or takes longer than `timeout`.
@@ -675,6 +680,7 @@ pub(super) mod test {
     use crate::reapi::auth_token::test::{read_again_now, token_file};
     #[cfg(unix)]
     use crate::reapi::credential_helper::test::script_helper;
+    use crate::reapi::jitter::test::{WAITS, assert_jittered};
     use crate::reapi::proto::build::bazel::semver::SemVer;
     use remexec::capabilities_server::{Capabilities, CapabilitiesServer};
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -1340,6 +1346,29 @@ pub(super) mod test {
         .await
         .unwrap_err();
         assert_eq!(1, calls.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_the_waits_before_retries_double_and_are_jittered() {
+        for earlier_retries in 0..RETRIES {
+            let waits: Vec<_> = (0..WAITS).map(|_| retry_wait(earlier_retries)).collect();
+            assert_jittered(RETRY_BACKOFF * 2u32.pow(earlier_retries), &waits);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_calls_tried_again_wait_for_different_times() {
+        let mut waits = Vec::new();
+        for _ in 0..WAITS {
+            let started = tokio::time::Instant::now();
+            with_retries(|| async {
+                Err::<(), _>(status_error(tonic::Status::unavailable("busy")))
+            })
+            .await
+            .unwrap_err();
+            waits.push(started.elapsed());
+        }
+        assert!(waits.iter().any(|wait| *wait != waits[0]), "{waits:?}");
     }
 
     #[tokio::test]
