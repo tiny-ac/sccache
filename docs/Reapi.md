@@ -66,7 +66,7 @@ With it, that rustc's lookups and executions use the Linux toolchain, unless the
 
 ## Credentials
 
-A `grpcs://` server's certificate must chain to one of the certificates in `tls_ca_file`, or, without it, to one of the system's root certificates. A server that asks for a client certificate gets the one in `tls_client_certificate_file`. With `grpc://`, the credentials and everything else travel in plain text.
+A `grpcs://` server's certificate must chain to one of the certificates in `tls_ca_file`, or, without it, to one of the system's root certificates. A server that asks for a client certificate gets the one in `tls_client_certificate_file`. When the certificate isn't valid for the endpoint's host, sccache's errors and logs name neither the host nor the names the certificate is valid for. With `grpc://`, the credentials and everything else travel in plain text.
 
 Each call carries the token in `auth_token_file` and the headers in `[dist.reapi.headers]`, whose values sccache leaves out of logs and errors. A syntax error in the config file can still print the line it's on, so keep secrets in `auth_token_file` or a credential helper rather than in `[dist.reapi.headers]`. sccache reads `auth_token_file` again every 10 seconds at most, and uses the token there if it changed, so a job can replace a short-lived token. The job should write the new token to another file and rename it over `auth_token_file`, so that sccache never reads half a token.
 

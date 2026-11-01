@@ -16,7 +16,7 @@
 
 use super::client::{
     Client, MAX_ACTION_RESULT_RESPONSE_BYTES, RPC_TIMEOUT, ReapiChannel, RpcError, action_request,
-    loggable, rpc_code, with_timeout,
+    loggable, rpc_code, status_message, with_timeout,
 };
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use super::proto::google::longrunning::{Operation, operation};
@@ -266,7 +266,7 @@ fn execution_status_error(status: tonic::Status) -> Error {
         .unwrap_or_default();
     rpc_status_error(rpc::Status {
         code: status.code() as i32,
-        message: status.message().to_owned(),
+        message: status_message(&status),
         details,
     })
 }
@@ -341,6 +341,7 @@ fn execute_response(result: Option<operation::Result>) -> Result<remexec::Execut
 mod test {
     use super::*;
     use crate::reapi::client::RUSTC_MNEMONIC;
+    use crate::reapi::client::test::certificate_name_error;
     use crate::reapi::digest;
     use crate::reapi::fake::{FakeServer, StreamBreak};
     use std::sync::atomic::Ordering;
@@ -691,5 +692,16 @@ mod test {
         assert!(e.is::<MissingActionBlobs>(), "{e:#}");
         // The first Execute and one more, with no reattaches after it.
         assert_eq!(2, server.execute_calls.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_an_execution_error_leaves_out_the_names_of_the_certificate() {
+        // As tonic answers a call after it fails to connect again.
+        let mut status = tonic::Status::unavailable(certificate_name_error().to_string());
+        status.set_source(std::sync::Arc::new(certificate_name_error()));
+        assert_eq!(
+            r#"Unavailable: "invalid peer certificate: NotValidForName""#,
+            execution_status_error(status).to_string()
+        );
     }
 }
