@@ -20,6 +20,7 @@ use super::action_cache::ActionCache;
 use super::cas::Cas;
 use super::client::{Client, ConnectOptions, CredentialsRefused, IncompatibleServer};
 use super::execution::Execution;
+use super::jitter::jittered;
 use super::mapping::CompileLocallyReason;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -169,7 +170,7 @@ impl Connection {
                     if e.is_panic() {
                         warn!("REAPI: connecting panicked: {e}");
                     }
-                    this.connect_failed(CompileLocallyReason::ConnectFailed)
+                    this.connect_failed(CompileLocallyReason::ConnectFailed).0
                 });
             *this.state.lock().await = state;
             this.attempts_ended.send_modify(|count| *count += 1);
@@ -205,8 +206,8 @@ impl Connection {
         if let Some(credential_helper) = &self.options.credential_helper
             && let Err(e) = credential_helper.renew().await
         {
-            let state = self.connect_failed(CompileLocallyReason::CredentialHelperFailed);
-            warn!("REAPI: {e:#}; compiling locally for {:?}", self.backoff());
+            let (state, wait) = self.connect_failed(CompileLocallyReason::CredentialHelperFailed);
+            warn!("REAPI: {e:#}; compiling locally for {wait:.1?}");
             return state;
         }
         let credentials_version = self.credentials_version();
@@ -234,19 +235,23 @@ impl Connection {
                 State::Refused(CompileLocallyReason::CredentialsRefused)
             }
             Err(e) => {
-                let state = self.connect_failed(CompileLocallyReason::ConnectFailed);
-                warn!("REAPI: {e:#}; compiling locally for {:?}", self.backoff());
+                let (state, wait) = self.connect_failed(CompileLocallyReason::ConnectFailed);
+                warn!("REAPI: {e:#}; compiling locally for {wait:.1?}");
                 state
             }
         }
     }
 
-    fn connect_failed(&self, reason: CompileLocallyReason) -> State {
+    /// Counts a failed connect. Returns the state after it, and how long compiles wait before
+    /// connecting again: the backoff, jittered.
+    fn connect_failed(&self, reason: CompileLocallyReason) -> (State, Duration) {
         self.failures_in_a_row.fetch_add(1, Ordering::Relaxed);
-        State::ConnectFailed {
-            retry_at: Instant::now() + self.backoff(),
+        let wait = jittered(self.backoff());
+        let state = State::ConnectFailed {
+            retry_at: Instant::now() + wait,
             reason,
-        }
+        };
+        (state, wait)
     }
 
     /// `BACKOFF_MIN`, doubled for each failure in a row after the first, up to `BACKOFF_MAX`.
@@ -266,6 +271,7 @@ mod test {
     #[cfg(unix)]
     use crate::reapi::credential_helper::test::{runs, script_helper};
     use crate::reapi::fake::FakeServer;
+    use crate::reapi::jitter::test::{WAITS, assert_jittered};
 
     async fn serve(server: FakeServer) -> (Arc<FakeServer>, Arc<Connection>) {
         let server = Arc::new(server);
@@ -536,5 +542,23 @@ mod test {
             })
             .collect();
         assert_eq!(vec![5, 10, 20, 40, 60, 60], backoffs);
+    }
+
+    #[test]
+    fn test_compiles_wait_for_the_backoff_jittered() {
+        let connection = Connection::new(Default::default());
+        let waits: Vec<_> = (0..WAITS)
+            .map(|_| {
+                connection.failures_in_a_row.store(0, Ordering::Relaxed);
+                let before = Instant::now();
+                let (state, wait) = connection.connect_failed(CompileLocallyReason::ConnectFailed);
+                let State::ConnectFailed { retry_at, .. } = state else {
+                    unreachable!("a failed connect");
+                };
+                assert!(before + wait <= retry_at && retry_at <= Instant::now() + wait);
+                wait
+            })
+            .collect();
+        assert_jittered(BACKOFF_MIN, &waits);
     }
 }
