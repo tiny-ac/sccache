@@ -2165,6 +2165,9 @@ pub struct ServerStats {
 pub struct ReapiStats {
     pub action_cache_hits: u64,
     pub executions: u64,
+    /// The executions of actions whose cached outputs the CAS didn't have, which
+    /// `executions` counts too.
+    pub executions_for_outputs_not_in_cas: u64,
     /// Compilations that ran locally, by reason.
     pub local_compilations: HashMap<String, usize>,
 }
@@ -2173,6 +2176,7 @@ impl std::ops::AddAssign for ReapiStats {
     fn add_assign(&mut self, rhs: ReapiStats) {
         self.action_cache_hits += rhs.action_cache_hits;
         self.executions += rhs.executions;
+        self.executions_for_outputs_not_in_cas += rhs.executions_for_outputs_not_in_cas;
         for (k, v) in rhs.local_compilations {
             *self.local_compilations.entry(k).or_default() += v;
         }
@@ -2306,6 +2310,11 @@ impl ServerStats {
             }
             DistType::Reapi(ReapiOutcome::Executed) => {
                 self.reapi.get_or_insert_default().executions += 1;
+            }
+            DistType::Reapi(ReapiOutcome::ExecutedForOutputsNotInCas) => {
+                let reapi = self.reapi.get_or_insert_default();
+                reapi.executions += 1;
+                reapi.executions_for_outputs_not_in_cas += 1;
             }
             DistType::Reapi(ReapiOutcome::CompiledLocally(reason)) => {
                 *self
@@ -2454,6 +2463,11 @@ impl ServerStats {
                 "REAPI action cache hits"
             );
             set_stat!(stats_vec, reapi.executions, "REAPI executions");
+            set_stat!(
+                stats_vec,
+                reapi.executions_for_outputs_not_in_cas,
+                "REAPI executions for outputs not in the CAS"
+            );
         }
 
         // Add multi-level cache statistics if available
@@ -3323,6 +3337,7 @@ mod tests {
             for _ in 0..n {
                 stats.count_dist_type(DistType::Reapi(ReapiOutcome::ActionCacheHit));
                 stats.count_dist_type(DistType::Reapi(ReapiOutcome::Executed));
+                stats.count_dist_type(DistType::Reapi(ReapiOutcome::ExecutedForOutputsNotInCas));
                 stats.count_dist_type(DistType::Reapi(ReapiOutcome::CompiledLocally(
                     "staticlib crate type".to_owned(),
                 )));
@@ -3345,7 +3360,13 @@ mod tests {
         assert!(
             output
                 .lines()
-                .any(|l| l.starts_with("REAPI executions") && l.ends_with(" 3")),
+                .any(|l| l.starts_with("REAPI executions ") && l.ends_with(" 6")),
+            "missing from:\n{output}"
+        );
+        assert!(
+            output.lines().any(|l| {
+                l.starts_with("REAPI executions for outputs not in the CAS") && l.ends_with(" 3")
+            }),
             "missing from:\n{output}"
         );
         assert!(

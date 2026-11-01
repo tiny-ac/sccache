@@ -315,8 +315,9 @@ impl ReapiExecutor {
     }
 
     /// Looks `lookup`'s compile up in the action cache and, on a miss, executes it unless
-    /// `on_miss` is local, then writes its outputs. A miss that compiles locally because a
-    /// local slot is free puts the slot in `local_slot`.
+    /// `on_miss` is local, then writes its outputs. A hit whose outputs the CAS doesn't have
+    /// executes as a miss does. A miss that compiles locally because a local slot is free puts
+    /// the slot in `local_slot`.
     async fn look_up_or_execute(
         &self,
         lookup: Lookup,
@@ -373,29 +374,38 @@ impl ReapiExecutor {
                 return Err(CompileLocallyReason::ActionCacheLookupFailed);
             }
         };
-        let skip_cache_lookup = match cached {
+        let (skip_cache_lookup, miss_reason) = match cached {
             Some(result) if result.exit_code == 0 => {
-                let output = write_outputs(
+                let written = write_outputs(
                     &apis,
                     &reapi_compile,
                     &result,
                     &action.action_digest,
                     out_pretty,
                 )
-                .await?;
-                debug!(
-                    "[{}]: REAPI action cache hit {}",
-                    out_pretty, action.action_digest.hash
-                );
-                return Ok((ReapiOutcome::ActionCacheHit, output));
+                .await;
+                match written {
+                    Ok(output) => {
+                        debug!(
+                            "[{}]: REAPI action cache hit {}",
+                            out_pretty, action.action_digest.hash
+                        );
+                        return Ok((ReapiOutcome::ActionCacheHit, output));
+                    }
+                    // The execution replaces the result, so that later builds hit again.
+                    Err(CompileLocallyReason::OutputsNotInCas) => {
+                        (true, CompileLocallyReason::OutputsNotInCas)
+                    }
+                    Err(reason) => return Err(reason),
+                }
             }
             // A failed result may come from a worker problem, such as running out of memory, so
             // it counts as a miss, and the execution replaces it.
-            Some(_) => true,
-            None => false,
+            Some(_) => (true, CompileLocallyReason::NotInActionCache),
+            None => (false, CompileLocallyReason::NotInActionCache),
         };
         if self.on_miss == ReapiOnMiss::Local {
-            return compile_locally(out_pretty, CompileLocallyReason::NotInActionCache);
+            return compile_locally(out_pretty, miss_reason);
         }
         // Without a worker toolchain, the toolchain sent is the client's own, and REAPI workers
         // run Linux.
@@ -504,20 +514,35 @@ impl ReapiExecutor {
         if result.exit_code != 0 {
             return compile_locally(out_pretty, CompileLocallyReason::CompileFailedOnWorker);
         }
-        let output = write_outputs(
+        let written = write_outputs(
             &apis,
             &reapi_compile,
             &result,
             &action.action_digest,
             out_pretty,
         )
-        .await?;
+        .await;
+        let output = match written {
+            Ok(output) => output,
+            // A CAS that loses the outputs of an action that just ran would lose them again.
+            Err(CompileLocallyReason::OutputsNotInCas) => {
+                warn!(
+                    "[{}]: Compiling locally: the REAPI CAS doesn't have the outputs of action \
+                     {}, which just ran",
+                    out_pretty, action.action_digest.hash
+                );
+                return Err(CompileLocallyReason::OutputsNotInCas);
+            }
+            Err(reason) => return Err(reason),
+        };
         debug!(
             "[{}]: REAPI executed {} (cached: {})",
             out_pretty, action.action_digest.hash, response.cached_result
         );
         let outcome = if response.cached_result {
             ReapiOutcome::ActionCacheHit
+        } else if miss_reason == CompileLocallyReason::OutputsNotInCas {
+            ReapiOutcome::ExecutedForOutputsNotInCas
         } else {
             ReapiOutcome::Executed
         };
@@ -797,6 +822,14 @@ async fn write_outputs(
             } else {
                 materialize_failure_reason(&e)
             };
+            // The caller logs what follows, which differs between a hit and an execution.
+            if reason == CompileLocallyReason::OutputsNotInCas {
+                debug!(
+                    "[{}]: the REAPI CAS doesn't have the outputs of action {}: {:#}",
+                    out_pretty, action_digest.hash, e
+                );
+                return reason;
+            }
             // The same result fails the same way on every build.
             let log_level = match reason {
                 CompileLocallyReason::UnusableResult | CompileLocallyReason::WorkerRootInOutput => {
@@ -1447,7 +1480,7 @@ pub(super) mod test {
 
     /// A fixture whose misses execute on `server`, whose workers run the toolchain's rustc and
     /// write the rlib.
-    fn executing_fixture(server: FakeServer) -> Fixture {
+    pub(in crate::reapi) fn executing_fixture(server: FakeServer) -> Fixture {
         let mut fixture = Fixture::with_server(
             Eligibility::Eligible,
             FakeServer {
@@ -2381,6 +2414,240 @@ pub(super) mod test {
         assert_eq!(DistType::Reapi(ReapiOutcome::Executed), dist_type);
         // rustc -vV, then the compile.
         assert_eq!(2, fixture.server.actions_run.load(Ordering::SeqCst));
+    }
+
+    /// Makes `result`'s rlib come from the CAS, which doesn't have it.
+    pub(in crate::reapi) fn rlib_not_in_cas(result: &mut remexec::ActionResult) {
+        let rlib = &mut result.output_files[0];
+        rlib.contents.clear();
+        rlib.digest = Some(crate::reapi::digest::of_bytes(b"evicted rlib"));
+    }
+
+    /// Makes `result`'s stdout come from the CAS, which doesn't have it.
+    fn stdout_not_in_cas(result: &mut remexec::ActionResult) {
+        result.stdout_digest = Some(crate::reapi::digest::of_bytes(b"evicted stdout"));
+    }
+
+    /// How many compiles, rather than toolchain checks, `server` executed.
+    fn compiles_executed(server: &FakeServer) -> usize {
+        (server.request_metadata.lock().unwrap().iter())
+            .filter(|(method, request_metadata)| {
+                *method == "Execute" && request_metadata.action_mnemonic == RUSTC_MNEMONIC
+            })
+            .count()
+    }
+
+    #[test_case::test_case(rlib_not_in_cas ; "rlib")]
+    #[test_case::test_case(stdout_not_in_cas ; "stdout")]
+    fn test_a_hit_whose_outputs_the_cas_doesnt_have_executes_and_replaces_the_result(
+        not_in_cas: fn(&mut remexec::ActionResult),
+    ) {
+        let fixture = executing_fixture(FakeServer::default());
+        fixture.put_result_in_action_cache(not_in_cas);
+        let (dist_type, output) = fixture.compile();
+        assert_eq!(
+            DistType::Reapi(ReapiOutcome::ExecutedForOutputsNotInCas),
+            dist_type
+        );
+        assert!(output.status.success());
+        let rlib = fixture.dir.path().join("ws").join(RLIB);
+        assert_eq!(b"rlib".as_slice(), std::fs::read(rlib).unwrap());
+        // The server ran the compile instead of answering with the result it has: rustc -vV,
+        // then the compile.
+        assert_eq!(2, fixture.server.actions_run.load(Ordering::SeqCst));
+        let results: Vec<_> = (fixture.server.action_results.lock().unwrap())
+            .values()
+            .cloned()
+            .collect();
+        // The worker's result, from the worker root /worker, replaced the one from /w/1.
+        assert_eq!(1, results.len());
+        assert!(
+            String::from_utf8_lossy(&results[0].stderr_raw).ends_with("/worker\n"),
+            "{:?}",
+            results[0]
+        );
+        assert_eq!(
+            DistType::Reapi(ReapiOutcome::ActionCacheHit),
+            fixture.compile().0
+        );
+    }
+
+    #[test]
+    fn test_a_hit_whose_outputs_the_cas_doesnt_have_executes_once() {
+        let fixture = executing_fixture(FakeServer {
+            worker_outputs_not_in_cas: true,
+            ..Default::default()
+        });
+        fixture.put_result_in_action_cache(rlib_not_in_cas);
+        let (dist_type, output) = fixture.compile();
+        assert_eq!(compiled_locally("outputs not in the REAPI CAS"), dist_type);
+        assert_eq!(b"out".as_slice(), output.stdout);
+        assert_eq!(1, compiles_executed(&fixture.server));
+    }
+
+    #[test_case::test_case(
+        FakeServer::default(),
+        |fixture| {
+            fixture.config.on_miss = ReapiOnMiss::Local;
+            fixture.executor()
+        },
+        "outputs not in the REAPI CAS" ;
+        "on_miss local"
+    )]
+    #[test_case::test_case(
+        FakeServer {
+            execute_error: Some(tonic::Code::PermissionDenied),
+            ..Default::default()
+        },
+        |fixture| fixture.executor(),
+        "REAPI server refused executions" ;
+        "execution permission denied"
+    )]
+    #[test_case::test_case(
+        FakeServer::default(),
+        |fixture| {
+            let executor = fixture.executor();
+            executor.executions_refused.store(true, Ordering::Relaxed);
+            executor
+        },
+        "REAPI server refused executions" ;
+        "executions refused before"
+    )]
+    #[test_case::test_case(
+        FakeServer::default(),
+        |fixture| {
+            let executor = fixture.executor();
+            for _ in 0..FAILURES_TO_PAUSE {
+                executor.execution_pause.call_failed();
+            }
+            executor
+        },
+        "REAPI executions paused after failures" ;
+        "executions paused"
+    )]
+    #[test_case::test_case(
+        FakeServer::default(),
+        |fixture| {
+            *fixture.server.worker_rustc_commit_hash.lock().unwrap() = Some("def456".to_owned());
+            fixture.executor()
+        },
+        "rustc on the workers reports another commit hash" ;
+        "rustc check failed"
+    )]
+    #[test_case::test_case(
+        FakeServer::default(),
+        |fixture| {
+            fixture.config.remote_slots = NonZeroUsize::new(1);
+            let mut executor = fixture.executor();
+            executor.queue_timeout = Duration::from_millis(100);
+            (executor.remote_slots.clone().unwrap().try_acquire_owned().unwrap()).forget();
+            executor
+        },
+        "no remote slot freed in time" ;
+        "no free remote slot"
+    )]
+    #[test_case::test_case(
+        FakeServer::default(),
+        |fixture| {
+            fixture.config.local_slots = NonZeroUsize::new(1);
+            fixture.executor()
+        },
+        "a local slot is free" ;
+        "free local slot"
+    )]
+    #[test_case::test_case(
+        FakeServer::default(),
+        |fixture| {
+            let mut executor = fixture.executor();
+            executor.is_linux_client = false;
+            executor
+        },
+        "toolchain that doesn't run on Linux workers" ;
+        "toolchain that doesn't run on workers"
+    )]
+    fn test_a_hit_whose_outputs_the_cas_doesnt_have_compiles_locally_as_a_miss_would(
+        server: FakeServer,
+        setup: fn(&mut Fixture) -> ReapiExecutor,
+        reason: &str,
+    ) {
+        let mut fixture = executing_fixture(server);
+        let executor = setup(&mut fixture);
+        fixture.put_result_in_action_cache(rlib_not_in_cas);
+        let (dist_type, output) = fixture.compile_with(&executor);
+        assert_eq!(compiled_locally(reason), dist_type);
+        assert_eq!(b"out".as_slice(), output.stdout);
+        assert_eq!(0, compiles_executed(&fixture.server));
+    }
+
+    #[test]
+    fn test_a_hit_whose_outputs_the_cas_doesnt_have_on_a_server_that_doesnt_execute() {
+        let mut fixture = Fixture::new(Eligibility::Eligible);
+        fixture.config.on_miss = ReapiOnMiss::Execute;
+        fixture.put_result_in_action_cache(rlib_not_in_cas);
+        assert_eq!(
+            compiled_locally("REAPI server doesn't execute actions"),
+            fixture.compile().0
+        );
+    }
+
+    #[test_case::test_case(
+        FakeServer {
+            read_error: Some(tonic::Code::Unavailable).into(),
+            ..Default::default()
+        },
+        |result| result.output_files[0].contents.clear(),
+        "failed to download the outputs" ;
+        "unavailable"
+    )]
+    #[test_case::test_case(
+        FakeServer {
+            read_error: Some(tonic::Code::PermissionDenied).into(),
+            ..Default::default()
+        },
+        |result| result.output_files[0].contents.clear(),
+        "REAPI server refused the credentials" ;
+        "permission denied"
+    )]
+    #[test_case::test_case(
+        FakeServer {
+            corrupt_reads: true.into(),
+            ..Default::default()
+        },
+        |result| result.output_files[0].contents.clear(),
+        "failed to download the outputs" ;
+        "corrupt blob"
+    )]
+    #[test_case::test_case(
+        FakeServer::default(),
+        |result| {
+            let rlib = &mut result.output_files[0];
+            rlib.contents.clear();
+            rlib.digest.as_mut().unwrap().size_bytes = 5 << 30;
+        },
+        "failed to download the outputs" ;
+        "too large"
+    )]
+    #[test_case::test_case(
+        FakeServer::default(),
+        |result| {
+            let path = result.output_files[0].path.clone();
+            result.output_files[0] = inline_output(&path, b"built in /w/1");
+        },
+        "worker root in an output (lib.rs)" ;
+        "worker root"
+    )]
+    fn test_a_hit_whose_outputs_fail_otherwise_compiles_locally_without_executing(
+        server: FakeServer,
+        change: fn(&mut remexec::ActionResult),
+        reason: &str,
+    ) {
+        let fixture = executing_fixture(server);
+        fixture.server.insert_blob(b"rlib");
+        fixture.put_result_in_action_cache(change);
+        let (dist_type, output) = fixture.compile();
+        assert_eq!(compiled_locally(reason), dist_type);
+        assert_eq!(b"out".as_slice(), output.stdout);
+        assert_eq!(0, fixture.server.execute_calls.load(Ordering::SeqCst));
     }
 
     #[test]

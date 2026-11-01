@@ -289,7 +289,10 @@ impl<T: CommandCreatorSync> RemoteExecutor<T> for ReapiIpcExecutor {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::reapi::executor::test::{C_OBJECT, Eligibility, Fixture, RLIB};
+    use crate::reapi::executor::test::{
+        C_OBJECT, Eligibility, Fixture, RLIB, executing_fixture, rlib_not_in_cas,
+    };
+    use crate::reapi::fake::FakeServer;
     use crate::reapi::remote_compile::test::inline_output;
     use std::num::NonZeroUsize;
     use std::time::Duration;
@@ -368,6 +371,27 @@ mod test {
                 assert_eq!(ReapiOutcome::ActionCacheHit, outcome);
                 assert_eq!(0, output.code);
             }
+            other => panic!("expected FromReapi, got {other:?}"),
+        }
+        let rlib = std::fs::read(fixture.dir.path().join("ws").join(RLIB)).unwrap();
+        assert_eq!(b"rlib", rlib.as_slice());
+    }
+
+    #[test]
+    fn test_the_daemon_executes_a_hit_whose_outputs_the_cas_doesnt_have() {
+        let fixture = executing_fixture(FakeServer::default());
+        fixture.put_result_in_action_cache(rlib_not_in_cas);
+        let executor = fixture.executor();
+        let compiled = fixture.runtime.block_on(handle_reapi_ipc_request(
+            Some(&executor),
+            &mut None,
+            compile_request(&fixture),
+        ));
+        match compiled {
+            ReapiIpcResponse::CompileThroughReapi(CompileThroughReapiResult::FromReapi {
+                outcome,
+                ..
+            }) => assert_eq!(ReapiOutcome::ExecutedForOutputsNotInCas, outcome),
             other => panic!("expected FromReapi, got {other:?}"),
         }
         let rlib = std::fs::read(fixture.dir.path().join("ws").join(RLIB)).unwrap();

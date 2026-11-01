@@ -1139,6 +1139,9 @@ pub enum ReapiOutcome {
     ActionCacheHit,
     /// Ran on the server's workers, with its outputs written to their local paths.
     Executed,
+    /// Found in the action cache without its outputs in the CAS, then ran on the server's
+    /// workers, with its outputs written to their local paths.
+    ExecutedForOutputsNotInCas,
     /// Compiled locally, for the reason given.
     CompiledLocally(String),
 }
