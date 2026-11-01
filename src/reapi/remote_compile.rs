@@ -16,7 +16,7 @@
 //! output files to their local paths.
 
 use super::cas::{Blob, Cas};
-use super::client::loggable;
+use super::client::{loggable, rpc_code};
 use super::digest::{self, DigestCache};
 use super::input_root::{InputRoot, InputRootFile};
 use super::mapping::{
@@ -775,6 +775,8 @@ pub(super) fn materialize_failure_reason(e: &Error) -> CompileLocallyReason {
         CompileLocallyReason::UnusableResult
     } else if e.is::<UnwritableOutputs>() {
         CompileLocallyReason::UnwritableOutputs
+    } else if rpc_code(e) == Some(tonic::Code::NotFound) {
+        CompileLocallyReason::OutputsNotInCas
     } else {
         // `materialize` gives a type to every error except the CAS's.
         CompileLocallyReason::DownloadingOutputsFailed
@@ -1745,7 +1747,10 @@ pub(super) mod test {
         let e = materialize_in(dir.path(), &[b"rlib"], worker_result(files))
             .await
             .unwrap_err();
-        assert!(format!("{e:#}").contains("NotFound"), "{e:#}");
+        assert_eq!(
+            CompileLocallyReason::OutputsNotInCas,
+            materialize_failure_reason(&e)
+        );
         assert!(output_names(dir.path()).is_empty());
     }
 
