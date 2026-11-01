@@ -102,6 +102,9 @@ impl Toolchains {
     fn spawn_hash(self: &Arc<Self>, key: ToolchainKey) {
         let this = self.clone();
         tokio::spawn(async move {
+            // The digests are kept for as long as the key's stamps stay the same.
+            let settling_time = this.digest_cache.settling_time(key.stamps());
+            tokio::time::sleep(settling_time).await;
             let (toolchain, digest_cache) = (key.clone(), this.digest_cache.clone());
             let hashed = tokio::task::spawn_blocking(move || {
                 let files = match &toolchain {
@@ -216,6 +219,19 @@ mod test {
         let after = toolchains.files(&key(&sysroot), in_secs(10)).await.unwrap();
         assert_ne!(llvm_digest(&before), llvm_digest(&after));
         assert_eq!(digest::of_bytes(b"patched"), llvm_digest(&after));
+    }
+
+    #[tokio::test]
+    async fn test_a_toolchain_that_just_changed_is_hashed_once_its_files_settle() {
+        let dir = tempfile::tempdir().unwrap();
+        let sysroot = fake_sysroot(dir.path());
+        let settling_time = Duration::from_millis(500);
+        let digest_cache =
+            DigestCache::load(dir.path().join("digests.json")).with_min_age_to_cache(settling_time);
+        let toolchains = Toolchains::new(Arc::new(digest_cache));
+        let started = Instant::now();
+        toolchains.files(&key(&sysroot), in_secs(10)).await.unwrap();
+        assert!(started.elapsed() >= settling_time);
     }
 
     #[tokio::test]

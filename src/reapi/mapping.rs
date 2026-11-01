@@ -114,6 +114,15 @@ impl ToolchainKey {
         ToolchainKey::Rustc(RustcToolchainKey::new(commit_hash, sysroot, target_triple))
     }
 
+    pub(super) fn stamps(&self) -> Vec<&FileStamp> {
+        match self {
+            ToolchainKey::Rustc(key) => (key.files.iter().flatten())
+                .map(|file| &file.stamp)
+                .collect(),
+            ToolchainKey::C(key) => key.stamps.iter().flatten().collect(),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn as_rustc(&self) -> &RustcToolchainKey {
         match self {
