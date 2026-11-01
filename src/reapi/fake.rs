@@ -120,7 +120,7 @@ pub(crate) struct FakeServer {
     pub(crate) missing_blobs_in_response: bool,
     /// Refuses each Execute with this code, such as FAILED_PRECONDITION when no worker
     /// matches the platform.
-    pub(crate) execute_error: Option<tonic::Code>,
+    pub(crate) execute_error: Mutex<Option<tonic::Code>>,
     /// Sends each Execute an operation at each of these stages, then nothing, as a server
     /// whose action waits at the last one.
     pub(crate) stages_then_stall: Vec<remexec::execution_stage::Value>,
@@ -929,7 +929,7 @@ impl Execution for FakeServer {
         let action: remexec::Action = self.decode_blob(Some(&action_digest))?;
         let command: remexec::Command = self.decode_blob(action.command_digest.as_ref())?;
         self.check_input_root(action.input_root_digest.as_ref())?;
-        if let Some(code) = self.execute_error {
+        if let Some(code) = *self.execute_error.lock().unwrap() {
             return Err(Status::new(code, "execute_error"));
         }
         if !self.stages_then_stall.is_empty() {

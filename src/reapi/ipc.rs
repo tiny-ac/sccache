@@ -289,12 +289,15 @@ impl<T: CommandCreatorSync> RemoteExecutor<T> for ReapiIpcExecutor {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::reapi::auth_token::test::{read_again_now, token_file};
     use crate::reapi::executor::test::{
-        C_OBJECT, Eligibility, Fixture, RLIB, executing_fixture, rlib_not_in_cas,
+        C_OBJECT, Eligibility, Fixture, RLIB, executing_fixture, executor_with_credentials,
+        rlib_not_in_cas,
     };
     use crate::reapi::fake::FakeServer;
     use crate::reapi::remote_compile::test::inline_output;
     use std::num::NonZeroUsize;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     fn compile_request(fixture: &Fixture) -> ReapiIpcRequest {
@@ -608,6 +611,37 @@ mod test {
         let rlib = std::fs::read(fixture.dir.path().join("ws").join(RLIB)).unwrap();
         assert_eq!(b"rlib", rlib.as_slice());
         drop(executor);
+        daemon.stop();
+    }
+
+    #[test]
+    fn test_the_daemon_keeps_refused_executions_for_every_cli_until_the_token_changes() {
+        let fixture = executing_fixture(FakeServer {
+            execute_error: Some(tonic::Code::PermissionDenied).into(),
+            ..Default::default()
+        });
+        let (auth_token, write_token) = token_file(fixture.dir.path(), Duration::ZERO);
+        let executor = executor_with_credentials(&fixture, |options| {
+            options.auth_token = Some(auth_token.clone());
+        });
+        let daemon = TestDaemon::start(executor, fixture.dir.path().join("daemon"));
+        let refused = DistType::Reapi(ReapiOutcome::CompiledLocally(
+            "REAPI server refused executions".to_owned(),
+        ));
+        let first = cli_executor(&fixture, &daemon.addr);
+        assert_eq!(refused, fixture.compile_with(&first).0);
+        let second = cli_executor(&fixture, &daemon.addr);
+        assert_eq!(refused, fixture.compile_with(&second).0);
+        assert_eq!(1, fixture.server.execute_calls.load(Ordering::SeqCst));
+
+        write_token("second");
+        fixture.runtime.block_on(read_again_now(&auth_token));
+        *fixture.server.execute_error.lock().unwrap() = None;
+        assert_eq!(
+            DistType::Reapi(ReapiOutcome::Executed),
+            fixture.compile_with(&second).0
+        );
+        drop((first, second));
         daemon.stop();
     }
 
