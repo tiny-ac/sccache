@@ -27,13 +27,17 @@ pub(super) fn jittered(wait: Duration) -> Duration {
 pub(super) mod test {
     use super::*;
 
+    pub(in crate::reapi) fn assert_in_jitter_range(wait: Duration, jittered: Duration) {
+        assert!(
+            wait / 2 <= jittered && jittered <= wait * 3 / 2,
+            "{jittered:?} isn't {wait:?} jittered"
+        );
+    }
+
     /// Checks that each of `waits` is `wait` jittered, and that they don't all wait alike.
     pub(in crate::reapi) fn assert_jittered(wait: Duration, waits: &[Duration]) {
         for jittered in waits {
-            assert!(
-                wait / 2 <= *jittered && *jittered <= wait * 3 / 2,
-                "{jittered:?} isn't {wait:?} jittered"
-            );
+            assert_in_jitter_range(wait, *jittered);
         }
         let shortest = waits.iter().min().unwrap();
         let longest = waits.iter().max().unwrap();

@@ -16,6 +16,7 @@
 //! answering doesn't delay every compile by a call's timeout. After a pause, one compile makes
 //! the call alone until the server answers it or fails it again.
 
+use super::jitter::jittered;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -70,7 +71,7 @@ impl Pause {
     }
 
     /// Counts a failed call, and pauses calls after `FAILURES_TO_PAUSE` in a row, or after one
-    /// following a pause. Returns the pause it started, if any.
+    /// following a pause. Returns the pause it started, if any: the backoff, jittered.
     pub(super) fn call_failed(&self) -> Option<Duration> {
         let mut state = self.state.lock().unwrap();
         let now = Instant::now();
@@ -83,9 +84,7 @@ impl Pause {
         if state.pauses_in_a_row == 0 && state.failures_in_a_row < FAILURES_TO_PAUSE {
             return None;
         }
-        let pause = PAUSE_MIN
-            .saturating_mul(2u32.saturating_pow(state.pauses_in_a_row))
-            .min(PAUSE_MAX);
+        let pause = jittered(backoff(state.pauses_in_a_row));
         *state = State {
             failures_in_a_row: 0,
             pauses_in_a_row: state.pauses_in_a_row + 1,
@@ -102,9 +101,18 @@ impl Pause {
     }
 }
 
+/// The pause after `pauses_in_a_row` others, before jitter: `PAUSE_MIN`, doubled for each, up
+/// to `PAUSE_MAX`.
+fn backoff(pauses_in_a_row: u32) -> Duration {
+    PAUSE_MIN
+        .saturating_mul(2u32.saturating_pow(pauses_in_a_row))
+        .min(PAUSE_MAX)
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::reapi::jitter::test::{WAITS, assert_in_jitter_range, assert_jittered};
 
     fn pause() -> Pause {
         Pause::new(Duration::from_secs(60))
@@ -119,7 +127,7 @@ mod test {
         let pause = pause();
         assert_eq!(None, fail(&pause, FAILURES_TO_PAUSE - 1));
         assert!(pause.may_call());
-        assert_eq!(Some(PAUSE_MIN), fail(&pause, 1));
+        assert!(fail(&pause, 1).is_some());
         assert!(!pause.may_call());
     }
 
@@ -138,7 +146,8 @@ mod test {
         fail(&pause, FAILURES_TO_PAUSE);
         assert_eq!(None, fail(&pause, FAILURES_TO_PAUSE));
         pause.end();
-        assert_eq!(Some(PAUSE_MIN * 2), fail(&pause, 1));
+        assert!(fail(&pause, 1).is_some());
+        assert_eq!(2, pause.state.lock().unwrap().pauses_in_a_row);
     }
 
     #[test]
@@ -154,19 +163,33 @@ mod test {
     }
 
     #[test]
-    fn test_pauses_double_up_to_the_max() {
+    fn test_backoffs_double_up_to_the_max() {
+        let backoffs: Vec<_> = (0..6).map(|pauses| backoff(pauses).as_secs()).collect();
+        assert_eq!(vec![5, 10, 20, 40, 60, 60], backoffs);
+    }
+
+    #[test]
+    fn test_each_pause_lasts_its_backoff_jittered() {
         let pause = pause();
         let mut failures = FAILURES_TO_PAUSE;
-        let pauses: Vec<_> = (0..6)
-            .map(|_| {
-                let started = fail(&pause, failures).unwrap();
-                pause.end();
-                // After a pause, the first failure starts the next one.
-                failures = 1;
-                started.as_secs()
-            })
+        for pauses_in_a_row in 0..6 {
+            let before = Instant::now();
+            let started = fail(&pause, failures).unwrap();
+            let paused_until = pause.state.lock().unwrap().paused_until.unwrap();
+            assert!(before + started <= paused_until && paused_until <= Instant::now() + started);
+            assert_in_jitter_range(backoff(pauses_in_a_row), started);
+            pause.end();
+            // After a pause, the first failure starts the next one.
+            failures = 1;
+        }
+    }
+
+    #[test]
+    fn test_pauses_are_jittered() {
+        let pauses: Vec<_> = (0..WAITS)
+            .map(|_| fail(&pause(), FAILURES_TO_PAUSE).unwrap())
             .collect();
-        assert_eq!(vec![5, 10, 20, 40, 60, 60], pauses);
+        assert_jittered(PAUSE_MIN, &pauses);
     }
 
     #[test]
@@ -176,6 +199,7 @@ mod test {
         // A call in flight when the pause started.
         pause.call_succeeded();
         assert!(pause.may_call());
-        assert_eq!(Some(PAUSE_MIN), fail(&pause, FAILURES_TO_PAUSE));
+        assert!(fail(&pause, FAILURES_TO_PAUSE).is_some());
+        assert_eq!(1, pause.state.lock().unwrap().pauses_in_a_row);
     }
 }
