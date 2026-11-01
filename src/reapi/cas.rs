@@ -70,6 +70,19 @@ impl std::fmt::Display for UnreadableBlob {
 
 impl std::error::Error for UnreadableBlob {}
 
+/// Error for a local file whose bytes don't match its upload digest, as when the file changed
+/// after sccache hashed it.
+#[derive(Debug)]
+pub(crate) struct ChangedBlob(pub(crate) PathBuf);
+
+impl std::fmt::Display for ChangedBlob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} changed after it was hashed", self.0.display())
+    }
+}
+
+impl std::error::Error for ChangedBlob {}
+
 /// A blob to upload.
 #[derive(Debug, Clone)]
 pub(crate) enum Blob {
@@ -78,10 +91,17 @@ pub(crate) enum Blob {
 }
 
 impl Blob {
-    fn read(self) -> Result<Vec<u8>> {
+    /// Fails with [`ChangedBlob`] for a file whose bytes don't match `digest`.
+    fn read(self, digest: &remexec::Digest) -> Result<Vec<u8>> {
         match self {
             Blob::Bytes(bytes) => Ok(bytes),
-            Blob::File(path) => std::fs::read(&path).with_context(|| UnreadableBlob(path)),
+            Blob::File(path) => {
+                let bytes = std::fs::read(&path).with_context(|| UnreadableBlob(path.clone()))?;
+                if digest::of_bytes(&bytes) != *digest {
+                    return Err(ChangedBlob(path).into());
+                }
+                Ok(bytes)
+            }
         }
     }
 
@@ -100,35 +120,49 @@ impl Blob {
 enum ChunkReader {
     Unopened {
         blob: Blob,
+        digest: remexec::Digest,
         compress: bool,
     },
     Open {
-        reader: Box<dyn Read + Send>,
+        source: Box<ChunkSource>,
         file: Option<PathBuf>,
+        digest: remexec::Digest,
     },
 }
 
 impl ChunkReader {
-    /// The next chunk to send, and `self` to read the rest from. Blocks.
+    /// The next chunk to send, and `self` to read the rest from. Blocks. Fails with
+    /// [`ChangedBlob`] instead of giving the chunk that reaches the digest's size, for a file
+    /// whose bytes don't match the digest, so that the server never gets all of the changed
+    /// bytes.
     fn next_chunk(self) -> Result<(Self, Vec<u8>)> {
-        let (mut reader, file) = match self {
-            ChunkReader::Unopened { blob, compress } => {
+        let (mut source, file, digest) = match self {
+            ChunkReader::Unopened {
+                blob,
+                digest,
+                compress,
+            } => {
                 let file = match &blob {
                     Blob::File(path) => Some(path.clone()),
                     Blob::Bytes(_) => None,
                 };
-                let reader = blob.open()?;
-                let reader: Box<dyn Read + Send> = if compress {
-                    Box::new(zstd::stream::read::Encoder::new(reader, ZSTD_LEVEL)?)
+                // A byte past the digest's size shows that the file grew.
+                let reader = HashingReader::new(blob.open()?.take(digest.size_bytes as u64 + 1));
+                let source = Box::new(if compress {
+                    ChunkSource::Zstd(zstd::stream::read::Encoder::new(reader, ZSTD_LEVEL)?)
                 } else {
-                    reader
-                };
-                (reader, file)
+                    ChunkSource::Plain(reader)
+                });
+                (source, file, digest)
             }
-            ChunkReader::Open { reader, file } => (reader, file),
+            ChunkReader::Open {
+                source,
+                file,
+                digest,
+            } => (source, file, digest),
         };
         let mut data = Vec::with_capacity(BYTESTREAM_WRITE_CHUNK_BYTES);
-        if let Err(e) = (&mut reader)
+        if let Err(e) = (&mut source)
             .take(BYTESTREAM_WRITE_CHUNK_BYTES as u64)
             .read_to_end(&mut data)
         {
@@ -137,7 +171,83 @@ impl ChunkReader {
                 None => e.into(),
             });
         }
-        Ok((ChunkReader::Open { reader, file }, data))
+        // A short chunk is the last one, read once the file has been read to its end. A file of
+        // whole chunks reaches the digest's size with a full chunk, and some servers commit a
+        // blob once they have that many bytes, without `finish_write`.
+        let is_last = data.len() < BYTESTREAM_WRITE_CHUNK_BYTES;
+        let read_to_size = source.hashing_reader().len >= digest.size_bytes as u64;
+        if let Some(path) = &file
+            && (is_last || read_to_size)
+            && source.hashing_reader().digest() != digest
+        {
+            return Err(ChangedBlob(path.clone()).into());
+        }
+        Ok((
+            ChunkReader::Open {
+                source,
+                file,
+                digest,
+            },
+            data,
+        ))
+    }
+}
+
+/// A blob's bytes as an upload sends them, compressed or not.
+enum ChunkSource {
+    Plain(HashingReader),
+    Zstd(zstd::stream::read::Encoder<'static, io::BufReader<HashingReader>>),
+}
+
+impl ChunkSource {
+    fn hashing_reader(&self) -> &HashingReader {
+        match self {
+            ChunkSource::Plain(reader) => reader,
+            ChunkSource::Zstd(encoder) => encoder.get_ref().get_ref(),
+        }
+    }
+}
+
+impl Read for ChunkSource {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            ChunkSource::Plain(reader) => reader.read(buf),
+            ChunkSource::Zstd(encoder) => encoder.read(buf),
+        }
+    }
+}
+
+/// Hashes the bytes read from `inner`.
+struct HashingReader {
+    inner: io::Take<Box<dyn Read + Send>>,
+    hasher: Sha256,
+    len: u64,
+}
+
+impl HashingReader {
+    fn new(inner: io::Take<Box<dyn Read + Send>>) -> Self {
+        HashingReader {
+            inner,
+            hasher: Sha256::new(),
+            len: 0,
+        }
+    }
+
+    /// The digest of the bytes read so far.
+    fn digest(&self) -> remexec::Digest {
+        remexec::Digest {
+            hash: format!("{:x}", self.hasher.clone().finalize()),
+            size_bytes: self.len as i64,
+        }
+    }
+}
+
+impl Read for HashingReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.len += n as u64;
+        Ok(n)
     }
 }
 
@@ -304,7 +414,9 @@ impl Cas {
     }
 
     /// Uploads whichever of `blobs` the CAS doesn't have, in batches, or through ByteStream
-    /// if too large for one. A local file that can't be read fails with [`UnreadableBlob`].
+    /// if too large for one. A local file that can't be read fails with [`UnreadableBlob`], and
+    /// one whose bytes don't match its digest fails with [`ChangedBlob`] before the server can
+    /// store them.
     /// A blob that another call uploads while this one waits for an upload permit isn't
     /// uploaded again.
     pub(crate) async fn ensure_uploaded(&self, blobs: Vec<(remexec::Digest, Blob)>) -> Result<()> {
@@ -428,8 +540,8 @@ impl Cas {
                 .into_iter()
                 .map(|(digest, blob)| {
                     Ok(remexec::batch_update_blobs_request::Request {
+                        data: blob.read(&digest)?,
                         digest: Some(digest),
-                        data: blob.read()?,
                         compressor: remexec::compressor::Value::Identity as i32,
                     })
                 })
@@ -506,6 +618,7 @@ impl Cas {
         let sent_bytes = Arc::new(AtomicU64::new(0));
         let chunk_reader = ChunkReader::Unopened {
             blob,
+            digest: digest.clone(),
             compress: self.supports_zstd_bytestream,
         };
         let requests = futures::stream::unfold(Some(chunk_reader), {
@@ -524,6 +637,7 @@ impl Cas {
                         .flatten();
                     let (chunk_reader, data) = match next_chunk {
                         Ok(next_chunk) => next_chunk,
+                        // Ends the stream without `finish_write`, so the server doesn't commit it.
                         Err(e) => {
                             *read_error.lock().unwrap() = Some(e);
                             return None;
@@ -566,12 +680,12 @@ impl Cas {
             },
         )
         .await;
-        // A server that has the blob may end the write early, so a read error matters only
-        // when the write failed.
-        let committed_size = match response {
-            Ok(response) => response.into_inner().committed_size,
-            Err(e) => return Err(read_error.lock().unwrap().take().unwrap_or(e)),
-        };
+        // A read error ends the stream without `finish_write`, and a server may still answer
+        // OK with the bytes it received, as the ByteStream spec says.
+        if let Some(e) = read_error.lock().unwrap().take() {
+            return Err(e);
+        }
+        let committed_size = response?.into_inner().committed_size;
         let sent_bytes = sent_bytes.load(Ordering::Relaxed);
         // Servers report the bytes received, or, when they end the write early because they
         // already have the blob, its size (-1 for a compressed upload).
@@ -898,6 +1012,43 @@ mod test {
         );
         let e = cas.ensure_uploaded(vec![missing]).await.unwrap_err();
         assert!(e.is::<UnreadableBlob>(), "{e:#}");
+    }
+
+    #[test_case(100, false, 0, false ; "in a batch")]
+    #[test_case(3 * BYTESTREAM_WRITE_CHUNK_BYTES + 10, false, 0, false ; "through bytestream")]
+    #[test_case(3 * BYTESTREAM_WRITE_CHUNK_BYTES + 10, true, 0, false ; "through zstd bytestream")]
+    #[test_case(2 * BYTESTREAM_WRITE_CHUNK_BYTES, false, 0, false ; "of whole chunks")]
+    #[test_case(3 * BYTESTREAM_WRITE_CHUNK_BYTES, false, 10, false ; "that grew")]
+    #[test_case(3 * BYTESTREAM_WRITE_CHUNK_BYTES + 10, false, 0, true ; "through bytestream, to a server that answers unfinished writes")]
+    #[test_case(3 * BYTESTREAM_WRITE_CHUNK_BYTES + 10, true, 0, true ; "through zstd bytestream, to a server that answers unfinished writes")]
+    #[test_case(2 * BYTESTREAM_WRITE_CHUNK_BYTES, false, 0, true ; "of whole chunks, to a server that answers unfinished writes")]
+    #[tokio::test]
+    async fn test_a_file_changed_after_hashing_fails_the_upload(
+        size: usize,
+        supports_zstd_bytestream: bool,
+        growth: usize,
+        answers_unfinished_writes: bool,
+    ) {
+        let (cas, server) = cas_with_small_batches(FakeServer {
+            supports_zstd_bytestream,
+            stores_mismatched_blobs: true,
+            answers_unfinished_writes,
+            ..Default::default()
+        })
+        .await;
+        let hashed = incompressible_bytes_of_len(size);
+        let mut changed = hashed.clone();
+        changed[size - 1] ^= 1;
+        changed.resize(size + growth, 0);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, &changed).unwrap();
+        let e = cas
+            .ensure_uploaded(vec![(digest::of_bytes(&hashed), Blob::File(file))])
+            .await
+            .unwrap_err();
+        assert!(e.is::<ChangedBlob>(), "{e:#}");
+        assert!(!server.has_blob(&hashed));
     }
 
     #[tokio::test]

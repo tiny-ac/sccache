@@ -84,6 +84,13 @@ pub(crate) struct FakeServer {
     /// Deletes this file at the next FindMissingBlobs, as a build that removes an input after
     /// sccache hashes it.
     pub(crate) delete_at_find_missing: Mutex<Option<PathBuf>>,
+    /// Stores uploaded blobs without checking them against their digests, so that a test sees
+    /// any changed bytes that sccache lets the server store.
+    pub(crate) stores_mismatched_blobs: bool,
+    /// Answers a ByteStream write that ends without `finish_write` with the bytes it received,
+    /// as the ByteStream spec says, and stores the blob if they are all of its bytes, as servers
+    /// that commit by size do.
+    pub(crate) answers_unfinished_writes: bool,
     /// Answers BatchUpdateBlobs with this code.
     pub(crate) upload_error: Mutex<Option<tonic::Code>>,
     /// Answers each blob of a BatchUpdateBlobs with this code.
@@ -441,7 +448,8 @@ impl ContentAddressableStorage for FakeServer {
                         message: "blob_upload_error".to_owned(),
                         details: vec![],
                     })
-                } else if digest::of_bytes(&request.data) == digest {
+                } else if self.stores_mismatched_blobs || digest::of_bytes(&request.data) == digest
+                {
                     self.blobs
                         .lock()
                         .unwrap()
@@ -633,17 +641,26 @@ impl ByteStream for FakeServer {
                 break;
             }
         }
-        if !finished {
-            return Err(Status::invalid_argument("no finish_write"));
-        }
         let committed_size = data.len() as i64;
         let ResourceName { digest, is_zstd } =
             self.parse_write_resource_name(&resource_name.unwrap_or_default())?;
+        if !finished {
+            if !self.answers_unfinished_writes {
+                return Err(Status::invalid_argument("no finish_write"));
+            }
+            if !is_zstd && committed_size == digest.size_bytes {
+                self.blobs
+                    .lock()
+                    .unwrap()
+                    .insert((digest.hash, digest.size_bytes), data);
+            }
+            return Ok(Response::new(WriteResponse { committed_size }));
+        }
         if is_zstd {
             data = zstd::bulk::decompress(&data, digest.size_bytes as usize)
                 .map_err(|e| Status::invalid_argument(e.to_string()))?;
         }
-        if digest::of_bytes(&data) != digest {
+        if !self.stores_mismatched_blobs && digest::of_bytes(&data) != digest {
             return Err(Status::invalid_argument("digest mismatch"));
         }
         self.blobs
