@@ -235,7 +235,7 @@ impl Client {
                 channel_builder
                     .connect()
                     .await
-                    .map_err(|e| without_host(e.into(), tls_domain.as_deref()))
+                    .map_err(|e| without_server_names(e.into(), tls_domain.as_deref()))
             },
         )
         .await?;
@@ -511,11 +511,20 @@ pub(super) fn loggable(text: &[u8]) -> String {
 
 impl std::error::Error for RpcError {}
 
+/// Leaves out the status's source, and the names of a TLS certificate in its message, which
+/// tonic copies from the source when it fails to connect again.
 pub(super) fn status_error(status: tonic::Status) -> Error {
     Error::new(RpcError {
         code: status.code(),
-        message: status.message().to_owned(),
+        message: status_message(&status),
     })
+}
+
+/// `status`'s message, without the names of a TLS certificate that isn't valid for the host,
+/// which tonic copies into the message of a call that fails to connect.
+pub(super) fn status_message(status: &tonic::Status) -> String {
+    let sources = std::iter::successors(std::error::Error::source(status), |e| e.source());
+    without_certificate_names(status.message().to_owned(), sources)
 }
 
 /// The code of the REAPI call that failed with `e`, if `e` is one.
@@ -523,13 +532,54 @@ pub(super) fn rpc_code(e: &Error) -> Option<tonic::Code> {
     e.downcast_ref::<RpcError>().map(|e| e.code)
 }
 
-/// `error` with each mention of `host` replaced, since rustls names the expected host when the
-/// server's certificate doesn't match it.
-fn without_host(error: Error, host: Option<&str>) -> Error {
-    match host {
-        Some(host) => anyhow!("{}", format!("{error:#}").replace(host, "<REAPI server>")),
-        None => error,
+/// `error` with each mention of `host` replaced, and without the names of a TLS certificate
+/// that isn't valid for `host`. An error that names neither stays as it is.
+fn without_server_names(error: Error, host: Option<&str>) -> Error {
+    let text = format!("{error:#}");
+    let mut without_names = without_certificate_names(text.clone(), error.chain());
+    if let Some(host) = host {
+        without_names = without_names.replace(host, "<REAPI server>");
     }
+    if without_names == text {
+        return error;
+    }
+    anyhow!("{without_names}")
+}
+
+/// `text` without the names that rustls lists for a certificate that isn't valid for the host:
+/// the host, and every DNS name and IP address the certificate presents. The rustls error is
+/// one of `errors`, and `text` repeats the rustls error's message once for each error that
+/// wraps the rustls error.
+fn without_certificate_names<'a>(
+    mut text: String,
+    errors: impl Iterator<Item = &'a (dyn std::error::Error + 'static)>,
+) -> String {
+    for error in errors {
+        // tokio-rustls returns rustls' errors inside an `io::Error`.
+        let tls_error = (error.downcast_ref::<rustls::Error>()).or_else(|| {
+            let io_error = error.downcast_ref::<std::io::Error>()?;
+            io_error.get_ref()?.downcast_ref::<rustls::Error>()
+        });
+        if let Some(
+            tls_error @ rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidForNameContext {
+                    expected,
+                    presented,
+                },
+            ),
+        ) = tls_error
+        {
+            let without_names =
+                rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName);
+            text = text.replace(&tls_error.to_string(), &without_names.to_string());
+            // A wrapper may format rustls' error some other way, so each name goes too.
+            for name in presented {
+                text = text.replace(name.as_str(), "<certificate name>");
+            }
+            text = text.replace(expected.to_str().as_ref(), "<REAPI server>");
+        }
+    }
+    text
 }
 
 /// A REAPI endpoint as tonic connects to it.
@@ -620,7 +670,7 @@ fn check_api_version(capabilities: &remexec::ServerCapabilities) -> Result<()> {
 }
 
 #[cfg(test)]
-mod test {
+pub(super) mod test {
     use super::*;
     use crate::reapi::auth_token::test::{read_again_now, token_file};
     #[cfg(unix)]
@@ -930,7 +980,7 @@ mod test {
         .unwrap();
         let e = format!("{e:#}");
         assert!(
-            e.contains("<REAPI server>") && !e.contains("localhost"),
+            e.contains("NotValidForName") && !e.contains("localhost") && !e.contains("127.0.0.1"),
             "{e}"
         );
     }
@@ -1246,6 +1296,17 @@ mod test {
         assert_eq!(Some(tonic::Code::Unavailable), rpc_code(&e));
     }
 
+    #[test]
+    fn test_status_error_leaves_out_the_names_of_the_certificate() {
+        // As tonic answers a call after it fails to connect again.
+        let mut status = tonic::Status::unavailable(certificate_name_error().to_string());
+        status.set_source(std::sync::Arc::new(certificate_name_error()));
+        assert_eq!(
+            r#"Unavailable: "invalid peer certificate: NotValidForName""#,
+            status_error(status).to_string()
+        );
+    }
+
     #[test_case(tonic::Code::Unavailable, RETRIES + 1 ; "unavailable")]
     #[test_case(tonic::Code::ResourceExhausted, RETRIES + 1 ; "resource exhausted")]
     #[test_case(tonic::Code::Internal, 1 ; "internal")]
@@ -1295,14 +1356,52 @@ mod test {
         assert_eq!("answer", answer);
     }
 
+    /// rustls' error for a certificate of `farm.corp.example` and `10.1.2.3`, from a server
+    /// connected to as `reapi.example.com`, as tokio-rustls returns it.
+    pub(in crate::reapi) fn certificate_name_error() -> std::io::Error {
+        let expected = rustls::pki_types::ServerName::try_from("reapi.example.com").unwrap();
+        let tls_error =
+            rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForNameContext {
+                expected: expected.to_owned(),
+                presented: vec!["farm.corp.example".to_owned(), "10.1.2.3".to_owned()],
+            });
+        std::io::Error::new(std::io::ErrorKind::InvalidData, tls_error)
+    }
+
     #[test]
-    fn test_without_host_replaces_the_host() {
-        let error =
-            anyhow!("certificate not valid for name reapi.example.com").context("transport error");
+    fn test_without_server_names_replaces_the_host() {
+        let error = anyhow!("failed to reach reapi.example.com").context("transport error");
         assert_eq!(
-            "transport error: certificate not valid for name <REAPI server>",
-            without_host(error, Some("reapi.example.com")).to_string()
+            "transport error: failed to reach <REAPI server>",
+            without_server_names(error, Some("reapi.example.com")).to_string()
         );
+    }
+
+    #[test]
+    fn test_without_server_names_leaves_out_the_names_of_the_certificate() {
+        let error = Error::new(certificate_name_error()).context("transport error");
+        assert!(format!("{error:#}").contains("farm.corp.example"));
+        assert_eq!(
+            "transport error: invalid peer certificate: NotValidForName",
+            without_server_names(error, Some("reapi.example.com")).to_string()
+        );
+    }
+
+    #[test]
+    fn test_without_server_names_leaves_out_names_that_a_wrapper_formats_its_own_way() {
+        let error = Error::new(certificate_name_error())
+            .context(format!("transport error: {:?}", certificate_name_error()));
+        let text = format!("{:#}", without_server_names(error, None));
+        for name in ["reapi.example.com", "farm.corp.example", "10.1.2.3"] {
+            assert!(!text.contains(name), "{text}");
+        }
+    }
+
+    #[test]
+    fn test_without_server_names_keeps_an_error_that_names_no_server() {
+        let error = Error::new(std::io::Error::other("refused")).context("connecting");
+        let kept = without_server_names(error, Some("reapi.example.com"));
+        assert!(kept.is::<std::io::Error>(), "{kept:#}");
     }
 
     #[tokio::test]
