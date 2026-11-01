@@ -367,7 +367,7 @@ impl ReapiExecutor {
                 }
                 if let Some(pause) = self.lookup_pause.call_failed() {
                     warn!(
-                        "REAPI: action cache lookups are failing; compiling locally for {pause:?}"
+                        "REAPI: action cache lookups are failing; compiling locally for {pause:.1?}"
                     );
                 }
                 return Err(CompileLocallyReason::ActionCacheLookupFailed);
@@ -499,7 +499,9 @@ impl ReapiExecutor {
             }
             Err(reason) => {
                 if let Some(pause) = self.execution_pause.call_failed() {
-                    warn!("REAPI: executions are failing; compiling misses locally for {pause:?}");
+                    warn!(
+                        "REAPI: executions are failing; compiling misses locally for {pause:.1?}"
+                    );
                 }
                 return Err(reason);
             }
