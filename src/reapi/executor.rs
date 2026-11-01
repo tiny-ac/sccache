@@ -1286,8 +1286,7 @@ pub(super) mod test {
             let digest_cache = DigestCache::load(self.dir.path().join("digests.json"));
             let files = digest_input_root_files(&compile, &digest_cache).unwrap();
             let toolchain = crate::reapi::remote_compile::toolchain_files(
-                &self.dir.path().join("sysroot"),
-                TARGET_TRIPLE,
+                compile.toolchain.as_rustc(),
                 &digest_cache,
             )
             .unwrap();

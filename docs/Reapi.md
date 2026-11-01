@@ -54,7 +54,7 @@ A crate whose rlib holds the path it's built at, such as one with `env!("CARGO_M
 
 ## Lookups and execution
 
-sccache connects to the server and hashes each toolchain's files once while it runs. The digests are kept in `<dist cache_dir>/reapi-digests.json`, so after a restart only changed files are hashed again. On a hit, sccache writes the compile's outputs and caches them as it would a local compile's.
+sccache connects to the server and hashes each toolchain's files once while it runs, and a toolchain file again when it changes, even in place. The digests are kept in `<dist cache_dir>/reapi-digests.json`, so after a restart only changed files are hashed again. On a hit, sccache writes the compile's outputs and caches them as it would a local compile's.
 
 On a miss, with `on_miss = "execute"` (the default), sccache uploads the compile's inputs and toolchain to the server's CAS and runs it on a worker, and the server caches the result. Execution needs a server that executes actions, and a Linux client or a Linux toolchain for the client's rustc (see below). With `on_miss = "local"`, a miss compiles locally and sccache never writes to the server.
 

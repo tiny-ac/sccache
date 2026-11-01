@@ -105,11 +105,7 @@ impl Toolchains {
             let (toolchain, digest_cache) = (key.clone(), this.digest_cache.clone());
             let hashed = tokio::task::spawn_blocking(move || {
                 let files = match &toolchain {
-                    ToolchainKey::Rustc(toolchain) => toolchain_files(
-                        &toolchain.sysroot,
-                        &toolchain.target_triple,
-                        &digest_cache,
-                    )?,
+                    ToolchainKey::Rustc(toolchain) => toolchain_files(toolchain, &digest_cache)?,
                     ToolchainKey::C(toolchain) => c_toolchain_files(toolchain, &digest_cache)?,
                 };
                 if let Err(e) = digest_cache.save() {
@@ -156,6 +152,7 @@ impl Toolchains {
 mod test {
     use super::*;
     use crate::compiler::CCompilerKind;
+    use crate::reapi::digest;
     use crate::reapi::mapping::CToolchainKey;
     use crate::reapi::remote_compile::test::fake_sysroot;
     use std::path::Path;
@@ -202,6 +199,23 @@ mod test {
         for compile in compiles {
             assert!(Arc::ptr_eq(&first, &compile.await.unwrap()));
         }
+    }
+
+    #[tokio::test]
+    async fn test_a_toolchain_file_changed_in_place_is_hashed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let sysroot = fake_sysroot(dir.path());
+        let llvm = sysroot.join("lib/libLLVM.so.1");
+        let toolchains = toolchains(dir.path(), RETRY_AFTER);
+        let llvm_digest = |files: &ToolchainFiles| {
+            let (file, _) = files.iter().find(|(_, path)| *path == llvm).unwrap();
+            file.digest.clone()
+        };
+        let before = toolchains.files(&key(&sysroot), in_secs(10)).await.unwrap();
+        std::fs::write(&llvm, b"patched").unwrap();
+        let after = toolchains.files(&key(&sysroot), in_secs(10)).await.unwrap();
+        assert_ne!(llvm_digest(&before), llvm_digest(&after));
+        assert_eq!(digest::of_bytes(b"patched"), llvm_digest(&after));
     }
 
     #[tokio::test]

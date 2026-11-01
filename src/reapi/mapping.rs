@@ -24,6 +24,7 @@
 
 use super::client::{CPP_COMPILE_MNEMONIC, RUSTC_MNEMONIC};
 use super::digest::FileStamp;
+use super::remote_compile::list_toolchain_files;
 use crate::compiler::CCompilerKind;
 use crate::errors::*;
 use serde::{Deserialize, Serialize};
@@ -132,34 +133,46 @@ impl std::fmt::Display for ToolchainKey {
 }
 
 /// A local Rust toolchain. Two rustcs can report the same commit and still have different
-/// files, so the key includes the sysroot, and the stamps of rustc, its libraries' directory
-/// and the target's std directory, which change when the toolchain is updated in place or
-/// gets a target added.
+/// files, so the key includes the sysroot and the files that workers get, with their stamps,
+/// so that a file updated in place changes the key.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct RustcToolchainKey {
     pub(crate) commit_hash: String,
     pub(crate) sysroot: PathBuf,
     pub(crate) target_triple: String,
-    stamps: Vec<Option<FileStamp>>,
+    /// The files that workers get, with their stamps. `None` when listing the files fails, as
+    /// for a toolchain without std.
+    pub(crate) files: Option<Vec<StampedFile>>,
 }
 
 impl RustcToolchainKey {
-    /// Reads the stamps, so call it from a blocking thread.
+    /// Lists the files and reads their stamps, so call it from a blocking thread.
     pub(crate) fn new(commit_hash: String, sysroot: PathBuf, target_triple: String) -> Self {
-        let stamps = [
-            sysroot.join("bin/rustc"),
-            sysroot.join("lib"),
-            sysroot.join("lib/rustlib").join(&target_triple).join("lib"),
-        ]
-        .iter()
-        .map(|path| FileStamp::of(path).ok())
-        .collect();
+        let files = list_toolchain_files(&sysroot, &target_triple).ok();
         RustcToolchainKey {
             commit_hash,
             sysroot,
             target_triple,
-            stamps,
+            files,
         }
+    }
+}
+
+/// A local toolchain file that workers get.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct StampedFile {
+    pub(crate) path: PathBuf,
+    pub(crate) is_executable: bool,
+    stamp: FileStamp,
+}
+
+impl StampedFile {
+    pub(super) fn new(path: PathBuf, is_executable: bool) -> Result<Self> {
+        Ok(StampedFile {
+            stamp: FileStamp::of(&path)?,
+            path,
+            is_executable,
+        })
     }
 }
 
@@ -659,30 +672,70 @@ pub(crate) fn lexically_normalize(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::reapi::remote_compile::test::fake_sysroot;
     use test_case::test_case;
 
-    #[test]
-    fn test_a_toolchain_key_changes_with_rustc_and_a_new_target() {
+    const TARGET_TRIPLE: &str = "x86_64-unknown-linux-gnu";
+
+    fn rustc_key(sysroot: &Path, target_triple: &str) -> ToolchainKey {
+        ToolchainKey::rustc(
+            "abc123".to_owned(),
+            sysroot.to_owned(),
+            target_triple.to_owned(),
+        )
+    }
+
+    #[test_case("bin/rustc" ; "rustc")]
+    #[test_case("lib/libLLVM.so.1" ; "llvm")]
+    #[test_case("lib/librustc_driver-x.so" ; "rustc driver")]
+    #[test_case("lib/rustlib/x86_64-unknown-linux-gnu/lib/libstd-x.rlib" ; "std")]
+    #[test_case("lib/rustlib/x86_64-unknown-linux-gnu/lib/self-contained/crt1.o" ; "self-contained object")]
+    #[test_case("lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld" ; "rust-lld")]
+    #[test_case("lib/rustlib/x86_64-unknown-linux-gnu/bin/gcc-ld/ld.lld" ; "gcc-ld wrapper")]
+    fn test_a_toolchain_key_changes_with_a_file_changed_in_place(file: &str) {
         let dir = tempfile::tempdir().unwrap();
-        let sysroot = dir.path().to_owned();
-        std::fs::create_dir_all(sysroot.join("bin")).unwrap();
-        std::fs::write(sysroot.join("bin/rustc"), b"rustc 1").unwrap();
-        let key = || {
-            ToolchainKey::rustc(
-                "abc123".to_owned(),
-                sysroot.clone(),
-                "wasm32-unknown-unknown".to_owned(),
-            )
-        };
-        let original = key();
-        assert_eq!(original, key());
+        let sysroot = fake_sysroot(dir.path());
+        let crt1 = format!("lib/rustlib/{TARGET_TRIPLE}/lib/self-contained/crt1.o");
+        let ld_lld = format!("lib/rustlib/{TARGET_TRIPLE}/bin/gcc-ld/ld.lld");
+        for extra_file in [crt1, ld_lld] {
+            let path = sysroot.join(extra_file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"linker file").unwrap();
+        }
+        let before = rustc_key(&sysroot, TARGET_TRIPLE);
+        // A rewrite within the same tick of the filesystem's clock keeps the ctime, which the
+        // toolchain's settling wait covers, so the rewrite waits for the clock to move on.
+        let path = sysroot.join(file);
+        let modified = |path: &Path| path.metadata().unwrap().modified().unwrap();
+        let probe = dir.path().join("probe");
+        loop {
+            std::fs::write(&probe, b"").unwrap();
+            if modified(&probe) > modified(&path) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Same size and mtime, so only the file's own stamp shows the change.
+        let mtime = filetime::FileTime::from_last_modification_time(&path.metadata().unwrap());
+        let mut contents = std::fs::read(&path).unwrap();
+        contents[0] ^= 1;
+        std::fs::write(&path, contents).unwrap();
+        filetime::set_file_mtime(&path, mtime).unwrap();
+        assert_ne!(before, rustc_key(&sysroot, TARGET_TRIPLE));
+    }
 
-        std::fs::write(sysroot.join("bin/rustc"), b"rustc 1.1").unwrap();
-        let updated = key();
-        assert_ne!(original, updated, "rustc changed");
-
-        std::fs::create_dir_all(sysroot.join("lib/rustlib/wasm32-unknown-unknown/lib")).unwrap();
-        assert_ne!(updated, key(), "target added");
+    #[test]
+    fn test_a_toolchain_key_changes_when_its_target_is_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let sysroot = fake_sysroot(dir.path());
+        let without_target = rustc_key(&sysroot, "wasm32-unknown-unknown");
+        let std = sysroot.join("lib/rustlib/wasm32-unknown-unknown/lib/libstd-x.rlib");
+        std::fs::create_dir_all(std.parent().unwrap()).unwrap();
+        std::fs::write(&std, b"std").unwrap();
+        assert_ne!(
+            without_target,
+            rustc_key(&sysroot, "wasm32-unknown-unknown")
+        );
     }
 
     #[test]
