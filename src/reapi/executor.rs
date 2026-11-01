@@ -969,7 +969,9 @@ fn read_connect_options(config: &ReapiConfig) -> Result<ConnectOptions> {
         endpoint: config.endpoint.clone(),
         instance_name: config.instance_name.clone(),
         auth_token,
-        headers: config.headers.clone(),
+        headers: (config.headers.iter())
+            .map(|(name, value)| (name.clone(), value.as_str().to_owned()))
+            .collect(),
         credential_helper,
         tool_invocation_id: uuid::Uuid::new_v4().to_string(),
         tls_ca_certificates,
@@ -2605,6 +2607,19 @@ pub(super) mod test {
         let first = read_connect_options(&config).unwrap().tool_invocation_id;
         let second = read_connect_options(&config).unwrap().tool_invocation_id;
         assert!(!first.is_empty() && first != second, "{first} {second}");
+    }
+
+    #[test]
+    fn test_the_configured_headers_are_sent() {
+        let config = ReapiConfig {
+            headers: [("x-api-key".to_owned(), "key".into())].into(),
+            ..config("grpc://farm:8980".to_owned(), 0)
+        };
+        let headers = read_connect_options(&config).unwrap().headers;
+        assert_eq!(
+            std::collections::BTreeMap::from([("x-api-key".to_owned(), "key".to_owned())]),
+            headers
+        );
     }
 
     #[test]
