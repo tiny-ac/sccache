@@ -18,7 +18,7 @@
 //! local compiles by reason.
 
 use super::auth_token::{self, AuthToken};
-use super::cas::UnreadableBlob;
+use super::cas::{ChangedBlob, UnreadableBlob};
 use super::client::{
     ConnectOptions, RPC_TIMEOUT, RUSTC_MNEMONIC, RUSTC_VERSION_MNEMONIC, check_connect_options,
     credential_helper_uri, loggable, rpc_code,
@@ -426,13 +426,12 @@ impl ReapiExecutor {
                 out_pretty,
             )
             .await?;
-            upload_and_execute(
+            self.upload_and_execute(
                 &apis,
                 execution,
                 &action,
                 RUSTC_MNEMONIC,
                 skip_cache_lookup,
-                self.queue_timeout,
                 out_pretty,
             )
             .await
@@ -451,6 +450,12 @@ impl ReapiExecutor {
                     );
                 }
                 return Err(CompileLocallyReason::ExecutionsRefused);
+            }
+            // A toolchain file can change without changing the key's stamps, if edited soon
+            // after its last change.
+            Err(CompileLocallyReason::InputChangedAfterHashing) => {
+                self.toolchains.forget(&reapi_compile.toolchain).await;
+                return Err(CompileLocallyReason::InputChangedAfterHashing);
             }
             // An input that can't be read or hashed says nothing about the server, nor does an
             // action that runs out of time. The rustc check already counted the server's
@@ -559,16 +564,16 @@ impl ReapiExecutor {
             );
             CompileLocallyReason::HashingInputsFailed
         })?;
-        let response = upload_and_execute(
-            apis,
-            execution,
-            &action,
-            RUSTC_VERSION_MNEMONIC,
-            false,
-            self.queue_timeout,
-            out_pretty,
-        )
-        .await?;
+        let response = self
+            .upload_and_execute(
+                apis,
+                execution,
+                &action,
+                RUSTC_VERSION_MNEMONIC,
+                false,
+                out_pretty,
+            )
+            .await?;
         self.execution_pause.call_succeeded();
         let result = response.result.unwrap_or_default();
         let sysroot = key.sysroot.display();
@@ -650,81 +655,90 @@ async fn write_outputs(
         })
 }
 
-/// Uploads what `action` needs and executes it, uploading again once if the CAS evicted
-/// blobs since.
-async fn upload_and_execute(
-    apis: &ServerApis,
-    execution: &Execution,
-    action: &ActionBlobs,
-    action_mnemonic: &str,
-    skip_cache_lookup: bool,
-    queue_timeout: Duration,
-    out_pretty: &str,
-) -> std::result::Result<remexec::ExecuteResponse, CompileLocallyReason> {
-    let deadline = tokio::time::Instant::now() + EXECUTE_TIMEOUT;
-    let execute = || async {
-        tokio::time::timeout_at(
-            deadline,
-            execution.execute_action(
-                &action.action_digest,
-                action_mnemonic,
-                skip_cache_lookup,
-                queue_timeout,
-            ),
-        )
-        .await
-        .unwrap_or_else(|_| bail!("the execution timed out after {EXECUTE_TIMEOUT:?}"))
-    };
-    upload(apis, action, out_pretty).await?;
-    let executed = match execute().await {
-        // The CAS may evict blobs after FindMissingBlobs, or after `Cas` last saw them.
-        Err(e) if e.is::<MissingActionBlobs>() => {
-            debug!("[{}]: {:#}; uploading again", out_pretty, e);
-            apis.cas.forget_present_blobs();
-            upload(apis, action, out_pretty).await?;
-            execute().await
-        }
-        executed => executed,
-    };
-    executed.map_err(|e| {
-        warn!("[{}]: Compiling locally: {:#}", out_pretty, e);
-        if e.is::<QueuedTooLong>() {
-            return CompileLocallyReason::ExecutionQueuedTooLong;
-        }
-        match rpc_code(&e) {
-            Some(tonic::Code::Unauthenticated) => CompileLocallyReason::CredentialsRefused,
-            // PERMISSION_DENIED on Execute comes from credentials that may look actions up but
-            // not execute them.
-            Some(tonic::Code::PermissionDenied) => CompileLocallyReason::ExecutionsRefused,
-            Some(tonic::Code::DeadlineExceeded) => CompileLocallyReason::ExecutionTimedOut,
-            // Including FAILED_PRECONDITION without missing blobs, which servers also answer
-            // while no worker is available, as when a pool scales up from zero.
-            _ => CompileLocallyReason::ExecutionFailed,
-        }
-    })
-}
-
-async fn upload(
-    apis: &ServerApis,
-    action: &ActionBlobs,
-    out_pretty: &str,
-) -> std::result::Result<(), CompileLocallyReason> {
-    apis.cas
-        .ensure_uploaded(action.blobs.clone())
-        .await
-        .map_err(|e| {
+impl ReapiExecutor {
+    /// Uploads what `action` needs and executes it, uploading again once if the CAS evicted
+    /// blobs since.
+    async fn upload_and_execute(
+        &self,
+        apis: &ServerApis,
+        execution: &Execution,
+        action: &ActionBlobs,
+        action_mnemonic: &str,
+        skip_cache_lookup: bool,
+        out_pretty: &str,
+    ) -> std::result::Result<remexec::ExecuteResponse, CompileLocallyReason> {
+        let deadline = tokio::time::Instant::now() + EXECUTE_TIMEOUT;
+        let execute = || async {
+            tokio::time::timeout_at(
+                deadline,
+                execution.execute_action(
+                    &action.action_digest,
+                    action_mnemonic,
+                    skip_cache_lookup,
+                    self.queue_timeout,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| bail!("the execution timed out after {EXECUTE_TIMEOUT:?}"))
+        };
+        self.upload(apis, action, out_pretty).await?;
+        let executed = match execute().await {
+            // The CAS may evict blobs after FindMissingBlobs, or after `Cas` last saw them.
+            Err(e) if e.is::<MissingActionBlobs>() => {
+                debug!("[{}]: {:#}; uploading again", out_pretty, e);
+                apis.cas.forget_present_blobs();
+                self.upload(apis, action, out_pretty).await?;
+                execute().await
+            }
+            executed => executed,
+        };
+        executed.map_err(|e| {
             warn!("[{}]: Compiling locally: {:#}", out_pretty, e);
-            if e.is::<UnreadableBlob>() {
-                return CompileLocallyReason::UnreadableInput;
+            if e.is::<QueuedTooLong>() {
+                return CompileLocallyReason::ExecutionQueuedTooLong;
             }
             match rpc_code(&e) {
                 Some(tonic::Code::Unauthenticated) => CompileLocallyReason::CredentialsRefused,
-                // PERMISSION_DENIED on an upload comes from credentials that may read but not
-                // write.
+                // PERMISSION_DENIED on Execute comes from credentials that may look actions up but
+                // not execute them.
                 Some(tonic::Code::PermissionDenied) => CompileLocallyReason::ExecutionsRefused,
-                _ => CompileLocallyReason::UploadFailed,
+                Some(tonic::Code::DeadlineExceeded) => CompileLocallyReason::ExecutionTimedOut,
+                // Including FAILED_PRECONDITION without missing blobs, which servers also answer
+                // while no worker is available, as when a pool scales up from zero.
+                _ => CompileLocallyReason::ExecutionFailed,
             }
         })
+    }
+
+    /// Uploads what `action` needs. A file that changed after it was hashed loses its digest in the
+    /// digest cache, since an edit soon after the file's last change can keep the file's stamp.
+    async fn upload(
+        &self,
+        apis: &ServerApis,
+        action: &ActionBlobs,
+        out_pretty: &str,
+    ) -> std::result::Result<(), CompileLocallyReason> {
+        apis.cas
+            .ensure_uploaded(action.blobs.clone())
+            .await
+            .map_err(|e| {
+                warn!("[{}]: Compiling locally: {:#}", out_pretty, e);
+                if e.is::<UnreadableBlob>() {
+                    return CompileLocallyReason::UnreadableInput;
+                }
+                if let Some(ChangedBlob(path)) = e.downcast_ref() {
+                    self.digest_cache.forget(path);
+                    return CompileLocallyReason::InputChangedAfterHashing;
+                }
+                match rpc_code(&e) {
+                    Some(tonic::Code::Unauthenticated) => CompileLocallyReason::CredentialsRefused,
+                    // PERMISSION_DENIED on an upload comes from credentials that may read but not
+                    // write.
+                    Some(tonic::Code::PermissionDenied) => CompileLocallyReason::ExecutionsRefused,
+                    _ => CompileLocallyReason::UploadFailed,
+                }
+            })
+    }
 }
 
 /// Whether `e` is a read the server refused. A server lets any credentials it accepts read,
@@ -1885,6 +1899,22 @@ mod test {
             compiled_locally("failed to read an input to upload it"),
             dist_type
         );
+    }
+
+    #[test_case::test_case("ws/src/lib.rs" ; "an input")]
+    #[test_case::test_case("sysroot/bin/rustc" ; "a toolchain file")]
+    fn test_a_file_whose_cached_digest_is_stale_compiles_locally_then_executes(file: &str) {
+        let fixture = executing_fixture(FakeServer::default());
+        let executor = fixture.executor();
+        let stale_hash = crate::reapi::digest::of_bytes(b"before an edit that kept the stamp").hash;
+        (executor.digest_cache).cache_stale_hash(&fixture.dir.path().join(file), &stale_hash);
+        let (dist_type, _) = fixture.compile_with(&executor);
+        assert_eq!(
+            compiled_locally("input changed after it was hashed"),
+            dist_type
+        );
+        let (dist_type, _) = fixture.compile_with(&executor);
+        assert_eq!(DistType::Reapi(ReapiOutcome::Executed), dist_type);
     }
 
     #[test]

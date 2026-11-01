@@ -208,6 +208,11 @@ impl DigestCache {
         Ok(digest)
     }
 
+    /// Drops `path`'s entry, pinned or not.
+    pub(crate) fn forget(&self, path: &Path) {
+        self.entries.lock().unwrap().remove(path);
+    }
+
     /// How long to wait before hashing files with `stamps`, so that their digests can be kept
     /// for as long as the stamps stay the same. An edit soon after a file's last change can
     /// leave its stamp unchanged, as [`MIN_AGE_TO_CACHE`] says.
@@ -227,6 +232,18 @@ impl DigestCache {
     pub(super) fn with_min_age_to_cache(mut self, min_age_to_cache: Duration) -> Self {
         self.min_age_to_cache = min_age_to_cache;
         self
+    }
+
+    /// Caches `hash` as `path`'s, with `path`'s current stamp, as when an edit soon after the
+    /// file's last change kept its stamp.
+    #[cfg(test)]
+    pub(super) fn cache_stale_hash(&self, path: &Path, hash: &str) {
+        let entry = DigestCacheEntry {
+            stamp: FileStamp::of(path).unwrap(),
+            hash: hash.to_owned(),
+            pinned: true,
+        };
+        self.entries.lock().unwrap().insert(path.to_owned(), entry);
     }
 
     /// Caches files however recently they changed.
@@ -380,6 +397,18 @@ mod test {
         cache.min_age_to_cache = Duration::from_secs(3600);
         cache.digest(&file).unwrap();
         assert!(cache.entries.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_a_forgotten_entry_is_hashed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"hello").unwrap();
+        let cache = load_without_min_age(dir.path().join("digests.json"));
+        cache.cache_stale_hash(&file, "stale");
+        assert_eq!("stale", cache.digest_and_pin(&file).unwrap().hash);
+        cache.forget(&file);
+        assert_eq!(of_bytes(b"hello"), cache.digest_and_pin(&file).unwrap());
     }
 
     #[test]
