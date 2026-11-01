@@ -98,7 +98,7 @@ Instead of `auth_token_file`, `credential_helper` can name a [Bazel credential h
 - 30 minutes later, without an `expires`;
 - after the server refuses its headers.
 
-A helper that fails or takes more than 10 seconds when sccache has connected leaves the headers it printed before in use, and runs again 10 seconds later at the earliest. When it fails as sccache connects, compiles run locally, and sccache tries again as after a failed connection. Its stderr is discarded, so run `<helper> get` by hand to see why it fails.
+A helper that fails or takes more than 10 seconds when sccache has connected leaves the headers it printed before in use, and runs again about 10 seconds later at the earliest. When it fails as sccache connects, compiles run locally, and sccache tries again as after a failed connection. Its stderr is discarded, so run `<helper> get` by hand to see why it fails.
 
 The URI starts with `https`, for a `grpc://` endpoint too, and leaves out port 443. The URI has no path, since one helper run covers every gRPC service. Bazel adds the service's name as the path, such as `/build.bazel.remote.execution.v2.ContentAddressableStorage`, and runs the helper separately for each service. A helper that looks at the path may not recognize sccache's URI.
 
@@ -106,9 +106,10 @@ Each call carries a `RequestMetadata` with sccache's name and version and an ID 
 
 ## Failures and retries
 
-- An action cache lookup, an upload, or the start of a download that the server answers within a second with UNAVAILABLE or RESOURCE_EXHAUSTED is tried twice more, after 200 and 400 ms.
-- A failed connection is retried after 5 to 60 seconds, and a failed hashing of a toolchain after a minute.
-- After 3 action cache lookups fail in a row, compiles skip the lookup for 5 seconds, doubling up to 60 while lookups keep failing. Executions pause the same way, and misses compile locally meanwhile.
+- An action cache lookup, an upload, or the start of a download that the server answers within a second with UNAVAILABLE or RESOURCE_EXHAUSTED is tried twice more, after about 200 and 400 ms.
+- A failed connection is retried after about 5 to 60 seconds, and a failed hashing of a toolchain after a minute.
+- After 3 action cache lookups fail in a row, compiles skip the lookup for about 5 seconds, doubling up to about 60 while lookups keep failing. Executions pause the same way, and misses compile locally meanwhile.
+- Each wait given as "about", here and for the credential helper, lasts from half to one and a half times its time, at random, so that clients that failed together don't call the server again together.
 - A miss that the server reports queued for longer than `queue_timeout_secs` (60 by default) compiles locally, and counts as a failed execution toward the pause.
 - Each action has a 9-minute timeout. An action that runs out of time compiles locally and doesn't count toward the pause, and sccache stops waiting for an execution after 10 minutes.
 - A server older than REAPI v2.1 isn't used until sccache restarts.
