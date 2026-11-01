@@ -1,4 +1,4 @@
-.PHONY: help clean $(addprefix test-,$(BACKENDS)) $(addprefix clean-,$(BACKENDS)) test-backends
+.PHONY: help clean $(addprefix test-,$(BACKENDS)) $(addprefix clean-,$(BACKENDS)) test-backends bench-reapi
 
 export UID := $(shell id -u)
 export GID := $(shell id -g)
@@ -19,6 +19,7 @@ endif
 
 PROJECT_ROOT := $(shell git rev-parse --show-toplevel)
 SCCACHE_BIN := $(PROJECT_ROOT)/target/debug/sccache
+BENCH_SCCACHE_BIN := $(PROJECT_ROOT)/target/release/sccache
 
 # Coverage support via WITH_COVERAGE=1
 COVERAGE_DIR := $(PROJECT_ROOT)/target/integration-coverage
@@ -128,6 +129,9 @@ help:
 	@echo "  make test-multilevel         Run multi-level cache test across all backends"
 	@echo "  make test-multilevel-chain   Run multi-level backfill chain test (4 levels)"
 	@echo ""
+	@echo "Benchmarks (not part of make test):"
+	@echo "  make bench-reapi             Time ripgrep and rust-analyzer builds with and without REAPI"
+	@echo ""
 	@echo "  make test-backends           Run all backend tests"
 	@echo "  make clean                   Stop all services and clean up"
 	@echo "  make help                    Show this help"
@@ -169,6 +173,27 @@ endif
 	@echo "Binary built: $(SCCACHE_BIN)"
 	@ls -lh $(SCCACHE_BIN)
 	$(call endgroup)
+
+# The benchmark times a release build.
+$(BENCH_SCCACHE_BIN): $(PROJECT_ROOT)/Cargo.toml $(PROJECT_ROOT)/Cargo.lock | $(PROJECT_ROOT)/target/integration-cargo-cache
+	@echo "Building sccache for the benchmark in Docker..."
+	@docker run --rm \
+		-v $(PROJECT_ROOT):/sccache \
+		-v $(PROJECT_ROOT)/target/integration-cargo-cache:/usr/local/cargo/registry \
+		-w /sccache \
+		-e OPENSSL_NO_VENDOR=1 \
+		rust:latest \
+		bash -c "apt-get update -qq && apt-get install -y -qq libssl-dev pkg-config && \
+		         cargo build --locked --release --features reapi && \
+		         chown -R $(UID):$(GID) target"
+
+# REAPI_ENDPOINT points it at another server, and REAPI_CONFIG_DIR at a directory whose
+# reapi.toml it adds to [dist.reapi]; files there are under /reapi-config in the container.
+bench-reapi: $(BENCH_SCCACHE_BIN)
+	@mkdir -p $(PROJECT_ROOT)/target/bench-reapi
+	@docker compose --profile bench-reapi run --quiet-pull --rm \
+		$(if $(REAPI_CONFIG_DIR),-v $(abspath $(REAPI_CONFIG_DIR)):/reapi-config:ro -e REAPI_CONFIG=/reapi-config/reapi.toml) \
+		bench-reapi
 
 define profiles
 $(foreach profile,$(PROFILES_$(1)),--profile $(profile))
