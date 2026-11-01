@@ -1066,12 +1066,9 @@ mod test {
             let compile = self.compilation().map_for_reapi().unwrap();
             let digest_cache = DigestCache::load(self.dir.path().join("digests.json"));
             let files = digest_input_root_files(&compile, &digest_cache).unwrap();
-            let toolchain = crate::reapi::remote_compile::toolchain_files(
-                &self.dir.path().join("sysroot"),
-                TARGET_TRIPLE,
-                &digest_cache,
-            )
-            .unwrap();
+            let toolchain =
+                crate::reapi::remote_compile::toolchain_files(&compile.toolchain, &digest_cache)
+                    .unwrap();
             let action_digest = action_blobs(
                 &compile,
                 &files,

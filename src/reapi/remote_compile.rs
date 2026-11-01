@@ -19,7 +19,9 @@ use super::cas::{Blob, Cas};
 use super::client::loggable;
 use super::digest::{self, DigestCache};
 use super::input_root::{InputRoot, InputRootFile};
-use super::mapping::{BUILD_ROOT_DIR, CompileLocallyReason, ReapiCompile, TOOLCHAIN_DIR};
+use super::mapping::{
+    BUILD_ROOT_DIR, CompileLocallyReason, ReapiCompile, StampedFile, TOOLCHAIN_DIR, ToolchainKey,
+};
 use super::proto::build::bazel::remote::execution::v2 as remexec;
 use super::terminal_output::without_terminal_controls;
 use crate::config::ReapiConfig;
@@ -298,37 +300,14 @@ fn unusable(reason: CompileLocallyReason, detail: String) -> Error {
     Error::new(UnusableToolchain(reason)).context(detail)
 }
 
-/// rustc, its shared libraries, and `target_triple`'s std and bundled linker from
-/// `sysroot`, as input root files under [`TOOLCHAIN_DIR`] paired with their local paths.
-/// Fails with [`UnusableToolchain`] if one is missing or has a non-UTF-8 path.
-pub(super) fn toolchain_files(
+/// rustc, its shared libraries, and `target_triple`'s std and bundled linker from `sysroot`,
+/// with their stamps. Fails with [`UnusableToolchain`] if rustc, its `lib` directory or
+/// `target_triple`'s std is missing.
+pub(super) fn list_toolchain_files(
     sysroot: &Path,
     target_triple: &str,
-    digest_cache: &DigestCache,
-) -> Result<Vec<(InputRootFile, PathBuf)>> {
+) -> Result<Vec<StampedFile>> {
     let mut files = vec![];
-    let mut add = |local_path: PathBuf, is_executable: bool| -> Result<()> {
-        let path_in_sysroot = local_path
-            .strip_prefix(sysroot)
-            .with_context(|| format!("{} outside {}", local_path.display(), sysroot.display()))?
-            .to_str()
-            .ok_or_else(|| {
-                unusable(
-                    CompileLocallyReason::NonUtf8ToolchainPath,
-                    format!("non-UTF-8 toolchain path {}", local_path.display()),
-                )
-            })?
-            .to_owned();
-        // A symlink becomes a file with its destination's contents, which the CAS stores once.
-        let digest = digest_cache.digest_and_pin(&local_path)?;
-        let file = InputRootFile {
-            path: format!("{TOOLCHAIN_DIR}/{path_in_sysroot}"),
-            digest,
-            is_executable,
-        };
-        files.push((file, local_path));
-        Ok(())
-    };
     let missing = |what: &str| {
         unusable(
             CompileLocallyReason::MissingRustcOrStd,
@@ -339,7 +318,7 @@ pub(super) fn toolchain_files(
     if !rustc.is_file() {
         return Err(missing("rustc"));
     }
-    add(rustc, true)?;
+    files.push(StampedFile::new(rustc, true)?);
     // rustc's own shared libraries; the sanitizer runtimes next to them aren't needed to compile.
     let lib_dir = sysroot.join("lib");
     if !lib_dir.is_dir() {
@@ -353,7 +332,7 @@ pub(super) fn toolchain_files(
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with("librustc_driver") || n.starts_with("libLLVM"));
         if path.is_file() && is_rustc_library {
-            add(path, false)?;
+            files.push(StampedFile::new(path, false)?);
         }
     }
     let target_triple_dir = sysroot.join("lib/rustlib").join(target_triple);
@@ -364,7 +343,7 @@ pub(super) fn toolchain_files(
     for entry in walkdir::WalkDir::new(&std_dir).follow_links(true) {
         let entry = entry?;
         if entry.file_type().is_file() {
-            add(entry.into_path(), false)?;
+            files.push(StampedFile::new(entry.into_path(), false)?);
         }
     }
     // rust-lld, the default linker for some target triples, such as x86_64-unknown-linux-gnu.
@@ -373,11 +352,55 @@ pub(super) fn toolchain_files(
         for entry in walkdir::WalkDir::new(&linker_dir).follow_links(true) {
             let entry = entry?;
             if entry.file_type().is_file() {
-                add(entry.into_path(), true)?;
+                files.push(StampedFile::new(entry.into_path(), true)?);
             }
         }
     }
+    // The key holds the files, and directory listings have no fixed order.
+    files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
+}
+
+/// The files of `toolchain`'s key, as input root files under [`TOOLCHAIN_DIR`] paired with
+/// their local paths. Fails with [`UnusableToolchain`] for a toolchain without rustc, its
+/// `lib` directory or std, or for a file with a non-UTF-8 path.
+pub(super) fn toolchain_files(
+    toolchain: &ToolchainKey,
+    digest_cache: &DigestCache,
+) -> Result<Vec<(InputRootFile, PathBuf)>> {
+    let sysroot = &toolchain.sysroot;
+    let Some(files) = &toolchain.files else {
+        // A key holds no files when they couldn't be listed, so listing them again gives the
+        // error. Files listed now changed since the key was made, and digests kept under a
+        // key without files would outlive the next change.
+        list_toolchain_files(sysroot, &toolchain.target_triple)?;
+        bail!(
+            "the toolchain in {} changed while it was listed",
+            sysroot.display()
+        );
+    };
+    files
+        .iter()
+        .map(|file| {
+            let path_in_sysroot = (file.path.strip_prefix(sysroot))
+                .with_context(|| format!("{} outside {}", file.path.display(), sysroot.display()))?
+                .to_str()
+                .ok_or_else(|| {
+                    unusable(
+                        CompileLocallyReason::NonUtf8ToolchainPath,
+                        format!("non-UTF-8 toolchain path {}", file.path.display()),
+                    )
+                })?;
+            // A symlink becomes a file with its destination's contents, which the CAS stores
+            // once.
+            let input_root_file = InputRootFile {
+                path: format!("{TOOLCHAIN_DIR}/{path_in_sysroot}"),
+                digest: digest_cache.digest_and_pin(&file.path)?,
+                is_executable: file.is_executable,
+            };
+            Ok((input_root_file, file.path.clone()))
+        })
+        .collect()
 }
 
 /// Writes to `inner` and records whether the bytes written contain the worker root, even
@@ -822,8 +845,11 @@ pub(super) mod test {
         let digest_cache = DigestCache::load(dir.join("digests.json"));
         change(&mut compile);
         let files = digest_input_root_files(&compile, &digest_cache).unwrap();
-        let toolchain =
-            toolchain_files(sysroot, "x86_64-unknown-linux-gnu", &digest_cache).unwrap();
+        let toolchain = toolchain_files(
+            &toolchain_key(sysroot, "x86_64-unknown-linux-gnu"),
+            &digest_cache,
+        )
+        .unwrap();
         action_blobs(&compile, &files, &toolchain, options).unwrap()
     }
 
@@ -870,8 +896,11 @@ pub(super) mod test {
         let dir = tempfile::tempdir().unwrap();
         let sysroot = fake_sysroot(&dir.path().join("sysroot"));
         let digest_cache = DigestCache::load(dir.path().join("digests.json"));
-        let toolchain =
-            toolchain_files(&sysroot, "x86_64-unknown-linux-gnu", &digest_cache).unwrap();
+        let toolchain = toolchain_files(
+            &toolchain_key(&sysroot, "x86_64-unknown-linux-gnu"),
+            &digest_cache,
+        )
+        .unwrap();
         let options = ActionOptions::new(&config_with_salt_and_platform());
         let action_blobs = rustc_version_action_blobs(&toolchain, &options).unwrap();
         let blobs: std::collections::HashMap<_, _> = action_blobs.blobs.into_iter().collect();
@@ -1460,6 +1489,14 @@ pub(super) mod test {
         sysroot
     }
 
+    fn toolchain_key(sysroot: &Path, target_triple: &str) -> ToolchainKey {
+        ToolchainKey::new(
+            "abc123".to_owned(),
+            sysroot.to_owned(),
+            target_triple.to_owned(),
+        )
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_toolchain_files_are_rustc_its_libraries_std_and_linker() {
@@ -1477,12 +1514,14 @@ pub(super) mod test {
         .unwrap();
         let digest_cache = DigestCache::load(dir.path().join("digests"));
 
-        let mut files: Vec<(String, bool)> =
-            toolchain_files(&sysroot, "x86_64-unknown-linux-gnu", &digest_cache)
-                .unwrap()
-                .into_iter()
-                .map(|(file, _)| (file.path, file.is_executable))
-                .collect();
+        let mut files: Vec<(String, bool)> = toolchain_files(
+            &toolchain_key(&sysroot, "x86_64-unknown-linux-gnu"),
+            &digest_cache,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|(file, _)| (file.path, file.is_executable))
+        .collect();
         files.sort();
         let expected = [
             (".sccache-toolchain/bin/rustc".to_owned(), true),
@@ -1512,7 +1551,11 @@ pub(super) mod test {
         let dir = tempfile::tempdir().unwrap();
         let sysroot = fake_sysroot(dir.path());
         let digest_cache = DigestCache::load(dir.path().join("digests"));
-        let e = toolchain_files(&sysroot, "aarch64-apple-darwin", &digest_cache).unwrap_err();
+        let e = toolchain_files(
+            &toolchain_key(&sysroot, "aarch64-apple-darwin"),
+            &digest_cache,
+        )
+        .unwrap_err();
         assert!(
             e.to_string().contains("no std for aarch64-apple-darwin"),
             "{e:#}"
@@ -1529,11 +1572,30 @@ pub(super) mod test {
         let sysroot = fake_sysroot(dir.path());
         std::fs::remove_file(sysroot.join("bin/rustc")).unwrap();
         let digest_cache = DigestCache::load(dir.path().join("digests"));
-        let e = toolchain_files(&sysroot, "x86_64-unknown-linux-gnu", &digest_cache).unwrap_err();
+        let e = toolchain_files(
+            &toolchain_key(&sysroot, "x86_64-unknown-linux-gnu"),
+            &digest_cache,
+        )
+        .unwrap_err();
         assert!(e.to_string().contains("no rustc"), "{e:#}");
         assert!(matches!(
             e.downcast_ref(),
             Some(UnusableToolchain(CompileLocallyReason::MissingRustcOrStd))
         ));
+    }
+
+    #[test]
+    fn test_a_key_whose_files_couldnt_be_listed_fails_once_they_can_be() {
+        let dir = tempfile::tempdir().unwrap();
+        let sysroot = fake_sysroot(&dir.path().join("sysroot"));
+        let std_dir = sysroot.join("lib/rustlib/x86_64-unknown-linux-gnu/lib");
+        let moved_std_dir = dir.path().join("std");
+        std::fs::rename(&std_dir, &moved_std_dir).unwrap();
+        let key = toolchain_key(&sysroot, "x86_64-unknown-linux-gnu");
+        assert!(key.files.is_none());
+        std::fs::rename(&moved_std_dir, &std_dir).unwrap();
+        let digest_cache = DigestCache::load(dir.path().join("digests"));
+        let e = toolchain_files(&key, &digest_cache).unwrap_err();
+        assert!(e.downcast_ref::<UnusableToolchain>().is_none(), "{e:#}");
     }
 }
