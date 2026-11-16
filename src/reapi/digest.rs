@@ -262,21 +262,26 @@ impl DigestCache {
             .filter(|(path, entry)| entry.pinned && path.to_str().is_some())
             .map(|(path, entry)| (path.clone(), entry.clone()))
             .collect();
-        let dir = self
-            .save_file
-            .parent()
-            .context("the digest cache's save file has no directory")?;
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let mut tmp_file = tempfile::NamedTempFile::new_in(dir)
-            .with_context(|| format!("creating a temporary file in {}", dir.display()))?;
-        tmp_file
-            .write_all(&serde_json::to_vec(&to_save)?)
-            .with_context(|| format!("writing {}", tmp_file.path().display()))?;
-        tmp_file.persist(&self.save_file).with_context(|| {
-            format!("moving the temporary file to {}", self.save_file.display())
-        })?;
-        Ok(())
+        save_json(&self.save_file, &to_save)
     }
+}
+
+/// Writes `value` to `save_file` as JSON, through a temporary file so that a reader never sees
+/// it half written.
+pub(super) fn save_json(save_file: &Path, value: &impl Serialize) -> Result<()> {
+    let dir = save_file
+        .parent()
+        .with_context(|| format!("{} has no directory", save_file.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let mut tmp_file = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("creating a temporary file in {}", dir.display()))?;
+    tmp_file
+        .write_all(&serde_json::to_vec(value)?)
+        .with_context(|| format!("writing {}", tmp_file.path().display()))?;
+    tmp_file
+        .persist(save_file)
+        .with_context(|| format!("moving the temporary file to {}", save_file.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -197,7 +197,7 @@ fn c_compiler_check_options(key: &CToolchainKey) -> Vec<&str> {
 }
 
 /// The [`ActionBlobs`] of [`c_compiler_check_command`]'s action. Servers neither answer it
-/// from their action cache nor cache its result, so it runs on a worker each time.
+/// from their action cache nor cache its result, so sccache keeps the answer for a day itself.
 pub(super) fn c_compiler_check_action_blobs(
     key: &CToolchainKey,
     toolchain: &[(InputRootFile, PathBuf)],
@@ -410,7 +410,8 @@ pub(super) fn action_blobs(
 }
 
 /// The [`ActionBlobs`] of the action that prints `toolchain`'s `rustc -vV`. Servers neither
-/// answer it from their action cache nor cache its result, so it runs on a worker each time.
+/// answer it from their action cache nor cache its result, so sccache keeps the answer for a
+/// day itself.
 pub(super) fn rustc_version_action_blobs(
     toolchain: &[(InputRootFile, PathBuf)],
     options: &ActionOptions,

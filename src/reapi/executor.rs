@@ -19,6 +19,7 @@
 
 use super::auth_token::{self, AuthToken};
 use super::cas::{ChangedBlob, UnreadableBlob};
+use super::check_answers::CheckAnswers;
 use super::client::{
     CPP_COMPILER_CHECK_MNEMONIC, ConnectOptions, RPC_TIMEOUT, RUSTC_VERSION_MNEMONIC,
     check_connect_options, credential_helper_uri, loggable, rpc_code,
@@ -63,6 +64,9 @@ pub(super) const PREPROCESSED_DIR: &str = "reapi-preprocessed";
 const WORKER_TOOLCHAINS_DIR: &str = "reapi-worker-toolchains";
 /// File under the dist cache dir that keeps toolchain file digests across restarts.
 const DIGEST_CACHE_FILE: &str = "reapi-digests.json";
+/// File under the dist cache dir that keeps the workers' answers to toolchain checks across
+/// restarts.
+const CHECK_ANSWERS_FILE: &str = "reapi-check-answers.json";
 /// Bounds an execution, with its reattaches and its retry after uploading again. Longer than
 /// the action's own timeout, so that the server reports an action that runs out of time.
 const EXECUTE_TIMEOUT: Duration = Duration::from_secs(ACTION_TIMEOUT.as_secs() + 60);
@@ -90,6 +94,7 @@ pub(crate) struct ReapiExecutor {
     /// The toolchains workers run for a client that doesn't run Linux.
     worker_toolchains: WorkerToolchains,
     toolchain_checks: Mutex<HashMap<ToolchainKey, Arc<ToolchainCheck>>>,
+    check_answers: Arc<CheckAnswers>,
     /// The version of the credentials the server refused an execution or an upload for, so
     /// that misses compile locally until the credentials change.
     executions_refused_credentials_version: Mutex<Option<u64>>,
@@ -120,6 +125,14 @@ enum ToolchainOnWorkers {
     Matches,
     /// Compiles with the toolchain compile locally, for this reason.
     Unusable(CompileLocallyReason),
+}
+
+/// The stdout of a toolchain check that exited with 0 on a worker.
+struct WorkerAnswer {
+    action_digest: remexec::Digest,
+    stdout: Vec<u8>,
+    /// Whether the answer comes from `check_answers`, which already keeps it.
+    remembered: bool,
 }
 
 /// A compile that runs locally, for `reason`.
@@ -182,6 +195,11 @@ impl ReapiExecutor {
                 dist_cache_dir.join(WORKER_TOOLCHAINS_DIR),
             ),
             toolchain_checks: Default::default(),
+            check_answers: Arc::new(CheckAnswers::load(
+                dist_cache_dir.join(CHECK_ANSWERS_FILE),
+                &config.endpoint,
+                &config.instance_name,
+            )),
             executions_refused_credentials_version: Default::default(),
             local_slots: config
                 .local_slots
@@ -638,7 +656,7 @@ impl ReapiExecutor {
     ) -> std::result::Result<ToolchainOnWorkers, CompileLocallyReason> {
         let (files, action_options) = (toolchain.clone(), self.action_options.clone());
         let sysroot = key.sysroot.display();
-        let stdout = self
+        let answer = self
             .run_check_on_worker(
                 apis,
                 execution,
@@ -648,12 +666,12 @@ impl ReapiExecutor {
                 out_pretty,
             )
             .await?;
-        let Some(stdout) = stdout else {
+        let Some(answer) = answer else {
             return Ok(ToolchainOnWorkers::Unusable(
                 CompileLocallyReason::RustcFailsOnWorkers,
             ));
         };
-        let stdout = String::from_utf8_lossy(&stdout);
+        let stdout = String::from_utf8_lossy(&answer.stdout);
         let commit_hash = stdout
             .lines()
             .find_map(|line| line.strip_prefix("commit-hash: "));
@@ -668,6 +686,7 @@ impl ReapiExecutor {
                 CompileLocallyReason::RustcCommitDiffersOnWorkers,
             ));
         }
+        self.remember(answer).await;
         Ok(ToolchainOnWorkers::Matches)
     }
 
@@ -699,7 +718,7 @@ impl ReapiExecutor {
         };
         let (files, worker_key, action_options) =
             (toolchain.clone(), key.clone(), self.action_options.clone());
-        let stdout = self
+        let answer = self
             .run_check_on_worker(
                 apis,
                 execution,
@@ -709,17 +728,17 @@ impl ReapiExecutor {
                 out_pretty,
             )
             .await?;
-        let Some(stdout) = stdout else {
+        let Some(answer) = answer else {
             return Ok(ToolchainOnWorkers::Unusable(
                 CompileLocallyReason::CCompilerFailsOnWorkers,
             ));
         };
-        let worker = worker_c_compiler_answers(key, &String::from_utf8_lossy(&stdout));
+        let worker = worker_c_compiler_answers(key, &String::from_utf8_lossy(&answer.stdout));
         if worker.as_ref() != Ok(&local) {
             warn!(
                 "REAPI: {driver} answers {} on the workers and {local:?} locally; compiling its \
                  misses locally",
-                loggable(&stdout)
+                loggable(&answer.stdout)
             );
             return Ok(ToolchainOnWorkers::Unusable(
                 worker
@@ -727,11 +746,31 @@ impl ReapiExecutor {
                     .unwrap_or(CompileLocallyReason::CCompilerDiffersOnWorkers),
             ));
         }
+        self.remember(answer).await;
         Ok(ToolchainOnWorkers::Matches)
     }
 
-    /// Runs the check action that `build_action` builds on a worker, and returns its stdout,
-    /// or `None` if `check`, as logs name it, exits non-zero.
+    /// Keeps the answer of a check that matched across restarts. A check that fails runs again
+    /// after a restart, so that restarting sccache picks up fixed workers.
+    async fn remember(&self, answer: WorkerAnswer) {
+        if answer.remembered {
+            return;
+        }
+        let check_answers = self.check_answers.clone();
+        let saved = tokio::task::spawn_blocking(move || {
+            check_answers.remember(&answer.action_digest, &answer.stdout)
+        })
+        .await
+        .map_err(Error::from)
+        .flatten();
+        if let Err(e) = saved {
+            warn!("REAPI: failed to save a toolchain check's answer: {e:#}");
+        }
+    }
+
+    /// Runs the check action that `build_action` builds on a worker, unless `check_answers`
+    /// keeps its answer, and returns the answer, or `None` if `check`, as logs name it, exits
+    /// non-zero.
     async fn run_check_on_worker(
         &self,
         apis: &ServerApis,
@@ -740,7 +779,7 @@ impl ReapiExecutor {
         check: &str,
         build_action: impl FnOnce() -> Result<ActionBlobs> + Send + 'static,
         out_pretty: &str,
-    ) -> std::result::Result<Option<Vec<u8>>, CompileLocallyReason> {
+    ) -> std::result::Result<Option<WorkerAnswer>, CompileLocallyReason> {
         let action = tokio::task::spawn_blocking(build_action)
             .await
             .map_err(Error::from)
@@ -752,6 +791,14 @@ impl ReapiExecutor {
                 );
                 CompileLocallyReason::HashingInputsFailed
             })?;
+        if let Some(stdout) = self.check_answers.get(&action.action_digest) {
+            debug!("REAPI: {check}: the workers answered within the last day");
+            return Ok(Some(WorkerAnswer {
+                action_digest: action.action_digest,
+                stdout,
+                remembered: true,
+            }));
+        }
         let response = self
             .upload_and_execute(apis, execution, &action, action_mnemonic, false, out_pretty)
             .await?;
@@ -768,17 +815,22 @@ impl ReapiExecutor {
             );
             return Ok(None);
         }
-        download_stdout_or_stderr(&apis.cas, &result.stdout_raw, result.stdout_digest.as_ref())
-            .await
-            .map(Some)
-            .map_err(|e| {
-                warn!("[{}]: Compiling locally: {:#}", out_pretty, e);
-                if is_refused_read(&e) {
-                    CompileLocallyReason::CredentialsRefused
-                } else {
-                    CompileLocallyReason::DownloadingOutputsFailed
-                }
-            })
+        let stdout =
+            download_stdout_or_stderr(&apis.cas, &result.stdout_raw, result.stdout_digest.as_ref())
+                .await
+                .map_err(|e| {
+                    warn!("[{}]: Compiling locally: {:#}", out_pretty, e);
+                    if is_refused_read(&e) {
+                        CompileLocallyReason::CredentialsRefused
+                    } else {
+                        CompileLocallyReason::DownloadingOutputsFailed
+                    }
+                })?;
+        Ok(Some(WorkerAnswer {
+            action_digest: action.action_digest,
+            stdout,
+            remembered: false,
+        }))
     }
 }
 
@@ -1206,6 +1258,8 @@ pub(super) mod test {
                     // Writing them again would change the toolchain key.
                     if !driver.exists() {
                         write_executable(&driver, &c_driver_script(self.c_version));
+                    }
+                    if !cc1.exists() {
                         std::fs::write(&cc1, "cc1").unwrap();
                     }
                     return Ok(ReapiCompile {
@@ -1609,6 +1663,30 @@ pub(super) mod test {
         );
     }
 
+    #[test]
+    fn test_a_c_compiler_check_that_passes_doesnt_run_again_after_a_restart() {
+        let fixture = executing_c_fixture();
+        let (dist_type, _) = fixture.compile_with(&fixture.executor());
+        assert_eq!(DistType::Reapi(ReapiOutcome::Executed), dist_type);
+        fixture.server.action_results.lock().unwrap().clear();
+        let (dist_type, _) = fixture.compile_with(&fixture.executor());
+        assert_eq!(DistType::Reapi(ReapiOutcome::Executed), dist_type);
+        let execute_mnemonics: Vec<_> = (fixture.server.request_metadata.lock().unwrap())
+            .iter()
+            .filter(|(method, _)| *method == "Execute")
+            .map(|(_, request_metadata)| request_metadata.action_mnemonic.clone())
+            .collect();
+        // The second sccache server reads the check's answer from the save file.
+        assert_eq!(
+            vec![
+                CPP_COMPILER_CHECK_MNEMONIC,
+                CPP_COMPILE_MNEMONIC,
+                CPP_COMPILE_MNEMONIC
+            ],
+            execute_mnemonics
+        );
+    }
+
     #[test_case::test_case(None, "gcc or clang fails its check on the workers" ; "fails")]
     #[test_case::test_case(
         Some(("aarch64-linux-gnu", "gcc 12")),
@@ -1708,7 +1786,10 @@ pub(super) mod test {
 
     /// Fails executions until they pause, then ends the pause.
     fn pause_executions(fixture: &Fixture, executor: &ReapiExecutor) {
+        // Executions fail too, since a toolchain check answered from the check answers file
+        // uploads nothing.
         *fixture.server.upload_error.lock().unwrap() = Some(tonic::Code::Internal);
+        *fixture.server.execute_error.lock().unwrap() = Some(tonic::Code::Internal);
         for _ in 0..FAILURES_TO_PAUSE {
             fixture.compile_with(executor);
         }
@@ -1717,6 +1798,7 @@ pub(super) mod test {
             fixture.compile_with(executor).0
         );
         *fixture.server.upload_error.lock().unwrap() = None;
+        *fixture.server.execute_error.lock().unwrap() = None;
         executor.execution_pause.end();
     }
 
@@ -2159,6 +2241,29 @@ pub(super) mod test {
     }
 
     #[test]
+    fn test_a_rustc_check_that_passes_doesnt_run_again_after_a_restart() {
+        let fixture = executing_fixture(FakeServer::default());
+        let (dist_type, _) = fixture.compile_with(&fixture.executor());
+        assert_eq!(DistType::Reapi(ReapiOutcome::Executed), dist_type);
+        fixture.server.action_results.lock().unwrap().clear();
+        let (dist_type, _) = fixture.compile_with(&fixture.executor());
+        assert_eq!(DistType::Reapi(ReapiOutcome::Executed), dist_type);
+        // rustc -vV, then each compile: the second sccache server reads rustc -vV's answer
+        // from the save file.
+        assert_eq!(3, fixture.server.execute_calls.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_a_rustc_check_that_fails_runs_again_after_a_restart() {
+        let mut fixture = executing_fixture(FakeServer::default());
+        fixture.commit_hash = "def456".to_owned();
+        let rustc_differs = compiled_locally("rustc on the workers reports another commit hash");
+        assert_eq!(rustc_differs, fixture.compile().0);
+        assert_eq!(rustc_differs, fixture.compile().0);
+        assert_eq!(2, fixture.server.actions_run.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn test_a_compile_that_fails_on_a_worker_compiles_locally() {
         let fixture = executing_fixture(FakeServer {
             worker_exit_code: 1,
@@ -2167,9 +2272,10 @@ pub(super) mod test {
         let (dist_type, output) = fixture.compile();
         assert_eq!(compiled_locally("compile failed on a worker"), dist_type);
         assert_eq!(b"out".as_slice(), output.stdout);
-        // rustc -vV and the compile, twice: the server cached neither.
+        // The compile runs twice, since the server doesn't cache a failed compile. rustc -vV
+        // runs once: the second sccache server reads its answer from the save file.
         fixture.compile();
-        assert_eq!(4, fixture.server.actions_run.load(Ordering::SeqCst));
+        assert_eq!(3, fixture.server.actions_run.load(Ordering::SeqCst));
     }
 
     #[test_case::test_case(

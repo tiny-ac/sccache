@@ -18,6 +18,7 @@
 mod action_cache;
 mod auth_token;
 mod cas;
+mod check_answers;
 mod client;
 mod compile_as_worker;
 mod connection;
