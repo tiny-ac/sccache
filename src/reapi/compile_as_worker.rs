@@ -179,6 +179,7 @@ mod test {
             toolchain: ToolchainKey::C(toolchain),
             env: Default::default(),
             input_root_files: vec![],
+            input_root_directories: vec![],
             preprocessed_source: Some(PreprocessedSource::new(
                 source.into_temp_path(),
                 "src/x.c".to_owned(),

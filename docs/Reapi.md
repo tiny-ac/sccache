@@ -124,6 +124,7 @@ Each call carries a `RequestMetadata` with sccache's name and version and an ID 
 - The compile's stdout and stderr from the server lose any terminal control sequence except colors, so a server can't set the terminal's title or clipboard, or rewrite what it shows. Worker paths in them are replaced with local ones, but a local path with a `"` or `\` isn't escaped again in JSON diagnostics.
 - A C or C++ compile run through REAPI names its sources relative to the package or the target dir in its warnings and errors, and doesn't show macro expansions in them. The workers' messages come in the C locale. Compiling the preprocessed source can warn where the original didn't, such as on macro expansions: cargo then shows the extra warnings, and with `-Werror` the compile fails on the worker and as a worker before the compile's own command runs, at every miss.
 - A proc macro that reads env vars or files that rustc doesn't record in the dep-info gets the worker's, not the client's, and they aren't part of the action's key.
+- A Rust compile that reads a file through a path stepping out of a symlink with `..`, such as `src/link/../x.rs` where `src/link` is a symlink, compiles locally, as sccache-dist refuses it too.
 
 ## Benchmark
 

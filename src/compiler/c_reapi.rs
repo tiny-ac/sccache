@@ -154,6 +154,7 @@ fn reapi_compile(
         toolchain: ToolchainKey::C(toolchain),
         env: Default::default(),
         input_root_files: vec![],
+        input_root_directories: vec![],
         preprocessed_source: Some(PreprocessedSource::new(preprocessed, mapped_input)),
         outputs: vec![object],
     })

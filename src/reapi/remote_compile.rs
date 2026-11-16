@@ -206,6 +206,7 @@ pub(super) fn c_compiler_check_action_blobs(
     command_action_blobs(
         c_compiler_check_command(key),
         toolchain.iter(),
+        &[],
         options,
         true,
     )
@@ -402,6 +403,7 @@ pub(super) fn action_blobs(
     command_action_blobs(
         build_command(compile),
         files.iter().chain(toolchain),
+        &compile.input_root_directories,
         options,
         false,
     )
@@ -413,17 +415,25 @@ pub(super) fn rustc_version_action_blobs(
     toolchain: &[(InputRootFile, PathBuf)],
     options: &ActionOptions,
 ) -> Result<ActionBlobs> {
-    command_action_blobs(rustc_version_command(), toolchain.iter(), options, true)
+    command_action_blobs(
+        rustc_version_command(),
+        toolchain.iter(),
+        &[],
+        options,
+        true,
+    )
 }
 
-/// The [`ActionBlobs`] of the action that runs `command` on `files`.
+/// The [`ActionBlobs`] of the action that runs `command` on `files`, in an input root that
+/// also holds `directories`.
 fn command_action_blobs<'a>(
     command: remexec::Command,
     files: impl Iterator<Item = &'a (InputRootFile, PathBuf)> + Clone,
+    directories: &[String],
     options: &ActionOptions,
     do_not_cache: bool,
 ) -> Result<ActionBlobs> {
-    let input_root = InputRoot::build(files.clone().map(|(file, _)| file))?;
+    let input_root = InputRoot::build(files.clone().map(|(file, _)| file), directories)?;
     let (command, mut action) = build_action(command, input_root.digest, options);
     action.do_not_cache = do_not_cache;
     let command_bytes = command.encode_to_vec();
@@ -1024,6 +1034,7 @@ pub(super) mod test {
                 unset_vars: vec!["HOSTNAME".to_owned(), "GIT_HASH".to_owned()],
             },
             input_root_files: vec![],
+            input_root_directories: vec![],
             preprocessed_source: None,
             outputs: vec![
                 format!("{cwd}/target/debug/deps/libfoo.rmeta").into(),
@@ -1128,6 +1139,46 @@ pub(super) mod test {
         }
         assert!(file_names.contains(&"lib.rs".to_owned()), "{file_names:?}");
         assert!(file_names.contains(&"rustc".to_owned()), "{file_names:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_directory_an_input_steps_out_of_goes_into_the_input_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let sysroot = fake_sysroot(&dir.path().join("sysroot"));
+        let action_blobs = action_blobs_in(
+            dir.path(),
+            "pub fn f() {}",
+            &sysroot,
+            |compile| {
+                let src = compile.input_root_files[0].parent().unwrap().to_owned();
+                std::fs::create_dir_all(src.join("bits")).unwrap();
+                compile.input_root_files = vec![src.join("bits/../lib.rs")];
+                compile.input_root_directories = vec!["src/bits".to_owned()];
+            },
+            &ActionOptions::default(),
+        );
+        let blobs: std::collections::HashMap<_, _> = action_blobs.blobs.into_iter().collect();
+        let directory = |digest: &remexec::Digest| match &blobs[digest] {
+            Blob::Bytes(bytes) => remexec::Directory::decode(bytes.as_slice()).unwrap(),
+            Blob::File(path) => panic!("{path:?}"),
+        };
+        let action = match &blobs[&action_blobs.action_digest] {
+            Blob::Bytes(bytes) => remexec::Action::decode(bytes.as_slice()).unwrap(),
+            Blob::File(path) => panic!("{path:?}"),
+        };
+        let subdirectory = |parent: &remexec::Directory, name: &str| {
+            let node = (parent.directories.iter())
+                .find(|node| node.name == name)
+                .unwrap_or_else(|| panic!("no {name} in {parent:?}"));
+            directory(node.digest.as_ref().unwrap())
+        };
+        let src = subdirectory(
+            &directory(action.input_root_digest.as_ref().unwrap()),
+            "src",
+        );
+        assert_eq!(remexec::Directory::default(), subdirectory(&src, "bits"));
+        assert!(src.files.iter().any(|file| file.name == "lib.rs"));
     }
 
     #[cfg(unix)]
