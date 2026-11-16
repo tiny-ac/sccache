@@ -982,6 +982,7 @@ mod test {
                     ],
                     _ => vec![ws.join("src/lib.rs")],
                 },
+                input_root_directories: vec![],
                 outputs: vec![ws.join(RLIB)],
             })
         }

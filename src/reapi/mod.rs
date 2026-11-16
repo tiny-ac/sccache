@@ -39,6 +39,6 @@ mod worker_toolchains;
 pub(crate) use executor::ReapiExecutor;
 pub(crate) use mapping::{
     ActionEnv, CompileLocallyReason, NotEligible, PathMapper, ReapiCompile, ToolchainKey,
-    lexically_normalize,
+    lexically_normalize, traversed_directories,
 };
 pub(crate) use sysroot::sysroot_copy;

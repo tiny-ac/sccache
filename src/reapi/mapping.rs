@@ -24,6 +24,7 @@
 
 use super::digest::FileStamp;
 use super::remote_compile::list_toolchain_files;
+use crate::dist::simplify_path::simplify_path_and_dirs;
 use crate::errors::*;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -47,6 +48,9 @@ pub struct ReapiCompile {
     pub(crate) env: ActionEnv,
     /// Local paths of the files that go into the input root.
     pub(crate) input_root_files: Vec<PathBuf>,
+    /// The input-root paths of the directories the inputs step out of with `..`, which go into
+    /// the input root even when no input is in them.
+    pub(crate) input_root_directories: Vec<String>,
     /// Local paths the compile writes.
     pub(crate) outputs: Vec<PathBuf>,
 }
@@ -151,6 +155,7 @@ pub(crate) enum CompileLocallyReason {
     UnexpectedCargoLayout,
     PathOutsideInputRoot,
     SourceOutsideInputRoot,
+    DotDotOutOfSymlink,
     AbsolutePathInOption,
     CustomTargetSpec,
     NativeCpu,
@@ -213,6 +218,7 @@ impl std::fmt::Display for CompileLocallyReason {
             Self::UnexpectedCargoLayout => "unexpected cargo dir layout",
             Self::PathOutsideInputRoot => "path outside the cwd and build root",
             Self::SourceOutsideInputRoot => "source file outside the cwd and build root",
+            Self::DotDotOutOfSymlink => "input path that steps out of a symlink with `..`",
             Self::AbsolutePathInOption => "absolute path in a -C or -Z option",
             Self::CustomTargetSpec => "custom target spec",
             Self::NativeCpu => "-C target-cpu=native or -Z tune-cpu=native",
@@ -417,6 +423,31 @@ pub(crate) fn lexically_normalize(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// The input-root paths of the directories that `files` step out of with `..`, such as
+/// `src/nptl/bits` in `src/nptl/bits/../../x86/mutex.rs`. A worker's OS resolves `a/b/../c` only
+/// if `a/b` exists, so these directories go into the input root even when no input is in them.
+///
+/// Refuses a file that steps out of a symlink with `..`, as sccache-dist does.
+pub(crate) fn traversed_directories(
+    files: &[PathBuf],
+    path_mapper: &PathMapper,
+) -> std::result::Result<Vec<String>, NotEligible> {
+    let mut traversed = vec![];
+    for file in files {
+        simplify_path_and_dirs(file, &mut traversed).map_err(|e| {
+            NotEligible::new(
+                CompileLocallyReason::DotDotOutOfSymlink,
+                e.context(file.display().to_string()),
+            )
+        })?;
+    }
+    Ok(traversed
+        .iter()
+        .filter_map(|directory| path_mapper.to_input_root(directory))
+        .filter(|directory| directory != ".")
+        .collect())
 }
 
 #[cfg(test)]
@@ -732,5 +763,37 @@ mod test {
         let sysroot = sysroot_with_rust_src(dir.path());
         let rlib = compile_remapped(&dir.path().join("checkout"), &sysroot);
         assert!(names_rust_src(&rlib), "the rlib doesn't name rust-src");
+    }
+
+    #[test]
+    fn test_traversed_directories_are_the_ones_an_input_steps_out_of() {
+        let path_mapper = PathMapper::new("/ws".into(), "/ws/target".into());
+        let files = [
+            "/ws/src/nptl/bits/../../x86/bits/mutex.rs".into(),
+            "/ws/src/lib.rs".into(),
+            // Steps out of the cwd, which is the input root and needs no entry.
+            "/ws/../ws/src/main.rs".into(),
+        ];
+        assert_eq!(
+            vec!["src/nptl/bits", "src/nptl"],
+            traversed_directories(&files, &path_mapper).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_an_input_that_steps_out_of_a_symlink_compiles_locally() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/real")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("src/real"), dir.path().join("src/link"))
+            .unwrap();
+        let path_mapper = PathMapper::new(dir.path().into(), dir.path().join("target"));
+        let files = [dir.path().join("src/link/../lib.rs")];
+        assert_eq!(
+            CompileLocallyReason::DotDotOutOfSymlink,
+            traversed_directories(&files, &path_mapper)
+                .unwrap_err()
+                .reason
+        );
     }
 }

@@ -100,6 +100,7 @@ Each call carries a `RequestMetadata` with sccache's name and version and an ID 
 - sccache downloads a result's stdout or stderr up to 8 MiB, an output file up to 4 GiB, and a server's answer with a result up to 32 MiB. A compile whose result is larger runs locally.
 - The compile's stdout and stderr from the server lose any terminal control sequence except colors, so a server can't set the terminal's title or clipboard, or rewrite what it shows. Worker paths in them are replaced with local ones, but a local path with a `"` or `\` isn't escaped again in JSON diagnostics.
 - A proc macro that reads env vars or files that rustc doesn't record in the dep-info gets the worker's, not the client's, and they aren't part of the action's key.
+- A Rust compile that reads a file through a path stepping out of a symlink with `..`, such as `src/link/../x.rs` where `src/link` is a symlink, compiles locally, as sccache-dist refuses it too.
 
 ## Trust
 
