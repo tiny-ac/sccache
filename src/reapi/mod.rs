@@ -46,5 +46,6 @@ pub(crate) use ipc::{
 pub(crate) use mapping::{
     ActionEnv, CToolchainKey, CompileLocallyReason, InternalFile, NotEligible, PathMapper,
     PreprocessedSource, ReapiCompile, ToolchainKey, WorkerProgram, lexically_normalize,
+    traversed_directories,
 };
 pub(crate) use sysroot::sysroot_copy;

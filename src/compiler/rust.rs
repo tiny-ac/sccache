@@ -2665,7 +2665,7 @@ mod reapi_mapping {
     use crate::compiler::remote::{LocalArg, LocalCompileChanges};
     use crate::reapi::{
         ActionEnv, CompileLocallyReason, NotEligible, PathMapper, ReapiCompile, ToolchainKey,
-        WorkerProgram, lexically_normalize, sysroot_copy,
+        WorkerProgram, lexically_normalize, sysroot_copy, traversed_directories,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -2981,6 +2981,7 @@ mod reapi_mapping {
         input_root_files.extend(dependency_files(compilation, &path_mapper)?);
         input_root_files.sort();
         input_root_files.dedup();
+        let input_root_directories = traversed_directories(&input_root_files, &path_mapper)?;
         let outputs = compilation
             .outputs
             .values()
@@ -2993,6 +2994,7 @@ mod reapi_mapping {
             toolchain: ToolchainKey::rustc(commit_hash, compilation.sysroot.clone(), target_triple),
             env,
             input_root_files,
+            input_root_directories,
             preprocessed_source: None,
             outputs,
         })
@@ -6782,6 +6784,18 @@ foo.rs:
             assert_eq!(
                 vec![root.join("src/lib.rs"), bar, foo],
                 map_for_reapi(&compilation).unwrap().input_root_files
+            );
+        }
+
+        #[test]
+        fn test_the_directories_an_input_steps_out_of_go_into_the_input_root() {
+            let mut compilation = compilation(&[]);
+            compilation
+                .inputs
+                .push(format!("{CWD}/src/sys/bits/../../x86/mutex.rs").into());
+            assert_eq!(
+                vec!["src/sys/bits", "src/sys"],
+                map_for_reapi(&compilation).unwrap().input_root_directories
             );
         }
 
