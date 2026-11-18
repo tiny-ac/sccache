@@ -13,9 +13,10 @@
 // limitations under the License.
 
 //! Headers from a Bazel credential helper
-//! (<https://github.com/EngFlow/credential-helper-spec>): sccache runs `<helper> get`, writes
-//! `{"uri": "https://<host>[:<port>]"}` to its stdin, and sends the headers it prints with
-//! every call, running it again before they expire.
+//! (<https://github.com/EngFlow/credential-helper-spec>): for each gRPC service, sccache runs
+//! `<helper> get`, writes `{"uri": "https://<host>[:<port>]/<service>"}` to its stdin, and sends
+//! the headers it prints with every call to that service, running it again before they expire.
+//! Bazel sends the same URIs, and some helpers need the service to choose the credentials.
 
 use super::client::{header_key, sensitive_ascii_value};
 use crate::errors::*;
@@ -46,6 +47,15 @@ const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(10);
 /// More than any helper prints, so that a broken one can't fill the memory.
 const MAX_OUTPUT_BYTES: u64 = 1 << 20;
 
+/// The gRPC services sccache calls.
+pub(super) const SERVICES: [&str; 5] = [
+    "build.bazel.remote.execution.v2.ActionCache",
+    "build.bazel.remote.execution.v2.Capabilities",
+    "build.bazel.remote.execution.v2.ContentAddressableStorage",
+    "build.bazel.remote.execution.v2.Execution",
+    "google.bytestream.ByteStream",
+];
+
 pub(super) type Headers = Arc<[(AsciiMetadataKey, AsciiMetadataValue)]>;
 
 pub(super) struct CredentialHelper {
@@ -53,13 +63,18 @@ pub(super) struct CredentialHelper {
     /// Passed before `get`. Tests run their scripts through `sh` this way, since a script
     /// run right after it was written can fail with ETXTBSY on Linux while other tests fork.
     program_args: Vec<OsString>,
-    uri: String,
     timeout: Duration,
+    services: BTreeMap<&'static str, ServiceHeaders>,
+}
+
+/// What the helper printed for one gRPC service's URI.
+struct ServiceHeaders {
+    uri: String,
     current: RwLock<CurrentHeaders>,
     /// Held while the helper runs, so that concurrent compiles run it once.
     running: Arc<tokio::sync::Mutex<()>>,
-    /// When the helper failed, if it failed the last time it ran.
-    failed_at: Mutex<Option<Instant>>,
+    /// When the helper may run again in the background, if it failed the last time it ran.
+    retry_at: Mutex<Option<Instant>>,
 }
 
 struct CurrentHeaders {
@@ -77,81 +92,110 @@ struct GetCredentialsResponse {
 }
 
 impl CredentialHelper {
-    /// A helper that has printed no headers yet. `uri` is what it gets on its stdin.
-    pub(super) fn new(program: PathBuf, uri: String, timeout: Duration) -> Self {
+    /// A helper that has printed no headers yet. `server_uri` is `https://<host>[:<port>]`;
+    /// each service's URI adds the service's name as the path.
+    pub(super) fn new(program: PathBuf, server_uri: &str, timeout: Duration) -> Self {
+        let services = SERVICES
+            .into_iter()
+            .map(|service| {
+                let headers = ServiceHeaders {
+                    uri: format!("{server_uri}/{service}"),
+                    current: RwLock::new(CurrentHeaders {
+                        headers: Arc::new([]),
+                        renew_at: Instant::now(),
+                        version: 0,
+                    }),
+                    running: Default::default(),
+                    retry_at: Mutex::new(None),
+                };
+                (service, headers)
+            })
+            .collect();
         CredentialHelper {
             program,
             program_args: Vec::new(),
-            uri,
             timeout,
-            current: RwLock::new(CurrentHeaders {
-                headers: Arc::new([]),
-                renew_at: Instant::now(),
-                version: 0,
-            }),
-            running: Default::default(),
-            failed_at: Mutex::new(None),
+            services,
         }
     }
 
-    /// The headers the helper printed last. Doesn't run it.
-    pub(super) fn headers(&self) -> Headers {
-        self.current.read().unwrap().headers.clone()
+    /// The headers the helper printed last for `service`, or `None` if sccache doesn't call
+    /// `service`. Doesn't run the helper.
+    pub(super) fn headers(&self, service: &str) -> Option<Headers> {
+        let service = self.services.get(service)?;
+        Some(service.current.read().unwrap().headers.clone())
     }
 
-    /// How many times the headers changed, so that a server that refused some can be tried
-    /// with the next.
+    /// How many times the headers changed, summed over the services, so that a server that
+    /// refused some can be tried with the next.
     pub(super) fn version(&self) -> u64 {
-        self.current.read().unwrap().version
+        (self.services.values())
+            .map(|service| service.current.read().unwrap().version)
+            .sum()
     }
 
     /// Runs the helper again at the next [`renew`](Self::renew), as for headers the server
     /// refused.
     pub(super) fn expire(&self) {
-        self.current.write().unwrap().renew_at = Instant::now();
+        for service in self.services.values() {
+            service.current.write().unwrap().renew_at = Instant::now();
+        }
     }
 
-    /// Runs the helper if its headers are due to be renewed, waiting for a run in progress to
-    /// end first. A failed run keeps the headers the helper printed before.
+    /// Runs the helper for the services whose headers are due to be renewed, at once, waiting
+    /// for runs in progress to end first. A failed run keeps the headers the helper printed
+    /// before for that service. Returns the first error.
     pub(super) async fn renew(&self) -> Result<()> {
-        if !self.due() {
-            return Ok(());
-        }
-        let _running = self.running.lock().await;
-        self.renew_while_running().await
-    }
-
-    /// Starts [`renew`](Self::renew), if the headers are due, no run is in progress, and the
-    /// helper didn't fail in the last [`RETRY_AFTER_FAILURE`]. The first failure in a row is
-    /// logged.
-    pub(super) fn renew_in_background(self: &Arc<Self>) -> Option<JoinHandle<()>> {
-        let failed_at = *self.failed_at.lock().unwrap();
-        if !self.due() || failed_at.is_some_and(|at| at.elapsed() < RETRY_AFTER_FAILURE) {
-            return None;
-        }
-        let running = self.running.clone().try_lock_owned().ok()?;
-        let this = self.clone();
-        Some(tokio::spawn(async move {
-            let renewed = this.renew_while_running().await;
-            drop(running);
-            if let Err(e) = renewed
-                && failed_at.is_none()
-            {
-                warn!("REAPI: {e:#}; keeping the headers it printed before");
+        // Every run ends before an error is returned, so that one failure doesn't kill the
+        // runs for the other services.
+        let renewals = self.services.values().map(|service| async move {
+            if !service.due() {
+                return Ok(());
             }
-        }))
+            let _running = service.running.lock().await;
+            self.renew_while_running(service).await
+        });
+        futures::future::join_all(renewals)
+            .await
+            .into_iter()
+            .collect()
     }
 
-    /// [`renew`](Self::renew), with `running` held.
-    async fn renew_while_running(&self) -> Result<()> {
-        if !self.due() {
+    /// Starts [`renew`](Self::renew) for each service whose headers are due, if no run for it
+    /// is in progress and the helper didn't fail for it in the last [`RETRY_AFTER_FAILURE`].
+    /// The first failure in a row is logged.
+    pub(super) fn renew_in_background(self: &Arc<Self>) -> Vec<JoinHandle<()>> {
+        (self.services.iter())
+            .filter_map(|(&name, service)| {
+                let retry_at = *service.retry_at.lock().unwrap();
+                if !service.due() || retry_at.is_some_and(|at| Instant::now() < at) {
+                    return None;
+                }
+                let running = service.running.clone().try_lock_owned().ok()?;
+                let this = self.clone();
+                Some(tokio::spawn(async move {
+                    let renewed = this.renew_while_running(&this.services[name]).await;
+                    drop(running);
+                    if let Err(e) = renewed
+                        && retry_at.is_none()
+                    {
+                        warn!("REAPI: {e:#}, for {name}; keeping the headers it printed before");
+                    }
+                }))
+            })
+            .collect()
+    }
+
+    /// [`renew`](Self::renew) for `service`, with its `running` held.
+    async fn renew_while_running(&self, service: &ServiceHeaders) -> Result<()> {
+        if !service.due() {
             return Ok(());
         }
-        let (headers, lifetime) = self.run().await.inspect_err(|_| {
-            *self.failed_at.lock().unwrap() = Some(Instant::now());
+        let (headers, lifetime) = self.run(&service.uri).await.inspect_err(|_| {
+            *service.retry_at.lock().unwrap() = Some(Instant::now() + RETRY_AFTER_FAILURE);
         })?;
-        *self.failed_at.lock().unwrap() = None;
-        let mut current = self.current.write().unwrap();
+        *service.retry_at.lock().unwrap() = None;
+        let mut current = service.current.write().unwrap();
         if headers[..] != current.headers[..] {
             current.headers = headers.into();
             current.version += 1;
@@ -160,12 +204,11 @@ impl CredentialHelper {
         Ok(())
     }
 
-    fn due(&self) -> bool {
-        Instant::now() >= self.current.read().unwrap().renew_at
-    }
-
-    /// The headers the helper prints, and how long to use them.
-    async fn run(&self) -> Result<(Vec<(AsciiMetadataKey, AsciiMetadataValue)>, Duration)> {
+    /// The headers the helper prints for `uri`, and how long to use them.
+    async fn run(
+        &self,
+        uri: &str,
+    ) -> Result<(Vec<(AsciiMetadataKey, AsciiMetadataValue)>, Duration)> {
         let program = self.program.display();
         let mut child = tokio::process::Command::new(&self.program)
             .args(&self.program_args)
@@ -176,7 +219,7 @@ impl CredentialHelper {
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("failed to run the REAPI credential helper {program}"))?;
-        let request = serde_json::json!({ "uri": self.uri }).to_string();
+        let request = serde_json::json!({ "uri": uri }).to_string();
         let mut stdin = child.stdin.take().unwrap();
         let mut stdout = child.stdout.take().unwrap().take(MAX_OUTPUT_BYTES + 1);
         let (status, output) = tokio::time::timeout(self.timeout, async {
@@ -210,6 +253,12 @@ impl CredentialHelper {
         }
         parse_response(&output, Utc::now())
             .with_context(|| format!("the REAPI credential helper {program} printed bad output"))
+    }
+}
+
+impl ServiceHeaders {
+    fn due(&self) -> bool {
+        Instant::now() >= self.current.read().unwrap().renew_at
     }
 }
 
@@ -320,25 +369,35 @@ pub(super) mod test {
         std::fs::write(&script, body).unwrap();
         CredentialHelper {
             program_args: vec![script.into()],
-            ..CredentialHelper::new("/bin/sh".into(), "https://farm".to_owned(), timeout)
+            ..CredentialHelper::new("/bin/sh".into(), "https://farm", timeout)
         }
     }
 
-    /// A script that counts its runs in `dir`, checks that it got `get` and the URI, and
-    /// prints `output`.
+    /// A script that writes the request it got to `dir`'s `runs`, checks that it got `get` and
+    /// a URI under `https://farm/`, and prints `output`.
     #[cfg(unix)]
     fn script_body(dir: &std::path::Path, output: &str) -> String {
         format!(
-            "echo run >> '{}'\n[ \"$1\" = get ] || exit 2\n\
-             grep -q '\"uri\":\"https://farm\"' || exit 3\nprintf '%s' '{output}'\n",
+            "request=$(cat)\necho \"$request\" >> '{}'\n[ \"$1\" = get ] || exit 2\n\
+             case \"$request\" in *'\"uri\":\"https://farm/'*) ;; *) exit 3 ;; esac\n\
+             printf '%s' '{output}'\n",
             dir.join("runs").display()
         )
     }
 
-    /// A helper in `dir` that prints `output`; [`runs`] counts its runs.
+    /// A helper in `dir` that prints `output` for every service; [`runs`] counts its runs, one
+    /// per service each time its headers are renewed.
     #[cfg(unix)]
     pub(in crate::reapi) fn script_helper(dir: &std::path::Path, output: &str) -> CredentialHelper {
         sh_helper(dir, &script_body(dir, output), HELPER_TIMEOUT)
+    }
+
+    /// A helper in `dir` that prints the URI it got as the header `x-uri`.
+    #[cfg(unix)]
+    pub(in crate::reapi) fn uri_helper(dir: &std::path::Path) -> CredentialHelper {
+        let body = "uri=$(sed 's/.*\"uri\":\"\\([^\"]*\\)\".*/\\1/')\n\
+                    printf '{\"headers\": {\"x-uri\": [\"%s\"]}}' \"$uri\"\n";
+        sh_helper(dir, body, HELPER_TIMEOUT)
     }
 
     #[cfg(unix)]
@@ -363,16 +422,55 @@ pub(super) mod test {
         for renewal in renewals {
             assert!(renewal.await.unwrap());
         }
-        assert_eq!(1, runs(dir.path()));
-        assert_eq!(1, helper.version());
-        assert_eq!(
-            vec![("x".to_owned(), "secret".to_owned())],
-            header_strings(&helper.headers())
-        );
+        assert_eq!(SERVICES.len(), runs(dir.path()));
+        assert_eq!(SERVICES.len() as u64, helper.version());
+        for service in SERVICES {
+            assert_eq!(
+                vec![("x".to_owned(), "secret".to_owned())],
+                header_strings(&helper.headers(service).unwrap())
+            );
+        }
         helper.expire();
         helper.renew().await.unwrap();
-        assert_eq!(2, runs(dir.path()));
-        assert_eq!(1, helper.version(), "the same headers again");
+        assert_eq!(2 * SERVICES.len(), runs(dir.path()));
+        assert_eq!(
+            SERVICES.len() as u64,
+            helper.version(),
+            "the same headers again"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_each_service_gets_its_uri_and_the_headers_printed_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper = uri_helper(dir.path());
+        helper.renew().await.unwrap();
+        for service in SERVICES {
+            assert_eq!(
+                vec![("x-uri".to_owned(), format!("https://farm/{service}"))],
+                header_strings(&helper.headers(service).unwrap())
+            );
+        }
+        assert!(helper.headers("google.longrunning.Operations").is_none());
+    }
+
+    #[test]
+    fn test_the_services_are_the_ones_sccache_has_clients_for() {
+        use crate::reapi::proto::build::bazel::remote::execution::v2::{
+            action_cache_server, capabilities_server, content_addressable_storage_server,
+            execution_server,
+        };
+        use crate::reapi::proto::google::bytestream::byte_stream_server;
+        let mut services = [
+            action_cache_server::SERVICE_NAME,
+            capabilities_server::SERVICE_NAME,
+            content_addressable_storage_server::SERVICE_NAME,
+            execution_server::SERVICE_NAME,
+            byte_stream_server::SERVICE_NAME,
+        ];
+        services.sort();
+        assert_eq!(SERVICES, services);
     }
 
     #[cfg(unix)]
@@ -380,16 +478,21 @@ pub(super) mod test {
     async fn test_a_helper_that_failed_in_the_background_waits_before_running_again() {
         let dir = tempfile::tempdir().unwrap();
         let helper = Arc::new(script_helper(dir.path(), "not json"));
-        let renewal = helper.renew_in_background().unwrap();
+        let renewals = helper.renew_in_background();
+        assert_eq!(SERVICES.len(), renewals.len());
         assert!(
-            helper.renew_in_background().is_none(),
-            "a run is in progress"
+            helper.renew_in_background().is_empty(),
+            "runs are in progress"
         );
-        renewal.await.unwrap();
-        assert!(helper.renew_in_background().is_none(), "it just failed");
-        *helper.failed_at.lock().unwrap() = Some(Instant::now() - RETRY_AFTER_FAILURE);
-        helper.renew_in_background().unwrap().await.unwrap();
-        assert_eq!(2, runs(dir.path()));
+        for renewal in renewals {
+            renewal.await.unwrap();
+        }
+        assert!(helper.renew_in_background().is_empty(), "they just failed");
+        *helper.services[SERVICES[0]].retry_at.lock().unwrap() = Some(Instant::now());
+        for renewal in helper.renew_in_background() {
+            renewal.await.unwrap();
+        }
+        assert_eq!(SERVICES.len() + 1, runs(dir.path()));
     }
 
     #[cfg(unix)]
@@ -422,8 +525,14 @@ pub(super) mod test {
         std::fs::write(dir.path().join("helper"), body).unwrap();
         helper.expire();
         assert!(helper.renew().await.is_err());
-        assert_eq!(2, runs(dir.path()), "the failure isn't the script's");
-        assert_eq!(1, helper.version());
-        assert_eq!(1, helper.headers().len());
+        assert_eq!(
+            2 * SERVICES.len(),
+            runs(dir.path()),
+            "the failure isn't the script's"
+        );
+        assert_eq!(SERVICES.len() as u64, helper.version());
+        for service in SERVICES {
+            assert_eq!(1, helper.headers(service).unwrap().len());
+        }
     }
 }

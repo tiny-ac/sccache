@@ -70,7 +70,7 @@ A `grpcs://` server's certificate must chain to one of the certificates in `tls_
 
 Each call carries the token in `auth_token_file` and the headers in `[dist.reapi.headers]`, whose values sccache leaves out of logs and errors. A syntax error in the config file can still print the line it's on, so keep secrets in `auth_token_file` or a credential helper rather than in `[dist.reapi.headers]`. sccache reads `auth_token_file` again every 10 seconds at most, and uses the token there if it changed, so a job can replace a short-lived token. The job should write the new token to another file and rename it over `auth_token_file`, so that sccache never reads half a token.
 
-Instead of `auth_token_file`, `credential_helper` can name a [Bazel credential helper](https://github.com/EngFlow/credential-helper-spec), as an absolute path or a name on the sccache server's `PATH`. sccache runs the helper with `get` and `{"uri": "https://<host>[:<port>]"}` on its stdin before connecting. sccache sends the headers the helper prints with each call, in place of configured headers of the same name. sccache runs the helper again:
+Instead of `auth_token_file`, `credential_helper` can name a [Bazel credential helper](https://github.com/EngFlow/credential-helper-spec), as an absolute path or a name on the sccache server's `PATH`. Before connecting, sccache runs the helper with `get` for each gRPC service it calls, with `{"uri": "https://<host>[:<port>]/<service>"}` on its stdin. sccache sends the headers the helper prints for a service with each call to that service, in place of configured headers of the same name. sccache runs the helper again for a service:
 
 - a minute before its `expires`, but not within 10 seconds;
 - 30 minutes later, without an `expires`;
@@ -78,7 +78,7 @@ Instead of `auth_token_file`, `credential_helper` can name a [Bazel credential h
 
 A helper that fails or takes more than 10 seconds when sccache has connected leaves the headers it printed before in use, and runs again 10 seconds later at the earliest. When it fails as sccache connects, compiles run locally, and sccache tries again as after a failed connection. Its stderr is discarded, so run `<helper> get` by hand to see why it fails.
 
-The URI starts with `https`, for a `grpc://` endpoint too, and leaves out port 443. The URI has no path, since one helper run covers every gRPC service. Bazel adds the service's name as the path, such as `/build.bazel.remote.execution.v2.ContentAddressableStorage`, and runs the helper separately for each service. A helper that looks at the path may not recognize sccache's URI.
+The URIs are the ones Bazel sends, so a helper written for Bazel works unchanged: they start with `https`, for a `grpc://` endpoint too, leave out port 443, and end with one of `build.bazel.remote.execution.v2.ActionCache`, `build.bazel.remote.execution.v2.Capabilities`, `build.bazel.remote.execution.v2.ContentAddressableStorage`, `build.bazel.remote.execution.v2.Execution` and `google.bytestream.ByteStream`. A helper that expects other URIs can be wrapped in a script that rewrites `uri` before passing the request on.
 
 Each call carries a `RequestMetadata` with sccache's name and version and an ID for the sccache server's run, and lookups and executions also carry the action's digest, so the server's logs can tell sccache's calls apart.
 

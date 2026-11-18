@@ -21,7 +21,7 @@ use super::auth_token::{self, AuthToken};
 use super::cas::{ChangedBlob, UnreadableBlob};
 use super::client::{
     ConnectOptions, RPC_TIMEOUT, RUSTC_MNEMONIC, RUSTC_VERSION_MNEMONIC, check_connect_options,
-    credential_helper_uri, loggable, rpc_code,
+    credential_helper_server_uri, loggable, rpc_code,
 };
 use super::connection::{Connection, ServerApis};
 use super::credential_helper::{self, CredentialHelper};
@@ -782,7 +782,7 @@ fn read_connect_options(config: &ReapiConfig) -> Result<ConnectOptions> {
     let credential_helper = match &config.credential_helper {
         Some(program) => Some(Arc::new(CredentialHelper::new(
             program.clone(),
-            credential_helper_uri(&config.endpoint)?,
+            &credential_helper_server_uri(&config.endpoint)?,
             credential_helper::HELPER_TIMEOUT,
         ))),
         None => None,
