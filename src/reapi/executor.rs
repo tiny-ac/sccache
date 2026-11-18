@@ -22,7 +22,7 @@ use super::cas::{ChangedBlob, UnreadableBlob};
 use super::check_answers::CheckAnswers;
 use super::client::{
     CPP_COMPILER_CHECK_MNEMONIC, ConnectOptions, RPC_TIMEOUT, RUSTC_VERSION_MNEMONIC,
-    check_connect_options, credential_helper_uri, loggable, rpc_code,
+    check_connect_options, credential_helper_server_uri, loggable, rpc_code,
 };
 use super::compile_as_worker::{CompileAsWorker, run_as_worker_or_locally};
 use super::connection::{Connection, ServerApis};
@@ -1061,7 +1061,7 @@ fn read_connect_options(config: &ReapiConfig) -> Result<ConnectOptions> {
     let credential_helper = match &config.credential_helper {
         Some(program) => Some(Arc::new(CredentialHelper::new(
             program.clone(),
-            credential_helper_uri(&config.endpoint)?,
+            &credential_helper_server_uri(&config.endpoint)?,
             credential_helper::HELPER_TIMEOUT,
         ))),
         None => None,

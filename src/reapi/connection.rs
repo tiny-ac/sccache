@@ -269,6 +269,7 @@ mod test {
     use crate::reapi::auth_token::AuthToken;
     use crate::reapi::auth_token::test::{read_again_now, token_file};
     #[cfg(unix)]
+    use crate::reapi::credential_helper::SERVICES;
     use crate::reapi::credential_helper::test::{runs, script_helper};
     use crate::reapi::fake::FakeServer;
     use crate::reapi::jitter::test::{WAITS, assert_jittered};
@@ -503,7 +504,7 @@ mod test {
                 connection.server_apis(in_secs(10)).await.err()
             );
         }
-        assert_eq!(1, runs(dir.path()));
+        assert_eq!(SERVICES.len(), runs(dir.path()));
         assert_eq!(0, capabilities_calls(&server));
     }
 
@@ -514,10 +515,10 @@ mod test {
         let (server, connection) =
             serve_with_helper(FakeServer::default(), dir.path(), r#"{"headers": {}}"#).await;
         let apis = connection.server_apis(in_secs(10)).await.unwrap();
-        assert_eq!(1, runs(dir.path()));
+        assert_eq!(SERVICES.len(), runs(dir.path()));
         connection.credentials_refused(&apis).await;
         connection.server_apis(in_secs(10)).await.unwrap();
-        assert_eq!(2, runs(dir.path()));
+        assert_eq!(2 * SERVICES.len(), runs(dir.path()));
         assert_eq!(2, capabilities_calls(&server));
     }
 
