@@ -47,6 +47,8 @@ pub use self::path_transform::PathTransformer;
 
 #[cfg(feature = "dist-client")]
 pub mod pkg;
+#[cfg(any(feature = "dist-client", feature = "reapi"))]
+pub(crate) mod simplify_path;
 #[cfg(not(feature = "dist-client"))]
 mod pkg {
     pub trait ToolchainPackager {}
