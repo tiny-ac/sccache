@@ -148,14 +148,26 @@ fn path_mapper(compilation: &RustCompilation) -> std::result::Result<PathMapper,
                 anyhow!("no outputs"),
             )
         })?;
-    let mut build_root = deps_dir_base(&output_dir)
-        .map(Path::to_owned)
-        .ok_or_else(|| {
+    let Some(build_root) = deps_dir_base(&output_dir) else {
+        // A build script that runs rustc itself writes into its OUT_DIR, mostly to probe
+        // which features rustc supports. Many probes fail on purpose, and a failed compile
+        // would run on a worker twice before running locally.
+        let in_out_dir = compilation.env_vars.iter().any(|(name, dir)| {
+            name == "OUT_DIR" && output_dir.starts_with(lexically_normalize(&cwd.join(dir)))
+        });
+        return Err(if in_out_dir {
+            NotEligible::new(
+                CompileLocallyReason::BuildScriptRustc,
+                anyhow!("{} is in OUT_DIR", output_dir.display()),
+            )
+        } else {
             NotEligible::new(
                 CompileLocallyReason::UnexpectedCargoLayout,
                 anyhow!("{} isn't a <profile>/deps dir", output_dir.display()),
             )
-        })?;
+        });
+    };
+    let mut build_root = build_root.to_owned();
     // -L dirs not ending in deps, such as a build script's OUT_DIR, are mapped with the
     // other arguments; one outside both roots compiles locally.
     let link_dirs: Vec<PathBuf> = compilation
@@ -1227,6 +1239,44 @@ mod test {
                 "/ws/app/target/debug/examples/libfoo-abc.rlib".into();
         }) ;
         "output dir not deps"
+    )]
+    #[test_case(
+        CompileLocallyReason::BuildScriptRustc,
+        with_env(
+            with(compilation(&[]), |c| {
+                c.outputs.get_mut("link").unwrap().path =
+                    "/ws/app/target/debug/build/foo-1/out/probe/libfoo.rmeta".into();
+            }),
+            env(&[("OUT_DIR", "/ws/app/target/debug/build/foo-1/out")]),
+            &[],
+        ) ;
+        "output in OUT_DIR"
+    )]
+    #[test_case(
+        CompileLocallyReason::BuildScriptRustc,
+        with_env(
+            with(compilation(&[]), |c| {
+                c.outputs.get_mut("link").unwrap().path = "target/debug/build/foo-1/out/libfoo.rmeta".into();
+            }),
+            env(&[("OUT_DIR", "../app/target/debug/build/foo-1/out")]),
+            &[],
+        ) ;
+        "output in a relative OUT_DIR"
+    )]
+    #[test_case(
+        CompileLocallyReason::UnexpectedCargoLayout,
+        with_env(
+            with(compilation(&[]), |c| {
+                c.outputs.get_mut("link").unwrap().path =
+                    "/ws/app/target/debug/examples/libfoo-abc.rlib".into();
+            }),
+            env(&[
+                ("CARGO_MANIFEST_DIR", "/ws/app"),
+                ("OUT_DIR", "/ws/app/target/debug/build/foo-1/out"),
+            ]),
+            &[],
+        ) ;
+        "output dir neither deps nor OUT_DIR"
     )]
     #[test_case(
         CompileLocallyReason::UnexpectedCargoLayout,
