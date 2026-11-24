@@ -73,10 +73,12 @@ Each call carries the token in `auth_token_file` and the headers in `[dist.reapi
 Instead of `auth_token_file`, `credential_helper` can name a [Bazel credential helper](https://github.com/EngFlow/credential-helper-spec), as an absolute path or a name on the sccache server's `PATH`. Before connecting, sccache runs the helper with `get` for each gRPC service it calls, with `{"uri": "https://<host>[:<port>]/<service>"}` on its stdin. sccache sends the headers the helper prints for a service with each call to that service, in place of configured headers of the same name. sccache runs the helper again for a service:
 
 - a minute before its `expires`, but not within 10 seconds;
-- 30 minutes later, without an `expires`;
+- when a compile starts after its `expires`, or 30 minutes after a run that printed no `expires`;
 - after the server refuses its headers.
 
-A helper that fails or takes more than 10 seconds when sccache has connected leaves the headers it printed before in use, and runs again 10 seconds later at the earliest. When it fails as sccache connects, compiles run locally, and sccache tries again as after a failed connection. Its stderr is discarded, so run `<helper> get` by hand to see why it fails.
+A compile that starts after the headers expired waits for that run, up to 10 seconds, as Bazel does before a call once its cached headers expired.
+
+A helper that fails or takes more than 10 seconds when sccache has connected leaves the headers it printed before in use, and runs again in the background 10 seconds later at the earliest. Until then, compiles don't wait for it. When it fails as sccache connects, compiles run locally, and sccache tries again as after a failed connection. Its stderr is discarded, so run `<helper> get` by hand to see why it fails.
 
 The URIs are the ones Bazel sends, so a helper written for Bazel works unchanged: they start with `https`, for a `grpc://` endpoint too, leave out port 443, and end with one of `build.bazel.remote.execution.v2.ActionCache`, `build.bazel.remote.execution.v2.Capabilities`, `build.bazel.remote.execution.v2.ContentAddressableStorage`, `build.bazel.remote.execution.v2.Execution` and `google.bytestream.ByteStream`. A helper that expects other URIs can be wrapped in a script that rewrites `uri` before passing the request on.
 

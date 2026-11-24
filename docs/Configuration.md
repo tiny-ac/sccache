@@ -79,7 +79,8 @@ tls_client_certificate_file = "/home/user/.config/sccache/reapi-client.pem"
 tls_client_key_file = "/home/user/.config/sccache/reapi-client.key"
 # how long a compile waits for the connection to the server and the hashing of
 # its toolchain, up to 3600; a compile that finds either not ready by then runs
-# locally. 0, the default, doesn't wait
+# locally. 0, the default, doesn't wait. A compile that finds both ready also
+# waits, up to 10 seconds, for a credential helper whose headers expired
 ready_wait_secs = 0
 # added to every action, so compiles with different salts don't share action
 # cache entries

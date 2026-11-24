@@ -41,8 +41,8 @@ const RENEW_BEFORE_EXPIRY: Duration = Duration::from_secs(60);
 /// The shortest time headers are used, so that a helper that prints a past `expires` doesn't
 /// run for every compile.
 const MIN_LIFETIME: Duration = Duration::from_secs(10);
-/// How long after a failed run the helper isn't run again in the background, so that a
-/// failing helper doesn't run for every compile.
+/// How long after a failed run the helper isn't run again in the background, so that a failing
+/// helper doesn't run for every compile. Compiles don't wait for it meanwhile.
 const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(10);
 /// More than any helper prints, so that a broken one can't fill the memory.
 const MAX_OUTPUT_BYTES: u64 = 1 << 20;
@@ -71,7 +71,7 @@ pub(super) struct CredentialHelper {
 struct ServiceHeaders {
     uri: String,
     current: RwLock<CurrentHeaders>,
-    /// Held while the helper runs, so that concurrent compiles run it once.
+    /// Held while the helper runs, so that concurrent compiles run it once and wait for that run.
     running: Arc<tokio::sync::Mutex<()>>,
     /// When the helper may run again in the background, if it failed the last time it ran.
     retry_at: Mutex<Option<Instant>>,
@@ -80,8 +80,18 @@ struct ServiceHeaders {
 struct CurrentHeaders {
     headers: Headers,
     renew_at: Instant,
+    /// From then on, a compile waits for the helper before calling the server.
+    expires_at: Instant,
     /// How many times the headers changed since sccache first ran the helper.
     version: u64,
+}
+
+/// When to run the helper again after it printed headers.
+struct Lifetime {
+    /// Until the helper runs again.
+    renew_after: Duration,
+    /// Until a compile waits for that run.
+    expires_after: Duration,
 }
 
 #[derive(Deserialize)]
@@ -103,6 +113,7 @@ impl CredentialHelper {
                     current: RwLock::new(CurrentHeaders {
                         headers: Arc::new([]),
                         renew_at: Instant::now(),
+                        expires_at: Instant::now(),
                         version: 0,
                     }),
                     running: Default::default(),
@@ -134,11 +145,13 @@ impl CredentialHelper {
             .sum()
     }
 
-    /// Runs the helper again at the next [`renew`](Self::renew), as for headers the server
-    /// refused.
+    /// Runs the helper again at the next [`renew`](Self::renew) or compile, which waits for it, as
+    /// for headers the server refused.
     pub(super) fn expire(&self) {
         for service in self.services.values() {
-            service.current.write().unwrap().renew_at = Instant::now();
+            let mut current = service.current.write().unwrap();
+            current.renew_at = Instant::now();
+            current.expires_at = Instant::now();
         }
     }
 
@@ -161,23 +174,35 @@ impl CredentialHelper {
             .collect()
     }
 
+    /// Waits for the runs [`renew_in_background`](Self::renew_in_background) started for the
+    /// services whose headers expired, as Bazel waits for the helper before a call once its
+    /// cached headers expired.
+    pub(super) async fn wait_for_expired(&self) {
+        let waits = self.services.values().map(|service| async move {
+            if service.expired() {
+                drop(service.running.lock().await);
+            }
+        });
+        futures::future::join_all(waits).await;
+    }
+
     /// Starts [`renew`](Self::renew) for each service whose headers are due, if no run for it
     /// is in progress and the helper didn't fail for it in the last [`RETRY_AFTER_FAILURE`].
     /// The first failure in a row is logged.
     pub(super) fn renew_in_background(self: &Arc<Self>) -> Vec<JoinHandle<()>> {
         (self.services.iter())
             .filter_map(|(&name, service)| {
-                let retry_at = *service.retry_at.lock().unwrap();
-                if !service.due() || retry_at.is_some_and(|at| Instant::now() < at) {
+                if !service.due() || service.failed_recently() {
                     return None;
                 }
                 let running = service.running.clone().try_lock_owned().ok()?;
+                let failed_before = service.retry_at.lock().unwrap().is_some();
                 let this = self.clone();
                 Some(tokio::spawn(async move {
                     let renewed = this.renew_while_running(&this.services[name]).await;
                     drop(running);
                     if let Err(e) = renewed
-                        && retry_at.is_none()
+                        && !failed_before
                     {
                         warn!("REAPI: {e:#}, for {name}; keeping the headers it printed before");
                     }
@@ -200,7 +225,9 @@ impl CredentialHelper {
             current.headers = headers.into();
             current.version += 1;
         }
-        current.renew_at = Instant::now() + lifetime;
+        let now = Instant::now();
+        current.renew_at = now + lifetime.renew_after;
+        current.expires_at = now + lifetime.expires_after;
         Ok(())
     }
 
@@ -208,7 +235,7 @@ impl CredentialHelper {
     async fn run(
         &self,
         uri: &str,
-    ) -> Result<(Vec<(AsciiMetadataKey, AsciiMetadataValue)>, Duration)> {
+    ) -> Result<(Vec<(AsciiMetadataKey, AsciiMetadataValue)>, Lifetime)> {
         let program = self.program.display();
         let mut child = tokio::process::Command::new(&self.program)
             .args(&self.program_args)
@@ -260,6 +287,14 @@ impl ServiceHeaders {
     fn due(&self) -> bool {
         Instant::now() >= self.current.read().unwrap().renew_at
     }
+
+    fn expired(&self) -> bool {
+        Instant::now() >= self.current.read().unwrap().expires_at
+    }
+
+    fn failed_recently(&self) -> bool {
+        (self.retry_at.lock().unwrap()).is_some_and(|at| Instant::now() < at)
+    }
 }
 
 /// The headers in a helper's `output`, and how long to use them from `now`. Errors never
@@ -267,7 +302,7 @@ impl ServiceHeaders {
 fn parse_response(
     output: &[u8],
     now: DateTime<Utc>,
-) -> Result<(Vec<(AsciiMetadataKey, AsciiMetadataValue)>, Duration)> {
+) -> Result<(Vec<(AsciiMetadataKey, AsciiMetadataValue)>, Lifetime)> {
     // serde_json's errors may quote the output, which holds credentials.
     let response: GetCredentialsResponse = serde_json::from_slice(output).map_err(|e| {
         anyhow!(
@@ -290,14 +325,23 @@ fn parse_response(
         Some(expires) => {
             let expires = DateTime::parse_from_rfc3339(&expires)
                 .map_err(|_| anyhow!("`expires` isn't an RFC 3339 time"))?;
-            (expires.with_timezone(&Utc) - now)
+            let expires_after = (expires.with_timezone(&Utc) - now)
                 .to_std()
                 .unwrap_or_default()
-                .saturating_sub(RENEW_BEFORE_EXPIRY)
+                .max(MIN_LIFETIME);
+            Lifetime {
+                renew_after: expires_after
+                    .saturating_sub(RENEW_BEFORE_EXPIRY)
+                    .max(MIN_LIFETIME),
+                expires_after,
+            }
         }
-        None => LIFETIME_WITHOUT_EXPIRY,
+        None => Lifetime {
+            renew_after: LIFETIME_WITHOUT_EXPIRY,
+            expires_after: LIFETIME_WITHOUT_EXPIRY,
+        },
     };
-    Ok((headers, lifetime.max(MIN_LIFETIME)))
+    Ok((headers, lifetime))
 }
 
 #[cfg(test)]
@@ -336,20 +380,46 @@ pub(super) mod test {
         assert!(headers.iter().all(|(_, value)| value.is_sensitive()));
     }
 
-    #[test_case(br#"{}"#, LIFETIME_WITHOUT_EXPIRY ; "no expires")]
+    #[test_case(
+        br#"{}"#,
+        LIFETIME_WITHOUT_EXPIRY,
+        LIFETIME_WITHOUT_EXPIRY ;
+        "no expires"
+    )]
     #[test_case(
         br#"{"expires": "2026-10-30T13:00:00+01:00"}"#,
+        MIN_LIFETIME,
         MIN_LIFETIME ;
         "expires now in another time zone"
     )]
     #[test_case(
         br#"{"expires": "2026-10-30T12:10:00Z"}"#,
-        Duration::from_secs(9 * 60) ;
+        Duration::from_secs(9 * 60),
+        Duration::from_secs(10 * 60) ;
         "renewed a minute before expiry"
     )]
-    #[test_case(br#"{"expires": "2026-10-30T11:00:00Z"}"#, MIN_LIFETIME ; "expired")]
-    fn test_headers_are_used_until_shortly_before_they_expire(output: &[u8], lifetime: Duration) {
-        assert_eq!(lifetime, parse_response(output, now()).unwrap().1);
+    #[test_case(
+        br#"{"expires": "2026-10-30T12:00:30Z"}"#,
+        MIN_LIFETIME,
+        Duration::from_secs(30) ;
+        "expires within a minute"
+    )]
+    #[test_case(
+        br#"{"expires": "2026-10-30T11:00:00Z"}"#,
+        MIN_LIFETIME,
+        MIN_LIFETIME ;
+        "expired"
+    )]
+    fn test_headers_are_renewed_shortly_before_they_expire(
+        output: &[u8],
+        renew_after: Duration,
+        expires_after: Duration,
+    ) {
+        let (_, lifetime) = parse_response(output, now()).unwrap();
+        assert_eq!(
+            (renew_after, expires_after),
+            (lifetime.renew_after, lifetime.expires_after)
+        );
     }
 
     #[test_case(br#"{"headers": {"x": "secret"}}"# ; "a value that isn't a list")]
@@ -376,7 +446,7 @@ pub(super) mod test {
     /// A script that writes the request it got to `dir`'s `runs`, checks that it got `get` and
     /// a URI under `https://farm/`, and prints `output`.
     #[cfg(unix)]
-    fn script_body(dir: &std::path::Path, output: &str) -> String {
+    pub(in crate::reapi) fn script_body(dir: &std::path::Path, output: &str) -> String {
         format!(
             "request=$(cat)\necho \"$request\" >> '{}'\n[ \"$1\" = get ] || exit 2\n\
              case \"$request\" in *'\"uri\":\"https://farm/'*) ;; *) exit 3 ;; esac\n\
@@ -398,6 +468,14 @@ pub(super) mod test {
         let body = "uri=$(sed 's/.*\"uri\":\"\\([^\"]*\\)\".*/\\1/')\n\
                     printf '{\"headers\": {\"x-uri\": [\"%s\"]}}' \"$uri\"\n";
         sh_helper(dir, body, HELPER_TIMEOUT)
+    }
+
+    /// What a connected compile does with the helper before it calls the server.
+    #[cfg(unix)]
+    async fn start_compile(helper: &Arc<CredentialHelper>) -> Vec<JoinHandle<()>> {
+        let renewals = helper.renew_in_background();
+        helper.wait_for_expired().await;
+        renewals
     }
 
     #[cfg(unix)]
@@ -471,6 +549,60 @@ pub(super) mod test {
         ];
         services.sort();
         assert_eq!(SERVICES, services);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_compile_waits_only_for_expired_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper = Arc::new(script_helper(
+            dir.path(),
+            r#"{"headers": {"x": ["secret"]}}"#,
+        ));
+        helper.renew().await.unwrap();
+        for service in helper.services.values() {
+            service.current.write().unwrap().renew_at = Instant::now();
+        }
+        let renewals = start_compile(&helper).await;
+        assert_eq!(SERVICES.len(), runs(dir.path()), "due but not expired");
+        for renewal in renewals {
+            renewal.await.unwrap();
+        }
+        assert_eq!(2 * SERVICES.len(), runs(dir.path()));
+        helper.expire();
+        *helper.services[SERVICES[0]].retry_at.lock().unwrap() =
+            Some(Instant::now() + Duration::from_secs(60));
+        *helper.services[SERVICES[1]].retry_at.lock().unwrap() = Some(Instant::now());
+        start_compile(&helper).await;
+        assert_eq!(
+            3 * SERVICES.len() - 1,
+            runs(dir.path()),
+            "only the one that failed recently isn't waited for"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_hanging_helper_runs_once_for_the_compiles_waiting_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = script_body(dir.path(), "{}").replace("printf", "sleep 5\nprintf");
+        let helper = Arc::new(sh_helper(dir.path(), &body, Duration::from_secs(1)));
+        let before = Instant::now();
+        let compiles: Vec<_> = (0..4)
+            .map(|_| {
+                let helper = helper.clone();
+                tokio::spawn(async move { start_compile(&helper).await })
+            })
+            .collect();
+        for compile in compiles {
+            compile.await.unwrap();
+        }
+        assert_eq!(SERVICES.len(), runs(dir.path()));
+        assert!(
+            before.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            before.elapsed()
+        );
     }
 
     #[cfg(unix)]
