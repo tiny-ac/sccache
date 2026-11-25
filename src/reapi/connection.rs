@@ -74,7 +74,7 @@ impl Connection {
 
     /// The server's APIs, or why a compile runs locally instead. Waits for a connection
     /// up to `deadline`. Once connected, waits for the credential helper to renew expired
-    /// headers, up to its own timeout.
+    /// headers, up to the helper's timeout.
     pub(super) async fn server_apis(
         self: &Arc<Self>,
         deadline: Instant,
@@ -92,8 +92,8 @@ impl Connection {
                     State::Connected(apis) => {
                         let apis = apis.clone();
                         drop(state);
-                        // The helper runs in spawned tasks, so a compile whose wait is dropped
-                        // doesn't kill it.
+                        // The helper runs in spawned tasks, so dropping a compile's wait doesn't
+                        // kill the helper.
                         self.renew_helper_headers_in_background();
                         self.wait_for_expired_helper_headers().await;
                         return Ok(apis);
