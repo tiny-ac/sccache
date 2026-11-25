@@ -168,11 +168,15 @@ impl CredentialHelper {
     pub(super) fn renew_in_background(self: &Arc<Self>) -> Vec<JoinHandle<()>> {
         (self.services.iter())
             .filter_map(|(&name, service)| {
-                let retry_at = *service.retry_at.lock().unwrap();
-                if !service.due() || retry_at.is_some_and(|at| Instant::now() < at) {
+                if !service.due() {
                     return None;
                 }
                 let running = service.running.clone().try_lock_owned().ok()?;
+                // A run that failed sets `retry_at` before it releases `running`.
+                let retry_at = *service.retry_at.lock().unwrap();
+                if retry_at.is_some_and(|at| Instant::now() < at) {
+                    return None;
+                }
                 let this = self.clone();
                 Some(tokio::spawn(async move {
                     let renewed = this.renew_while_running(&this.services[name]).await;
@@ -180,7 +184,9 @@ impl CredentialHelper {
                     if let Err(e) = renewed
                         && retry_at.is_none()
                     {
-                        warn!("REAPI: {e:#}, for {name}; keeping the headers it printed before");
+                        warn!(
+                            "REAPI: {e:#}; keeping the headers the helper printed before for {name}"
+                        );
                     }
                 }))
             })
@@ -212,6 +218,9 @@ impl CredentialHelper {
         uri: &str,
     ) -> Result<(Vec<(AsciiMetadataKey, AsciiMetadataValue)>, Duration)> {
         let program = self.program.display();
+        // The URI holds the server's host, which logs leave out.
+        let service = uri.rsplit('/').next().unwrap_or_default();
+        debug!("REAPI: running the credential helper {program} for {service}");
         let mut child = tokio::process::Command::new(&self.program)
             .args(&self.program_args)
             .arg("get")
@@ -337,6 +346,19 @@ pub(super) mod test {
             header_strings(&headers)
         );
         assert!(headers.iter().all(|(_, value)| value.is_sensitive()));
+    }
+
+    #[test]
+    fn test_other_properties_and_empty_value_lists_are_ignored() {
+        let (headers, _) = parse_response(
+            br#"{"headers": {"x": ["a"], "y": []}, "z": {"w": 1}}"#,
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            vec![("x".to_owned(), "a".to_owned())],
+            header_strings(&headers)
+        );
     }
 
     #[test_case(br#"{}"#, LIFETIME_WITHOUT_EXPIRY ; "no expires")]
@@ -533,6 +555,30 @@ pub(super) mod test {
         );
         let e = helper.renew().await.err().unwrap();
         assert!(format!("{e:#}").contains("printed more than"), "{e:#}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_helper_that_closes_its_stdin_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper = sh_helper(
+            dir.path(),
+            "exec 0<&-\nprintf '{\"headers\": {\"x\": [\"a\"]}}'\n",
+            HELPER_TIMEOUT,
+        );
+        helper.renew().await.unwrap();
+        assert_eq!(1, helper.headers(SERVICES[0]).unwrap().len());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_helper_that_isnt_executable_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("helper");
+        std::fs::write(&program, "printf '{}'\n").unwrap();
+        let helper = CredentialHelper::new(program, "https://farm", HELPER_TIMEOUT);
+        let e = helper.renew().await.err().unwrap();
+        assert!(format!("{e:#}").contains("failed to run"), "{e:#}");
     }
 
     #[cfg(unix)]

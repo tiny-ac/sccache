@@ -24,7 +24,9 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::GrpcMethod;
-use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue, BinaryMetadataValue};
+use tonic::metadata::{
+    AsciiMetadataKey, AsciiMetadataValue, BinaryMetadataKey, BinaryMetadataValue,
+};
 use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
@@ -124,13 +126,12 @@ impl Interceptor for HeadersInterceptor {
             // tonic's generated clients put each call's service in its extensions.
             let service =
                 (request.extensions().get::<GrpcMethod<'static>>()).map(|method| method.service());
-            let headers = service
-                .and_then(|service| credential_helper.headers(service))
-                .ok_or_else(|| {
-                    tonic::Status::internal(format!(
-                        "no credential helper headers for the gRPC service {service:?}"
-                    ))
-                })?;
+            let service = service.unwrap_or_default();
+            let headers = credential_helper.headers(service).ok_or_else(|| {
+                tonic::Status::internal(format!(
+                    "no credential helper headers for the gRPC service {service:?}"
+                ))
+            })?;
             for (i, (name, value)) in headers.iter().enumerate() {
                 if headers[..i].iter().any(|(earlier, _)| earlier == name) {
                     request.metadata_mut().append(name.clone(), value.clone());
@@ -438,6 +439,9 @@ pub(super) fn credential_helper_server_uri(endpoint: &str) -> Result<String> {
 
 /// `name` as a header name, if it's valid and gRPC or HTTP/2 doesn't own it.
 pub(super) fn header_key(name: &str) -> Result<AsciiMetadataKey> {
+    if BinaryMetadataKey::from_bytes(name.as_bytes()).is_ok() {
+        bail!("the REAPI header {name:?} is binary, and sccache sends only text headers");
+    }
     let key = AsciiMetadataKey::from_bytes(name.as_bytes())
         .with_context(|| format!("the REAPI header name {name:?} is not valid"))?;
     // tonic drops or replaces some, and HTTP/2 refuses requests that have the others.
@@ -1168,8 +1172,10 @@ pub(super) mod test {
         );
     }
 
+    // Header names are case-insensitive, so some cases give a name in mixed case.
     #[test_case("x api key", "hidden", "not valid" ; "invalid name")]
-    #[test_case("x-api-key-bin", "hidden", "not valid" ; "binary name")]
+    #[test_case("x api key-bin", "hidden", "not valid" ; "invalid binary name")]
+    #[test_case("X-Api-Key-Bin", "hidden", "only text headers" ; "binary name")]
     #[test_case("x-api-key", "sec\nret", "control character" ; "control character in the value")]
     #[test_case("x-api-key", "hédden", "non-ASCII" ; "non-ascii value")]
     #[test_case("grpc-timeout", "1S", "reserved" ; "grpc name")]
