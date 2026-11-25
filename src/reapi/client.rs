@@ -586,8 +586,9 @@ fn without_certificate_names<'a>(
             let without_names =
                 rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName);
             text = text.replace(&tls_error.to_string(), &without_names.to_string());
-            // A wrapper may format rustls' error some other way, so each name goes too.
-            for name in presented {
+            // A wrapper may format rustls' error some other way, so each name goes too. An
+            // empty name matches between every two characters.
+            for name in presented.iter().filter(|name| !name.is_empty()) {
                 text = text.replace(name.as_str(), "<certificate name>");
             }
             text = text.replace(expected.to_str().as_ref(), "<REAPI server>");
@@ -1454,6 +1455,25 @@ pub(super) mod test {
         for name in ["reapi.example.com", "farm.corp.example", "10.1.2.3"] {
             assert!(!text.contains(name), "{text}");
         }
+    }
+
+    #[test]
+    fn test_without_server_names_skips_an_empty_certificate_name() {
+        let expected = rustls::pki_types::ServerName::try_from("reapi.example.com").unwrap();
+        let tls_error =
+            rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForNameContext {
+                expected: expected.to_owned(),
+                presented: vec![String::new()],
+            });
+        let error = Error::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            tls_error,
+        ))
+        .context("transport error");
+        assert_eq!(
+            "transport error: invalid peer certificate: NotValidForName",
+            without_server_names(error, Some("reapi.example.com")).to_string()
+        );
     }
 
     #[test]
