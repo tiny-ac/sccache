@@ -24,6 +24,17 @@ local blobstore(dir, keysBytes, blocksBytes, newBlocks) = {
   grpcServers: [{
     listenAddresses: [':8980'],
     authenticationPolicy: { allow: {} },
+  }, {
+    // test-reapi-buildbarn's credentials mode, with tokens that reapi/credential-helper.py
+    // signs.
+    listenAddresses: [':8985'],
+    authenticationPolicy: { jwt: {
+      jwksFile: '/jwt/jwks.json',
+      maximumCacheSize: 1000,
+      cacheReplacementPolicy: 'LEAST_RECENTLY_USED',
+      claimsValidationJmespathExpression: { expression: '`true`' },
+      metadataExtractionJmespathExpression: { expression: '`{}`' },
+    } },
   }],
   schedulers: {
     '': { endpoint: { address: 'bb-scheduler:8982' } },

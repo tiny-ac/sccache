@@ -379,9 +379,25 @@ services:
     command: [/config/storage.jsonnet]
     volumes:
       - ./reapi/buildbarn:/config:ro
+      - bb-jwt:/jwt:ro
       # bb_storage doesn't create its directories.
       - /storage/cas
       - /storage/ac
+    depends_on:
+      bb-jwt-keys:
+        condition: service_completed_successfully
+    profiles:
+      - test
+      - reapi-buildbarn
+
+  # Makes the key that signs test-reapi-buildbarn's JWTs, so no private key is committed.
+  bb-jwt-keys:
+    image: sccache-test-nativelink
+    pull_policy: never
+    entrypoint: /config/jwt-keys.sh
+    volumes:
+      - ./reapi/buildbarn:/config:ro
+      - bb-jwt:/jwt
     profiles:
       - test
       - reapi-buildbarn
@@ -455,7 +471,13 @@ services:
     environment:
       <<: *common-env
       REAPI_ENDPOINT: grpc://bb-storage:8980
+      REAPI_AUTH_ENDPOINT: grpc://bb-storage:8985
       REAPI_PLATFORM: OSFamily = "linux"
+    volumes:
+      - ../../:/sccache:ro
+      - ../../target/integration-cargo-cache:/usr/local/cargo/registry:rw
+      - ../../target/integration-coverage:/coverage:rw
+      - bb-jwt:/jwt:ro
     depends_on:
       - bb-storage
       - bb-scheduler
@@ -533,6 +555,7 @@ volumes:
   webdav-data:
   bb-runner-install:
   bb-worker-dirs:
+  bb-jwt:
 
 networks:
   default:

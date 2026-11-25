@@ -5,7 +5,11 @@
 #   checkout B, at another path, hits the action cache for each one and links the rlibs;
 # - on_miss = "local": a build executes nothing and writes no action result, so a later build
 #   with the same salt still executes every compile, and writes the same rlibs;
-# - an unreachable server: the build compiles everything locally.
+# - an unreachable server: the build compiles everything locally;
+# - with REAPI_AUTH_ENDPOINT, a listener of the same server that requires a JWT: a build
+#   without credentials compiles everything locally, a build with the credential helper
+#   executes each compile, and a build with the helper's token in `auth_token_file` hits the
+#   action cache for each one.
 set -euo pipefail
 
 SCCACHE="${SCCACHE_PATH:-/sccache/target/debug/sccache}"
@@ -45,7 +49,7 @@ build() {
 fail() {
     echo "FAIL ($mode): $*" >&2
     # The calling mode's locals.
-    for stats_json in "${stats_a:-}" "${stats_b:-}"; do
+    for stats_json in "${stats_a:-}" "${stats_b:-}" "${stats_token:-}"; do
         [ -z "$stats_json" ] || echo "$stats_json" >&2
     done
     exit 1
@@ -149,7 +153,51 @@ unreachable_server() {
     rm -rf "$work"
 }
 
+credentials() {
+    setup "credentials" "$REAPI_AUTH_ENDPOINT" 300
+    local stats_a stats_b stats_token helper=/sccache/tests/integration/reapi/credential-helper.py
+    # Bazel's URIs: https for a grpc:// endpoint too, the endpoint's host and port without port
+    # 443, and one per gRPC service.
+    local authority="${REAPI_AUTH_ENDPOINT#*://}"
+    authority="${authority%%/*}"
+    local uri="https://${authority%:443}"
+    stats_a=$(build checkout-a) || fail "checkout A didn't build"
+    [ "$(reapi_stat executions "$stats_a")" -eq 0 ] || fail "checkout A executed actions without credentials"
+    [ "$(local_compiles "REAPI server refused the credentials" "$stats_a")" -eq "$(rlibs checkout-a)" ] ||
+        fail "the server didn't refuse each of checkout A's $(rlibs checkout-a) rlibs"
+
+    export CREDENTIAL_HELPER_LOG="$work/helper.log"
+    sed -i "/^ready_wait_secs = /a credential_helper = \"$helper\"" "$work/sccache.toml"
+    grep -qx "credential_helper = \"$helper\"" "$work/sccache.toml" || fail "the config has no credential_helper"
+    stats_b=$(build elsewhere/checkout-b) || fail "checkout B didn't build"
+    [ "$(reapi_stat executions "$stats_b")" -eq "$(rlibs elsewhere/checkout-b)" ] ||
+        fail "checkout B executed $(reapi_stat executions "$stats_b") of its $(rlibs elsewhere/checkout-b) rlibs"
+    diff <(sort -u "$CREDENTIAL_HELPER_LOG") - <<URIS || fail "the helper didn't get one URI per gRPC service"
+$uri/build.bazel.remote.execution.v2.ActionCache
+$uri/build.bazel.remote.execution.v2.Capabilities
+$uri/build.bazel.remote.execution.v2.ContentAddressableStorage
+$uri/build.bazel.remote.execution.v2.Execution
+$uri/google.bytestream.ByteStream
+URIS
+
+    # sccache sends the token as `Bearer <token>`, as the helper's header.
+    echo "{\"uri\": \"$uri\"}" | "$helper" get |
+        python3 -c 'import sys, json
+print(json.load(sys.stdin)["headers"]["Authorization"][0].removeprefix("Bearer "), end="")' >"$work/token" ||
+        fail "the helper didn't print a token"
+    sed -i "s|^credential_helper = .*|auth_token_file = \"$work/token\"|" "$work/sccache.toml"
+    grep -qx "auth_token_file = \"$work/token\"" "$work/sccache.toml" || fail "the config has no auth_token_file"
+    rm -rf "$work/checkout-a/target" "$work/cache-checkout-a" "$work/dist-cache-checkout-a"
+    stats_token=$(build checkout-a) || fail "checkout A didn't build with the token"
+    [ "$(reapi_stat executions "$stats_token")" -eq 0 ] || fail "checkout A executed actions with the token"
+    [ "$(reapi_stat action_cache_hits "$stats_token")" -eq "$(reapi_stat executions "$stats_b")" ] ||
+        fail "with the token, checkout A hit $(reapi_stat action_cache_hits "$stats_token") of the actions checkout B executed: $stats_token"
+    echo "✓ PASS: the server refuses a build without credentials, executes with the credential helper, and answers lookups with its token"
+    rm -rf "$work"
+}
+
 execute_on_miss
 local_on_miss
 unreachable_server
+[ -z "${REAPI_AUTH_ENDPOINT:-}" ] || credentials
 echo "All REAPI tests completed successfully!"
