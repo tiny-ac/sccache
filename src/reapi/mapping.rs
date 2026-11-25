@@ -771,6 +771,15 @@ mod test {
     }
 
     #[test]
+    fn test_a_toolchain_key_is_the_same_while_its_files_are() {
+        let dir = tempfile::tempdir().unwrap();
+        let sysroot = fake_sysroot(dir.path());
+        let key = rustc_key(&sysroot, TARGET_TRIPLE);
+        assert!(key.as_rustc().files.is_some());
+        assert_eq!(key, rustc_key(&sysroot, TARGET_TRIPLE));
+    }
+
+    #[test]
     fn test_a_toolchain_key_changes_when_its_target_is_added() {
         let dir = tempfile::tempdir().unwrap();
         let sysroot = fake_sysroot(dir.path());

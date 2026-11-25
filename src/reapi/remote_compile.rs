@@ -547,22 +547,22 @@ pub(super) fn list_toolchain_files(
 }
 
 /// The files of `toolchain`'s key, as input root files under [`TOOLCHAIN_DIR`] paired with
-/// their local paths. Fails with [`UnusableToolchain`] for a toolchain whose files can't be
-/// listed, or for a file with a non-UTF-8 path.
+/// their local paths. Fails with [`UnusableToolchain`] for a toolchain without rustc, its
+/// `lib` directory or std, or for a file with a non-UTF-8 path.
 pub(super) fn toolchain_files(
     toolchain: &RustcToolchainKey,
     digest_cache: &DigestCache,
 ) -> Result<Vec<(InputRootFile, PathBuf)>> {
     let sysroot = &toolchain.sysroot;
-    let listed;
-    let files = match &toolchain.files {
-        Some(files) => files,
+    let Some(files) = &toolchain.files else {
         // A key holds no files when they couldn't be listed, so listing them again gives the
-        // error.
-        None => {
-            listed = list_toolchain_files(sysroot, &toolchain.target_triple)?;
-            &listed
-        }
+        // error. Files listed now changed since the key was made, and digests kept under a
+        // key without files would outlive the next change.
+        list_toolchain_files(sysroot, &toolchain.target_triple)?;
+        bail!(
+            "the toolchain in {} changed while it was listed",
+            sysroot.display()
+        );
     };
     files
         .iter()
@@ -2210,5 +2210,20 @@ pub(super) mod test {
             e.downcast_ref(),
             Some(UnusableToolchain(CompileLocallyReason::MissingRustcOrStd))
         ));
+    }
+
+    #[test]
+    fn test_a_key_whose_files_couldnt_be_listed_fails_once_they_can_be() {
+        let dir = tempfile::tempdir().unwrap();
+        let sysroot = fake_sysroot(&dir.path().join("sysroot"));
+        let std_dir = sysroot.join("lib/rustlib/x86_64-unknown-linux-gnu/lib");
+        let moved_std_dir = dir.path().join("std");
+        std::fs::rename(&std_dir, &moved_std_dir).unwrap();
+        let key = toolchain_key(&sysroot, "x86_64-unknown-linux-gnu");
+        assert!(key.files.is_none());
+        std::fs::rename(&moved_std_dir, &std_dir).unwrap();
+        let digest_cache = DigestCache::load(dir.path().join("digests"));
+        let e = toolchain_files(&key, &digest_cache).unwrap_err();
+        assert!(e.downcast_ref::<UnusableToolchain>().is_none(), "{e:#}");
     }
 }
